@@ -1,6 +1,6 @@
 # Ahura Kernel
 
-Not ready to use 
+Not ready to use. 
 A small preemptive RTOS kernel for ARM Cortex-M.
 
 ## Layout
