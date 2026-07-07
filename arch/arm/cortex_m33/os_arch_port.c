@@ -1,8 +1,9 @@
 /**
  * @file os_arch_port.c
  * @brief Architecture port for ARM Cortex-M33: uses the shared ARMv7-M/ARMv8-M
- *        mainline implementation (FPU context handling compiles in when built
- *        with a hard/softfp float ABI).
+ *        mainline implementation (FPU context handling compiles in with a
+ *        hard/softfp float ABI, plus per-task PSPLIM and the MSPLIM
+ *        handler-stack guard).
  *
  * @copyright (c) 2026 Ahura Project Contributors
  *            SPDX-License-Identifier: MIT

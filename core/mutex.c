@@ -52,7 +52,7 @@ os_status os_mutex_init(os_mutex_t *mutex)
  * with OS_STATUS_BUSY instead of deadlocking.
  *
  * @param[in,out] mutex       Mutex object.
- * @param[in]     timeout_ms  OS_NO_WAIT, a duration in ms, or OS_WAIT_FOREVER.
+ * @param[in]     timeout_ms  OS_WAIT_NOTHING, a duration in ms, or OS_WAIT_FOREVER.
  * @return os_status  OK on acquisition, BUSY when unavailable without waiting,
  *                    TIMEOUT when the wait elapsed.
  */
@@ -94,7 +94,7 @@ os_status os_mutex_lock(os_mutex_t *mutex, uint32_t timeout_ms)
             return OS_STATUS_BUSY;
         }
 
-        if (timeout_ms == OS_NO_WAIT)
+        if (timeout_ms == OS_WAIT_NOTHING)
         {
             return OS_STATUS_BUSY;
         }
@@ -125,7 +125,7 @@ os_status os_mutex_lock(os_mutex_t *mutex, uint32_t timeout_ms)
  */
 os_status os_mutex_try_lock(os_mutex_t *mutex)
 {
-    return os_mutex_lock(mutex, OS_NO_WAIT);
+    return os_mutex_lock(mutex, OS_WAIT_NOTHING);
 }
 
 /******************************************************************************************************/

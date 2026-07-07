@@ -1,9 +1,16 @@
 /**
  * @file os_arch_port_v6m.c
- * @brief Shared port implementation for ARMv6-M and ARMv8-M baseline cores
- *        (Cortex-M0, M0+, M23). Thumb-1 subset only, no FPU, no DWT cycle counter.
+ * @brief Shared port implementation for ARMv6-M (Cortex-M0, M0+) and
+ *        ARMv8-M baseline (Cortex-M23) cores. Thumb-1 subset only, no FPU,
+ *        no DWT cycle counter (synthesized from SysTick). Non-secure ARMv8-M
+ *        baseline has no stack-limit registers, so there is no PSPLIM
+ *        handling here.
  *
  * This file is textually included by each variant's os_arch_port.c wrapper.
+ *
+ * TrustZone: not yet supported. Build with the Security Extension disabled or
+ * run the kernel entirely in one security state; per-task secure contexts are
+ * future work and belong in a dedicated v8-M TZ port, not in this file.
  *
  * @copyright (c) 2026 Ahura Project Contributors
  *            SPDX-License-Identifier: MIT

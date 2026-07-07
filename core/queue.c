@@ -61,7 +61,7 @@ os_status os_queue_init(os_queue_t *queue, void *buffer, size_t item_size, size_
  *
  * @param[in,out] queue       Queue object.
  * @param[in]     item        Item data to copy.
- * @param[in]     timeout_ms  OS_NO_WAIT, a duration in ms, or OS_WAIT_FOREVER.
+ * @param[in]     timeout_ms  OS_WAIT_NOTHING, a duration in ms, or OS_WAIT_FOREVER.
  * @return os_status  OK on send, FULL when no space without waiting,
  *                    TIMEOUT when the wait elapsed.
  */
@@ -96,7 +96,7 @@ os_status os_queue_send(os_queue_t *queue, const void *item, uint32_t timeout_ms
 
         os_critical_exit();
 
-        if (timeout_ms == OS_NO_WAIT)
+        if (timeout_ms == OS_WAIT_NOTHING)
         {
             return OS_STATUS_FULL;
         }
@@ -123,7 +123,7 @@ os_status os_queue_send(os_queue_t *queue, const void *item, uint32_t timeout_ms
  *
  * @param[in,out] queue       Queue object.
  * @param[out]    item_out    Destination buffer.
- * @param[in]     timeout_ms  OS_NO_WAIT, a duration in ms, or OS_WAIT_FOREVER.
+ * @param[in]     timeout_ms  OS_WAIT_NOTHING, a duration in ms, or OS_WAIT_FOREVER.
  * @return os_status  OK on receive, EMPTY when no items without waiting,
  *                    TIMEOUT when the wait elapsed.
  */
@@ -158,7 +158,7 @@ os_status os_queue_receive(os_queue_t *queue, void *item_out, uint32_t timeout_m
 
         os_critical_exit();
 
-        if (timeout_ms == OS_NO_WAIT)
+        if (timeout_ms == OS_WAIT_NOTHING)
         {
             return OS_STATUS_EMPTY;
         }

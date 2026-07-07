@@ -63,7 +63,7 @@ os_status os_memory_pool_init(os_memory_pool_t *pool, void *buffer, void *usage_
  * @param[in,out] pool  Memory pool object.
  * @return void*        Pointer to block or NULL when unavailable.
  */
-void *os_memory_pool_alloc(os_memory_pool_t *pool)
+void* os_memory_pool_alloc(os_memory_pool_t *pool)
 {
     size_t index = 0U;
 

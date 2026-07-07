@@ -11,10 +11,36 @@ if(OS_ARCH_VARIANT STREQUAL "")
 	string(REGEX MATCH "-mcpu=([^ ]+)" _os_mcpu_match "${CMAKE_C_FLAGS}")
 	if(CMAKE_MATCH_1)
 		string(TOLOWER "${CMAKE_MATCH_1}" _os_mcpu)
-		# Drop feature suffixes such as +nofp or +nodsp before the folder lookup.
-		string(REGEX REPLACE "\\+.*" "" _os_mcpu "${_os_mcpu}")
+		# Drop feature suffixes such as +nofp, +nodsp or .small-multiply
+		# before the folder lookup.
+		string(REGEX REPLACE "[+.].*" "" _os_mcpu "${_os_mcpu}")
 		string(REPLACE "-" "_" _os_mcpu "${_os_mcpu}")
 		list(APPEND _os_arch_candidates "${_os_mcpu}")
+	endif()
+
+	# No usable -mcpu (e.g. older toolchains building newer cores with
+	# -march=armv8.1-m.main+mve): map the architecture to a representative
+	# core folder. All folders of one profile include the same shared port,
+	# so any core of the right architecture is equivalent here.
+	string(REGEX MATCH "-march=([^ ]+)" _os_march_match "${CMAKE_C_FLAGS}")
+	if(CMAKE_MATCH_1)
+		string(TOLOWER "${CMAKE_MATCH_1}" _os_march)
+		# Drop feature suffixes (+mve.fp, +nofp, ...) but keep profile dots
+		# such as armv8-m.main.
+		string(REGEX REPLACE "\\+.*" "" _os_march "${_os_march}")
+		if(_os_march MATCHES "^armv6s?-m$")
+			list(APPEND _os_arch_candidates "cortex_m0")
+		elseif(_os_march STREQUAL "armv7-m")
+			list(APPEND _os_arch_candidates "cortex_m3")
+		elseif(_os_march STREQUAL "armv7e-m")
+			list(APPEND _os_arch_candidates "cortex_m4")
+		elseif(_os_march STREQUAL "armv8-m.base")
+			list(APPEND _os_arch_candidates "cortex_m23")
+		elseif(_os_march STREQUAL "armv8-m.main")
+			list(APPEND _os_arch_candidates "cortex_m33")
+		elseif(_os_march STREQUAL "armv8.1-m.main")
+			list(APPEND _os_arch_candidates "cortex_m55")
+		endif()
 	endif()
 
 	if(DEFINED CMAKE_SYSTEM_PROCESSOR AND NOT CMAKE_SYSTEM_PROCESSOR STREQUAL "")

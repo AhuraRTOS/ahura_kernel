@@ -98,7 +98,7 @@ os_status os_event_group_clear_bits(os_event_group_t *group, uint32_t bits)
  * @param[in]  bits         Bits to wait for.
  * @param[in]  wait_all     True to require all bits, false for any bit.
  * @param[out] matched_bits Matched bits snapshot (also written on failure).
- * @param[in]  timeout_ms   OS_NO_WAIT, a duration in ms, or OS_WAIT_FOREVER.
+ * @param[in]  timeout_ms   OS_WAIT_NOTHING, a duration in ms, or OS_WAIT_FOREVER.
  * @return os_status  OK on match, BUSY when unmatched without waiting,
  *                    TIMEOUT when the wait elapsed.
  */
@@ -140,7 +140,7 @@ os_status os_event_group_wait_bits(os_event_group_t *group, uint32_t bits, bool 
             return OS_STATUS_OK;
         }
 
-        if (timeout_ms == OS_NO_WAIT)
+        if (timeout_ms == OS_WAIT_NOTHING)
         {
             return OS_STATUS_BUSY;
         }

@@ -27,7 +27,6 @@ extern "C"
 
 #define OS_ARCH_REG_ICSR                  (*(volatile uint32_t *)0xE000ED04UL)
 #define OS_ARCH_ICSR_PENDSVSET_MSK        (1UL << 28)
-#define OS_ARCH_STACK_UNIT_BITS           32U
 #define OS_ARCH_STACK_ALIGNMENT_BYTES     4U
 #define OS_ARCH_DSB()                     __asm volatile("dsb 0xF" ::: "memory")
 #define OS_ARCH_ISB()                     __asm volatile("isb 0xF" ::: "memory")

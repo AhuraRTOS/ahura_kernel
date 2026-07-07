@@ -37,15 +37,6 @@ static volatile uint32_t os_tick_count = 0U;
 
 /*
  * ***********************************************************************************************************
- * Private function prototypes
- * ***********************************************************************************************************
-*/
-
-void os_tickless_pre_sleep(uint32_t planned_idle_ticks);
-void os_tickless_post_sleep(uint32_t elapsed_ticks);
-
-/*
- * ***********************************************************************************************************
  * Public function implementations
  * ***********************************************************************************************************
 */
@@ -166,7 +157,7 @@ void os_tickless_idle_process(void)
         return;
     }
 
-    os_tickless_pre_sleep(planned_idle_ticks);
+    os_tickless_pre_sleep_cb();
 
     OS_ARCH_SLEEP(planned_idle_ticks);
     elapsed_ticks = os_arch_elapsed_ticks_get();
@@ -176,31 +167,47 @@ void os_tickless_idle_process(void)
         elapsed_ticks = planned_idle_ticks;
     }
 
-    os_tickless_post_sleep(elapsed_ticks);
+    os_tickless_post_sleep_cb();
     os_tick_announce(elapsed_ticks);
 #endif
 }
 
 /******************************************************************************************************/
 /**
- * @brief Pre-sleep hook called before entering low-power mode.
+ * @brief Pre-sleep callback invoked before entering low-power mode.
  *
- * @param[in] planned_idle_ticks  Planned sleep duration in ticks.
+ * Weak empty default; the application overrides it by defining a function
+ * with the same signature (see ahura.h).
+ *
  * @return None.
  */
-OS_WEAK void os_tickless_pre_sleep(uint32_t planned_idle_ticks)
+OS_WEAK void os_tickless_pre_sleep_cb(void)
 {
-    (void)planned_idle_ticks;
+    /* Override in the application to select the sleep mode entered by the
+     * kernel's WFI, for example on a Cortex-M device:
+     *
+     *   - Sleep (default): CPU clock stops, peripherals and SysTick keep
+     *     running; nothing to do here.
+     *   - Deep sleep / STOP: set SLEEPDEEP and the vendor PWR mode bits,
+     *     e.g. SCB->SCR |= SCB_SCR_SLEEPDEEP_Msk; — then pick a wake source
+     *     that keeps counting time (SysTick stops in deep sleep) and clear
+     *     SLEEPDEEP again in os_tickless_post_sleep_cb.
+     *
+     * Gating peripheral clocks or lowering the regulator also belongs here.
+     */
 }
 
 /******************************************************************************************************/
 /**
- * @brief Post-sleep hook called after leaving low-power mode.
+ * @brief Post-sleep callback invoked after leaving low-power mode.
  *
- * @param[in] elapsed_ticks  Actual elapsed ticks while sleeping.
+ * Weak empty default; the application overrides it by defining a function
+ * with the same signature (see ahura.h).
+ *
  * @return None.
  */
-OS_WEAK void os_tickless_post_sleep(uint32_t elapsed_ticks)
+OS_WEAK void os_tickless_post_sleep_cb(void)
 {
-    (void)elapsed_ticks;
+    /* Override in the application to undo the pre-sleep configuration,
+     * e.g. SCB->SCR &= ~SCB_SCR_SLEEPDEEP_Msk; and restore clocks. */
 }

@@ -44,6 +44,51 @@ typedef enum
 
 } os_status;
 
+/******************************************************************************************************/
+/**
+ * @brief Task lifecycle state.
+ */
+typedef enum
+{
+    OS_TASK_STATE_INACTIVE = 0, /**< Not created / deleted.                    */
+    OS_TASK_STATE_READY,        /**< Runnable, waiting for the CPU.            */
+    OS_TASK_STATE_RUNNING,      /**< Currently executing.                      */
+    OS_TASK_STATE_BLOCKED,      /**< Waiting for a delay/timeout to expire.    */
+    OS_TASK_STATE_SUSPENDED,    /**< Paused until os_task_start is called.     */
+
+} os_task_state_t;
+
+/******************************************************************************************************/
+/**
+ * @brief Task entry function signature.
+ */
+typedef void (*os_task_entry_t)(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief Public task handle object.
+ */
+typedef struct
+{
+    uint32_t id;
+
+} os_task_t;
+
+/******************************************************************************************************/
+/**
+ * @brief Task creation parameters.
+ */
+typedef struct
+{
+    const char      *name;
+    os_task_entry_t entry;
+    void            *context;
+    uint32_t        priority;
+    void            *stack_memory;
+    size_t          stack_bytes;
+
+} os_task_config_t;
+
 #if (OS_CONFIG_QUEUE_ENABLE == 1U)
 /******************************************************************************************************/
 /**
@@ -195,74 +240,17 @@ typedef struct
 } os_list_t;
 #endif /* OS_CONFIG_LIST_ENABLE */
 
-/******************************************************************************************************/
-/**
- * @brief Task lifecycle state.
- */
-typedef enum
-{
-    OS_TASK_STATE_INACTIVE = 0, /**< Not created / deleted.                    */
-    OS_TASK_STATE_READY,        /**< Runnable, waiting for the CPU.            */
-    OS_TASK_STATE_RUNNING,      /**< Currently executing.                      */
-    OS_TASK_STATE_BLOCKED,      /**< Waiting for a delay/timeout to expire.    */
-    OS_TASK_STATE_SUSPENDED,    /**< Paused until os_task_start is called.     */
-
-} os_task_state_t;
-
-/******************************************************************************************************/
-/**
- * @brief Task entry function signature.
- */
-typedef void (*os_task_entry_t)(void *context);
-
-/******************************************************************************************************/
-/**
- * @brief Public task handle object.
- */
-typedef struct
-{
-    uint32_t id;
-
-} os_task_t;
-
-/******************************************************************************************************/
-/**
- * @brief Task creation parameters.
- */
-typedef struct
-{
-    const char      *name;
-    os_task_entry_t entry;
-    void            *context;
-    uint32_t        priority;
-    void            *stack_memory;
-    size_t          stack_bytes;
-
-} os_task_config_t;
-
 /*
  * ***********************************************************************************************************
  * Macros
  * ***********************************************************************************************************
 */
 
-#if (OS_ARCH_STACK_UNIT_BITS == 8U)
-typedef uint8_t os_stack_unit_t;
-#elif (OS_ARCH_STACK_UNIT_BITS == 16U)
-typedef uint16_t os_stack_unit_t;
-#elif (OS_ARCH_STACK_UNIT_BITS == 32U)
-typedef uint32_t os_stack_unit_t;
-#elif (OS_ARCH_STACK_UNIT_BITS == 64U)
-typedef uint64_t os_stack_unit_t;
-#else
-#error "Unsupported OS_ARCH_STACK_UNIT_BITS value"
-#endif
-
 /** Timeout value: wait forever (never time out). */
 #define OS_WAIT_FOREVER         0xFFFFFFFFU
 
 /** Timeout value: do not wait, fail immediately when unavailable. */
-#define OS_NO_WAIT              0U
+#define OS_WAIT_NOTHING         0U
 
 /** User task priority range: 0 is idle, OS_CONFIG_MAX_PRIORITY is reserved
  *  for the kernel work/timer service tasks. */
@@ -279,9 +267,12 @@ typedef uint64_t os_stack_unit_t;
 #define OS_STACK_ALIGNED
 #endif
 
-#define OS_TASK_DEFINE(name, stack_units) \
-    static os_stack_unit_t name##_STACK[(stack_units)] OS_STACK_ALIGNED; \
-    static os_task_t       name##_TASK
+/** Define a task stack and handle. The size is in bytes (rounded up to an
+ *  8-byte multiple so os_task_create's alignment check cannot fail) and must
+ *  be at least OS_CONFIG_MIN_STACK_SIZE. */
+#define OS_TASK_DEFINE(name, stack_bytes) \
+    static uint8_t   name##_STACK[(((stack_bytes) + 7U) & ~7U)] OS_STACK_ALIGNED; \
+    static os_task_t name##_TASK
 
 #define OS_TASK_CONFIG(name, entry, context, priority) \
     &(os_task_config_t) { \
@@ -316,30 +307,6 @@ void os_start(void);
  * @brief Return true once the scheduler has been started.
  */
 bool os_kernel_is_running(void);
-
-/******************************************************************************************************/
-/**
- * @brief Get the kernel tick counter (wraps at 32 bits).
- */
-uint32_t os_tick_get(void);
-
-/******************************************************************************************************/
-/**
- * @brief Block the calling task for the requested milliseconds (busy-waits before os_start).
- */
-os_status os_delay_ms(uint32_t milliseconds);
-
-/******************************************************************************************************/
-/**
- * @brief Busy-wait for the requested microseconds (precise, does not yield).
- */
-os_status os_delay_us(uint32_t microseconds);
-
-/******************************************************************************************************/
-/**
- * @brief Block the calling task for the requested seconds (busy-waits before os_start).
- */
-os_status os_delay_s(uint32_t seconds);
 
 /******************************************************************************************************/
 /**
@@ -384,6 +351,42 @@ os_task_state_t os_task_state_get(const os_task_t *task);
  */
 os_status os_task_stack_watermark_get(const os_task_t *task, size_t *min_free_bytes);
 #endif /* OS_CONFIG_STACK_WATERMARK_ENABLE */
+
+/******************************************************************************************************/
+/**
+ * @brief Get the kernel tick counter (wraps at 32 bits).
+ */
+uint32_t os_tick_get(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Pre-sleep callback invoked before entering low-power mode.
+ */
+void os_tickless_pre_sleep_cb(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Post-sleep callback invoked after leaving low-power mode.
+ */
+void os_tickless_post_sleep_cb(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Block the calling task for the requested milliseconds (busy-waits before os_start).
+ */
+os_status os_delay_ms(uint32_t milliseconds);
+
+/******************************************************************************************************/
+/**
+ * @brief Busy-wait for the requested microseconds (precise, does not yield).
+ */
+os_status os_delay_us(uint32_t microseconds);
+
+/******************************************************************************************************/
+/**
+ * @brief Block the calling task for the requested seconds (busy-waits before os_start).
+ */
+os_status os_delay_s(uint32_t seconds);
 
 /******************************************************************************************************/
 /**

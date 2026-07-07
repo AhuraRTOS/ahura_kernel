@@ -1,7 +1,8 @@
 /**
  * @file os_arch_port.c
  * @brief Architecture port for ARM Cortex-M23: uses the shared ARMv6-M-compatible
- *        implementation (ARMv8-M baseline executes the same Thumb-1 subset).
+ *        implementation (ARMv8-M baseline executes the same Thumb-1 subset;
+ *        non-secure baseline has no PSPLIM, so no stack-limit support is lost).
  *
  * @copyright (c) 2026 Ahura Project Contributors
  *            SPDX-License-Identifier: MIT

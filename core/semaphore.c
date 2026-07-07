@@ -81,10 +81,10 @@ os_status os_semaphore_give(os_semaphore_t *semaphore)
  * @brief Take one token from semaphore, waiting up to timeout_ms when empty.
  *
  * Nonzero timeouts are only honored from task context after os_start; from
- * interrupt context the call behaves like OS_NO_WAIT.
+ * interrupt context the call behaves like OS_WAIT_NOTHING.
  *
  * @param[in,out] semaphore   Semaphore object.
- * @param[in]     timeout_ms  OS_NO_WAIT, a duration in ms, or OS_WAIT_FOREVER.
+ * @param[in]     timeout_ms  OS_WAIT_NOTHING, a duration in ms, or OS_WAIT_FOREVER.
  * @return os_status  OK on take, EMPTY when unavailable without waiting,
  *                    TIMEOUT when the wait elapsed.
  */
@@ -114,7 +114,7 @@ os_status os_semaphore_take(os_semaphore_t *semaphore, uint32_t timeout_ms)
 
         os_critical_exit();
 
-        if (timeout_ms == OS_NO_WAIT)
+        if (timeout_ms == OS_WAIT_NOTHING)
         {
             return OS_STATUS_EMPTY;
         }

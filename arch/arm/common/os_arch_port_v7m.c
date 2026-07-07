@@ -1,9 +1,16 @@
 /**
  * @file os_arch_port_v7m.c
- * @brief Shared port implementation for ARMv7-M and ARMv8-M mainline cores
- *        (Cortex-M3, M4, M7, M33). FPU support is compile-time conditional.
+ * @brief Shared port implementation for ARMv7-M (Cortex-M3, M4, M7),
+ *        ARMv8-M mainline (Cortex-M33, M35P) and ARMv8.1-M (Cortex-M52, M55,
+ *        M85) cores. FPU support is compile-time conditional; on ARMv8-M
+ *        mainline the port adds per-task PSPLIM and, when the linker script
+ *        provides __StackLimit, an MSPLIM guard for the handler stack.
  *
  * This file is textually included by each variant's os_arch_port.c wrapper.
+ *
+ * TrustZone: not yet supported. Build with the Security Extension disabled or
+ * run the kernel entirely in one security state; per-task secure contexts are
+ * future work and belong in a dedicated v8-M TZ port, not in this file.
  *
  * @copyright (c) 2026 Ahura Project Contributors
  *            SPDX-License-Identifier: MIT
@@ -169,6 +176,12 @@ __asm(
 extern uint32_t SystemCoreClock;
 extern void     os_task_exit(void);
 
+#if (OS_ARCH_HAS_STACK_LIMIT == 1)
+/* Bottom of the main (handler) stack. CMSIS linker scripts define it; the
+ * weak reference resolves to address 0 when a custom script omits it. */
+extern uint32_t __StackLimit __attribute__((weak));
+#endif
+
 static void os_arch_task_exit_trap(void);
 
 /*
@@ -210,6 +223,19 @@ void os_arch_init(void)
 
     os_arch_sleep_entry_cycles = OS_ARCH_REG_DWT_CYCCNT;
     os_arch_planned_idle_ticks = 0U;
+
+#if (OS_ARCH_HAS_STACK_LIMIT == 1)
+    /* Guard the handler stack: an MSP push below __StackLimit raises a
+     * UsageFault instead of corrupting whatever sits below the stack.
+     * MSPLIM ignores its low 3 bits, so round the limit up. Skipped (MSPLIM
+     * keeps its reset value 0 = no checking) when the symbol is absent. */
+    if (&__StackLimit != (uint32_t *)0)
+    {
+        uint32_t msp_limit = ((uint32_t)(uintptr_t)&__StackLimit + 7U) & ~(uint32_t)0x7U;
+
+        __asm volatile("msr msplim, %0" :: "r"(msp_limit));
+    }
+#endif
 }
 
 /******************************************************************************************************/
