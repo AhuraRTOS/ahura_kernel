@@ -15,17 +15,7 @@
 
 #include "os_internal.h"
 
-/*
- * ***********************************************************************************************************
- * Macros
- * ***********************************************************************************************************
-*/
-
-#if defined(__GNUC__)
-#define OS_WEAK __attribute__((weak))
-#else
-#define OS_WEAK
-#endif
+/* OS_WEAK comes from the port layer (os_arch_port_common.h). */
 
 /*
  * ***********************************************************************************************************
@@ -33,7 +23,14 @@
  * ***********************************************************************************************************
 */
 
-static volatile uint32_t os_tick_count = 0U;
+static __IO uint32_t os_tick_count = 0U;
+
+#if (OS_CONFIG_CPU_USAGE_ENABLE == 1U)
+/* CPU load sampling: every tick counts once, and additionally as idle when
+ * it interrupted the idle task. os_cpu_usage_get consumes and resets both. */
+static __IO uint32_t os_tick_usage_total_ticks = 0U;
+static __IO uint32_t os_tick_usage_idle_ticks  = 0U;
+#endif
 
 /*
  * ***********************************************************************************************************
@@ -72,7 +69,31 @@ uint32_t os_tick_get(void)
  */
 void os_tick_handler(void)
 {
+#if (OS_CONFIG_CORE_COUNT > 1U)
+    /* Core 0 owns the kernel time base (delays, timers, work): a tick on
+     * any other core only drives that core's preemption and round-robin,
+     * or elapsed time would be counted once per core. */
+    if (os_arch_core_id_get() != 0U)
+    {
+        if (os_kernel_is_running())
+        {
+            OS_ARCH_CONTEXT_SWITCH_REQUEST();
+        }
+
+        return;
+    }
+#endif
+
     os_tick_count++;
+
+#if (OS_CONFIG_CPU_USAGE_ENABLE == 1U)
+    os_tick_usage_total_ticks++;
+    if (os_task_current_is_idle())
+    {
+        os_tick_usage_idle_ticks++;
+    }
+#endif
+
 #if (OS_CONFIG_WORK_ENABLE == 1U)
     os_work_tick_process(1U);
 #endif
@@ -100,6 +121,13 @@ void os_tick_handler(void)
 void os_tick_announce(uint32_t elapsed_ticks)
 {
     os_tick_count += elapsed_ticks;
+
+#if (OS_CONFIG_CPU_USAGE_ENABLE == 1U)
+    /* Announced ticks elapsed during a tickless sleep: idle by definition. */
+    os_tick_usage_total_ticks += elapsed_ticks;
+    os_tick_usage_idle_ticks  += elapsed_ticks;
+#endif
+
 #if (OS_CONFIG_WORK_ENABLE == 1U)
     os_work_tick_process(elapsed_ticks);
 #endif
@@ -113,6 +141,46 @@ void os_tick_announce(uint32_t elapsed_ticks)
         OS_ARCH_CONTEXT_SWITCH_REQUEST();
     }
 }
+
+#if (OS_CONFIG_CPU_USAGE_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Get the CPU usage in percent since the previous call (and restart the window).
+ *
+ * A tick counts as busy when it interrupted anything but the idle task, so
+ * the resolution is one tick: call at a period well above the tick period
+ * (e.g. once per second at 1 kHz tick). Returns 0 before the first tick.
+ *
+ * @return uint32_t  CPU usage 0..100.
+ */
+uint32_t os_cpu_usage_get(void)
+{
+    uint32_t total_ticks;
+    uint32_t idle_ticks;
+
+    os_critical_enter();
+
+    total_ticks = os_tick_usage_total_ticks;
+    idle_ticks  = os_tick_usage_idle_ticks;
+
+    os_tick_usage_total_ticks = 0U;
+    os_tick_usage_idle_ticks  = 0U;
+
+    os_critical_exit();
+
+    if (total_ticks == 0U)
+    {
+        return 0U;
+    }
+
+    if (idle_ticks > total_ticks)
+    {
+        idle_ticks = total_ticks;
+    }
+
+    return ((total_ticks - idle_ticks) * 100U) / total_ticks;
+}
+#endif /* OS_CONFIG_CPU_USAGE_ENABLE */
 
 /******************************************************************************************************/
 /**

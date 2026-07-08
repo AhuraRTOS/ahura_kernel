@@ -27,8 +27,12 @@ static uint8_t             work_task_stack[OS_CONFIG_WORK_STACK_SIZE] OS_STACK_A
 static os_task_t           work_task_handle;
 
 /* Registry of submitted work items, advanced on every kernel tick. Fixed
- * slots so tick-time iteration stays safe against concurrent submit/cancel. */
-static os_work_t *volatile work_registry[OS_CONFIG_MAX_WORKS];
+ * slots so tick-time iteration stays safe against concurrent submit/cancel.
+ * The slot (the pointer itself) is what the ISR and tasks race on, so the
+ * typedef lets __IO qualify the slot rather than the pointed-to item. */
+typedef os_work_t *os_work_slot_t;
+
+static __IO os_work_slot_t work_registry[OS_CONFIG_MAX_WORKS];
 
 /*
  * ***********************************************************************************************************
@@ -209,7 +213,8 @@ os_status os_work_system_init(void)
         (void *)0,
         OS_CONFIG_MAX_PRIORITY,
         (void *)work_task_stack,
-        sizeof(work_task_stack)
+        sizeof(work_task_stack),
+        OS_CONFIG_WORK_CORE_AFFINITY
     };
 
     for (slot = 0U; slot < OS_CONFIG_MAX_WORKS; slot++)
@@ -321,7 +326,7 @@ static void work_task_entry(void *context)
  *
  * @return os_work_t*  Ready work item, or NULL when none.
  */
-static os_work_t *work_ready_fetch(void)
+static os_work_t* work_ready_fetch(void)
 {
     os_work_t *work = NULL;
     uint32_t  slot;

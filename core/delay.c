@@ -31,8 +31,6 @@
  * ***********************************************************************************************************
 */
 
-extern uint32_t SystemCoreClock;
-
 static os_status os_delay_ticks(uint32_t ticks);
 static void      os_delay_cycle_wait(uint64_t cycle_count);
 
@@ -77,6 +75,7 @@ os_status os_delay_ms(uint32_t milliseconds)
  */
 os_status os_delay_us(uint32_t microseconds)
 {
+    uint32_t clock_hz = os_clock_hz_get_cb();
     uint64_t cycle_count;
 
     if (microseconds == 0U)
@@ -84,12 +83,12 @@ os_status os_delay_us(uint32_t microseconds)
         return OS_STATUS_OK;
     }
 
-    if (SystemCoreClock == 0U)
+    if (clock_hz == 0U)
     {
         return OS_STATUS_ERROR;
     }
 
-    cycle_count = ((uint64_t)microseconds * (uint64_t)SystemCoreClock + (OS_DELAY_US_PER_SECOND - 1ULL)) /
+    cycle_count = ((uint64_t)microseconds * (uint64_t)clock_hz + (OS_DELAY_US_PER_SECOND - 1ULL)) /
                   OS_DELAY_US_PER_SECOND;
 
     os_delay_cycle_wait(cycle_count);
@@ -131,6 +130,7 @@ os_status os_delay_s(uint32_t seconds)
  */
 static os_status os_delay_ticks(uint32_t ticks)
 {
+    uint32_t clock_hz;
     uint64_t cycle_count;
 
     if (ticks == 0U)
@@ -146,12 +146,13 @@ static os_status os_delay_ticks(uint32_t ticks)
     }
 
     /* Pre-scheduler or interrupt context: precise busy-wait. */
-    if (SystemCoreClock == 0U)
+    clock_hz = os_clock_hz_get_cb();
+    if (clock_hz == 0U)
     {
         return OS_STATUS_ERROR;
     }
 
-    cycle_count = ((uint64_t)ticks * (uint64_t)SystemCoreClock) / (uint64_t)OS_CONFIG_TICK_HZ;
+    cycle_count = ((uint64_t)ticks * (uint64_t)clock_hz) / (uint64_t)OS_CONFIG_TICK_HZ;
     os_delay_cycle_wait(cycle_count);
 
     return OS_STATUS_OK;

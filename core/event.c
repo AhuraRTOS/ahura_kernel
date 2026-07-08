@@ -38,6 +38,7 @@ os_status os_event_group_init(os_event_group_t *group)
     }
 
     group->flags = 0U;
+    os_list_init(&group->waiters);
 
     return OS_STATUS_OK;
 }
@@ -58,7 +59,13 @@ os_status os_event_group_set_bits(os_event_group_t *group, uint32_t bits)
     }
 
     os_critical_enter();
+
     group->flags |= bits;
+
+    /* Every waiter re-evaluates its own bit condition; non-matching ones
+     * re-join the list with their remaining timeout. */
+    os_task_waiters_wake_all(&group->waiters);
+
     os_critical_exit();
 
     return OS_STATUS_OK;
@@ -104,16 +111,14 @@ os_status os_event_group_clear_bits(os_event_group_t *group, uint32_t bits)
  */
 os_status os_event_group_wait_bits(os_event_group_t *group, uint32_t bits, bool wait_all, uint32_t *matched_bits, uint32_t timeout_ms)
 {
-    uint32_t start_tick;
-    uint32_t timeout_ticks;
+    uint32_t remaining_ticks;
 
     if ((group == NULL) || (matched_bits == NULL) || (bits == 0U))
     {
         return OS_STATUS_INVALID_ARG;
     }
 
-    timeout_ticks = os_internal_timeout_to_ticks(timeout_ms);
-    start_tick    = os_tick_get();
+    remaining_ticks = os_internal_timeout_to_ticks(timeout_ms);
 
     for (;;)
     {
@@ -121,9 +126,8 @@ os_status os_event_group_wait_bits(os_event_group_t *group, uint32_t bits, bool 
         bool     is_match;
 
         os_critical_enter();
-        current_flags = group->flags & bits;
-        os_critical_exit();
 
+        current_flags = group->flags & bits;
         *matched_bits = current_flags;
 
         if (wait_all)
@@ -137,27 +141,34 @@ os_status os_event_group_wait_bits(os_event_group_t *group, uint32_t bits, bool 
 
         if (is_match)
         {
+            os_critical_exit();
             return OS_STATUS_OK;
         }
 
-        if (timeout_ms == OS_WAIT_NOTHING)
+        if ((timeout_ms == OS_WAIT_NOTHING) || !os_internal_can_block())
         {
+            os_critical_exit();
             return OS_STATUS_BUSY;
         }
 
-        if (!os_internal_can_block())
+        if (remaining_ticks == 0U)
         {
-            return OS_STATUS_BUSY;
+            os_critical_exit();
+            return OS_STATUS_TIMEOUT;
         }
 
-        if ((timeout_ms != OS_WAIT_FOREVER) &&
-            ((uint32_t)(os_tick_get() - start_tick) >= timeout_ticks))
+        /* Join the waiter list inside the same critical section that saw the
+         * bits unmatched (no lost-wakeup window against set_bits). */
+        os_task_wait_begin(&group->waiters, remaining_ticks);
+        os_critical_exit();
+
+        /* Resumed: set_bits signaled (re-evaluate) or the wait timed out. */
+        if (!os_task_wait_signaled())
         {
             return OS_STATUS_TIMEOUT;
         }
 
-        /* Sleep one tick and retry; wait queues may replace this later. */
-        os_task_sleep_ticks(1U);
+        remaining_ticks = os_task_wait_remaining_ticks();
     }
 }
 

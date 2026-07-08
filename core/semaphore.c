@@ -41,6 +41,7 @@ os_status os_semaphore_init(os_semaphore_t *semaphore, uint32_t initial_count, u
 
     semaphore->count     = initial_count;
     semaphore->max_count = max_count;
+    os_list_init(&semaphore->waiters);
 
     return OS_STATUS_OK;
 }
@@ -70,6 +71,10 @@ os_status os_semaphore_give(os_semaphore_t *semaphore)
     else
     {
         semaphore->count++;
+
+        /* Hand the token to the highest-priority waiter (it re-takes in its
+         * own context). */
+        (void)os_task_waiters_wake_one(&semaphore->waiters);
     }
 
     os_critical_exit();
@@ -90,16 +95,14 @@ os_status os_semaphore_give(os_semaphore_t *semaphore)
  */
 os_status os_semaphore_take(os_semaphore_t *semaphore, uint32_t timeout_ms)
 {
-    uint32_t start_tick;
-    uint32_t timeout_ticks;
+    uint32_t remaining_ticks;
 
     if (semaphore == NULL)
     {
         return OS_STATUS_INVALID_ARG;
     }
 
-    timeout_ticks = os_internal_timeout_to_ticks(timeout_ms);
-    start_tick    = os_tick_get();
+    remaining_ticks = os_internal_timeout_to_ticks(timeout_ms);
 
     for (;;)
     {
@@ -112,26 +115,30 @@ os_status os_semaphore_take(os_semaphore_t *semaphore, uint32_t timeout_ms)
             return OS_STATUS_OK;
         }
 
+        if ((timeout_ms == OS_WAIT_NOTHING) || !os_internal_can_block())
+        {
+            os_critical_exit();
+            return OS_STATUS_EMPTY;
+        }
+
+        if (remaining_ticks == 0U)
+        {
+            os_critical_exit();
+            return OS_STATUS_TIMEOUT;
+        }
+
+        /* Join the waiter list inside the same critical section that saw the
+         * semaphore empty (no lost-wakeup window); the switch happens on exit. */
+        os_task_wait_begin(&semaphore->waiters, remaining_ticks);
         os_critical_exit();
 
-        if (timeout_ms == OS_WAIT_NOTHING)
-        {
-            return OS_STATUS_EMPTY;
-        }
-
-        if (!os_internal_can_block())
-        {
-            return OS_STATUS_EMPTY;
-        }
-
-        if ((timeout_ms != OS_WAIT_FOREVER) &&
-            ((uint32_t)(os_tick_get() - start_tick) >= timeout_ticks))
+        /* Resumed: a give signaled us (retry the take) or the wait timed out. */
+        if (!os_task_wait_signaled())
         {
             return OS_STATUS_TIMEOUT;
         }
 
-        /* Sleep one tick and retry; wait queues may replace this later. */
-        os_task_sleep_ticks(1U);
+        remaining_ticks = os_task_wait_remaining_ticks();
     }
 }
 

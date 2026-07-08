@@ -1,16 +1,13 @@
 /**
  * @file os_arch_port_v7m.c
- * @brief Shared port implementation for ARMv7-M (Cortex-M3, M4, M7),
- *        ARMv8-M mainline (Cortex-M33, M35P) and ARMv8.1-M (Cortex-M52, M55,
- *        M85) cores. FPU support is compile-time conditional; on ARMv8-M
- *        mainline the port adds per-task PSPLIM and, when the linker script
- *        provides __StackLimit, an MSPLIM guard for the handler stack.
+ * @brief Shared port implementation for ARMv7-M (Cortex-M3) and ARMv7E-M
+ *        (Cortex-M4, M7) cores. Thumb-2, FPU support is compile-time
+ *        conditional (saves s16-s31 and a per-task EXC_RETURN when built
+ *        with a hard/softfp float ABI).
  *
  * This file is textually included by each variant's os_arch_port.c wrapper.
- *
- * TrustZone: not yet supported. Build with the Security Extension disabled or
- * run the kernel entirely in one security state; per-task secure contexts are
- * future work and belong in a dedicated v8-M TZ port, not in this file.
+ * ARMv8-M mainline / ARMv8.1-M cores use os_arch_port_v8m.c, which extends
+ * this implementation with PSPLIM/MSPLIM stack limits and TrustZone.
  *
  * @copyright (c) 2026 Ahura Project Contributors
  *            SPDX-License-Identifier: MIT
@@ -24,7 +21,10 @@
 */
 
 #include "os_arch_port_common.h"
-#include "../../../ahura_config.h"
+
+#if !defined(__ARM_ARCH_7M__) && !defined(__ARM_ARCH_7EM__)
+#error "os_arch_port_v7m.c targets ARMv7-M / ARMv7E-M cores (check -mcpu / -march)."
+#endif
 
 /*
  * ***********************************************************************************************************
@@ -32,15 +32,15 @@
  * ***********************************************************************************************************
 */
 
-#define OS_ARCH_REG_SHPR2                    (*(volatile uint32_t *)0xE000ED1CUL)
-#define OS_ARCH_REG_SHPR3                    (*(volatile uint32_t *)0xE000ED20UL)
-#define OS_ARCH_REG_DEMCR                    (*(volatile uint32_t *)0xE000EDFCUL)
-#define OS_ARCH_REG_DWT_CTRL                 (*(volatile uint32_t *)0xE0001000UL)
-#define OS_ARCH_REG_DWT_CYCCNT               (*(volatile uint32_t *)0xE0001004UL)
-#define OS_ARCH_REG_DWT_LAR                  (*(volatile uint32_t *)0xE0001FB0UL)
-#define OS_ARCH_REG_SYST_CSR                 (*(volatile uint32_t *)0xE000E010UL)
-#define OS_ARCH_REG_SYST_RVR                 (*(volatile uint32_t *)0xE000E014UL)
-#define OS_ARCH_REG_SYST_CVR                 (*(volatile uint32_t *)0xE000E018UL)
+#define OS_ARCH_REG_SHPR2                    (*(__IO uint32_t *)0xE000ED1CUL)
+#define OS_ARCH_REG_SHPR3                    (*(__IO uint32_t *)0xE000ED20UL)
+#define OS_ARCH_REG_DEMCR                    (*(__IO uint32_t *)0xE000EDFCUL)
+#define OS_ARCH_REG_DWT_CTRL                 (*(__IO uint32_t *)0xE0001000UL)
+#define OS_ARCH_REG_DWT_CYCCNT               (*(__IO uint32_t *)0xE0001004UL)
+#define OS_ARCH_REG_DWT_LAR                  (*(__IO uint32_t *)0xE0001FB0UL)
+#define OS_ARCH_REG_SYST_CSR                 (*(__IO uint32_t *)0xE000E010UL)
+#define OS_ARCH_REG_SYST_RVR                 (*(__IO uint32_t *)0xE000E014UL)
+#define OS_ARCH_REG_SYST_CVR                 (*(__IO uint32_t *)0xE000E018UL)
 
 #define OS_ARCH_DEMCR_TRCENA_MSK             (1UL << 24)
 #define OS_ARCH_DWT_CTRL_CYCCNTENA_MSK       (1UL << 0)
@@ -69,17 +69,6 @@
 #define OS_ARCH_CONTROL_FPCA_MSK             (1UL << 2)
 
 /*
- * ARMv8-M mainline (Cortex-M33/M55/M85) adds per-task hardware stack overflow
- * detection: PSPLIM is saved/restored with the context and a push below the
- * limit raises a UsageFault instead of silently corrupting memory.
- */
-#if defined(__ARM_ARCH_8M_MAIN__) || defined(__ARM_ARCH_8_1M_MAIN__)
-#define OS_ARCH_HAS_STACK_LIMIT              1
-#else
-#define OS_ARCH_HAS_STACK_LIMIT              0
-#endif
-
-/*
  * ***********************************************************************************************************
  * Global variables
  * ***********************************************************************************************************
@@ -95,7 +84,6 @@ static uint32_t os_arch_planned_idle_ticks = 0U;
  *
  * Software-saved frame layout on a task stack (low address first):
  *   [ s16-s31 ]  only when the task was using the FPU (EXC_RETURN bit 4 clear)
- *   [ PSPLIM ]   only on ARMv8-M mainline (per-task stack limit)
  *   r4-r11, EXC_RETURN
  *   [ hardware frame: r0-r3, r12, lr, pc, xpsr, (s0-s15, fpscr) ]
  *
@@ -134,12 +122,7 @@ __asm(
 "    it      eq\n"
 "    vstmdbeq r0!, {s16-s31}\n"            /* task used the FPU: save callee-saved FP regs */
 #endif
-#if (OS_ARCH_HAS_STACK_LIMIT == 1)
-"    mrs     r2, psplim\n"                 /* save the per-task stack limit */
-"    stmdb   r0!, {r2, r4-r11, lr}\n"
-#else
 "    stmdb   r0!, {r4-r11, lr}\n"
-#endif
 "    bl      os_task_stack_save_current\n" /* r0 = stack pointer of outgoing task */
 "    bl      os_task_stack_select_next\n"  /* r0 = stack pointer of incoming task */
 "    b       os_arch_context_restore_asm\n"
@@ -150,12 +133,7 @@ __asm(
 ".type   os_arch_context_restore_asm, %function\n"
 ".thumb_func\n"
 "os_arch_context_restore_asm:\n"           /* r0 = stack pointer of task to restore */
-#if (OS_ARCH_HAS_STACK_LIMIT == 1)
-"    ldmia   r0!, {r2, r4-r11, lr}\n"
-"    msr     psplim, r2\n"                 /* restore the stack limit before PSP */
-#else
 "    ldmia   r0!, {r4-r11, lr}\n"
-#endif
 #if defined(__ARM_FP)
 "    tst     lr, #0x10\n"
 "    it      eq\n"
@@ -173,14 +151,7 @@ __asm(
  * ***********************************************************************************************************
 */
 
-extern uint32_t SystemCoreClock;
 extern void     os_task_exit(void);
-
-#if (OS_ARCH_HAS_STACK_LIMIT == 1)
-/* Bottom of the main (handler) stack. CMSIS linker scripts define it; the
- * weak reference resolves to address 0 when a custom script omits it. */
-extern uint32_t __StackLimit __attribute__((weak));
-#endif
 
 static void os_arch_task_exit_trap(void);
 
@@ -223,19 +194,6 @@ void os_arch_init(void)
 
     os_arch_sleep_entry_cycles = OS_ARCH_REG_DWT_CYCCNT;
     os_arch_planned_idle_ticks = 0U;
-
-#if (OS_ARCH_HAS_STACK_LIMIT == 1)
-    /* Guard the handler stack: an MSP push below __StackLimit raises a
-     * UsageFault instead of corrupting whatever sits below the stack.
-     * MSPLIM ignores its low 3 bits, so round the limit up. Skipped (MSPLIM
-     * keeps its reset value 0 = no checking) when the symbol is absent. */
-    if (&__StackLimit != (uint32_t *)0)
-    {
-        uint32_t msp_limit = ((uint32_t)(uintptr_t)&__StackLimit + 7U) & ~(uint32_t)0x7U;
-
-        __asm volatile("msr msplim, %0" :: "r"(msp_limit));
-    }
-#endif
 }
 
 /******************************************************************************************************/
@@ -280,14 +238,15 @@ void os_arch_start_first_task(void)
  */
 void os_arch_tick_init(void)
 {
+    uint32_t clock_hz = os_clock_hz_get_cb();
     uint32_t reload_value;
 
-    if ((SystemCoreClock == 0U) || (OS_CONFIG_TICK_HZ == 0U))
+    if ((clock_hz == 0U) || (OS_CONFIG_TICK_HZ == 0U))
     {
         return;
     }
 
-    reload_value = (SystemCoreClock / OS_CONFIG_TICK_HZ);
+    reload_value = (clock_hz / OS_CONFIG_TICK_HZ);
     if ((reload_value == 0U) || (reload_value > (OS_ARCH_SYST_RVR_RELOAD_MSK + 1UL)))
     {
         return;
@@ -311,7 +270,7 @@ void os_arch_tick_init(void)
  * @param[in] context      Task argument passed in R0.
  * @return uint32_t*       Initial process stack pointer for first restore, NULL on bad arguments.
  */
-uint32_t *os_arch_task_stack_initialize(uint8_t *stack_base, size_t stack_bytes, void (*entry)(void *context), void *context)
+uint32_t* os_arch_task_stack_initialize(uint8_t *stack_base, size_t stack_bytes, void (*entry)(void *context), void *context)
 {
     uint32_t *stack_top;
 
@@ -344,12 +303,6 @@ uint32_t *os_arch_task_stack_initialize(uint8_t *stack_base, size_t stack_bytes,
     *(--stack_top) = 0U;                                    /* R5   */
     *(--stack_top) = 0U;                                    /* R4   */
 
-#if (OS_ARCH_HAS_STACK_LIMIT == 1)
-    /* PSPLIM ignores its low 3 bits, so round the limit up: an overflow then
-     * always faults before writing outside the caller's stack memory. */
-    *(--stack_top) = ((uint32_t)(uintptr_t)stack_base + 7U) & ~(uint32_t)0x7U; /* PSPLIM */
-#endif
-
     return stack_top;
 }
 
@@ -372,6 +325,7 @@ uint32_t os_arch_cycle_count_get(void)
  */
 uint32_t os_arch_elapsed_ticks_get(void)
 {
+    uint32_t clock_hz = os_clock_hz_get_cb();
     uint32_t now_cycles;
     uint32_t delta_cycles;
     uint32_t elapsed_ticks;
@@ -384,7 +338,7 @@ uint32_t os_arch_elapsed_ticks_get(void)
     now_cycles   = os_arch_cycle_count_get();
     delta_cycles = now_cycles - os_arch_sleep_entry_cycles;
 
-    if (SystemCoreClock == 0U)
+    if (clock_hz == 0U)
     {
         elapsed_ticks = os_arch_planned_idle_ticks;
     }
@@ -392,7 +346,7 @@ uint32_t os_arch_elapsed_ticks_get(void)
     {
         uint64_t scaled_ticks = ((uint64_t)delta_cycles * (uint64_t)OS_CONFIG_TICK_HZ);
 
-        scaled_ticks /= (uint64_t)SystemCoreClock;
+        scaled_ticks /= (uint64_t)clock_hz;
         elapsed_ticks = (uint32_t)scaled_ticks;
     }
 
@@ -418,6 +372,29 @@ void os_arch_sleep_prepare(uint32_t planned_ticks)
     os_arch_planned_idle_ticks = planned_ticks;
     os_arch_sleep_entry_cycles = os_arch_cycle_count_get();
 }
+
+/*
+ * ***********************************************************************************************************
+ * Multi-core weak callback defaults
+ * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_CORE_COUNT > 1U)
+/******************************************************************************************************/
+/**
+ * @brief Weak defaults for the SoC multi-core callbacks: single-core behavior (core 0, no IPI;
+ *        cross-core wakeups then happen at the next tick).
+ */
+OS_WEAK uint32_t os_arch_core_id_get_cb(void)
+{
+    return 0U;
+}
+
+OS_WEAK void os_arch_core_ipi_request_cb(uint32_t core_id)
+{
+    (void)core_id;
+}
+#endif /* OS_CONFIG_CORE_COUNT > 1U */
 
 /*
  * ***********************************************************************************************************

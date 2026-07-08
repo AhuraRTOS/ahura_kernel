@@ -30,8 +30,12 @@ static uint8_t              timer_task_stack[OS_CONFIG_TIMER_STACK_SIZE] OS_STAC
 static os_task_t            timer_task_handle;
 
 /* Registry of started timers, advanced on every kernel tick. Fixed slots so
- * tick-time iteration stays safe against concurrent start/stop calls. */
-static os_timer_t *volatile timer_registry[OS_CONFIG_MAX_TIMERS];
+ * tick-time iteration stays safe against concurrent start/stop calls.
+ * The slot (the pointer itself) is what the ISR and tasks race on, so the
+ * typedef lets __IO qualify the slot rather than the pointed-to timer. */
+typedef os_timer_t *os_timer_slot_t;
+
+static __IO os_timer_slot_t timer_registry[OS_CONFIG_MAX_TIMERS];
 
 /*
  * ***********************************************************************************************************
@@ -167,7 +171,8 @@ os_status os_timer_system_init(void)
         (void *)0,
         OS_CONFIG_MAX_PRIORITY,
         (void *)timer_task_stack,
-        sizeof(timer_task_stack)
+        sizeof(timer_task_stack),
+        OS_CONFIG_TIMER_CORE_AFFINITY
     };
 
     for (slot = 0U; slot < OS_CONFIG_MAX_TIMERS; slot++)

@@ -39,6 +39,7 @@ os_status os_mutex_init(os_mutex_t *mutex)
 
     mutex->locked   = false;
     mutex->owner_id = 0U;
+    os_list_init(&mutex->waiters);
 
     return OS_STATUS_OK;
 }
@@ -59,17 +60,15 @@ os_status os_mutex_init(os_mutex_t *mutex)
 os_status os_mutex_lock(os_mutex_t *mutex, uint32_t timeout_ms)
 {
     uint32_t self_id;
-    uint32_t start_tick;
-    uint32_t timeout_ticks;
+    uint32_t remaining_ticks;
 
     if (mutex == NULL)
     {
         return OS_STATUS_INVALID_ARG;
     }
 
-    self_id       = os_task_current_id_get();
-    timeout_ticks = os_internal_timeout_to_ticks(timeout_ms);
-    start_tick    = os_tick_get();
+    self_id         = os_task_current_id_get();
+    remaining_ticks = os_internal_timeout_to_ticks(timeout_ms);
 
     for (;;)
     {
@@ -86,33 +85,33 @@ os_status os_mutex_lock(os_mutex_t *mutex, uint32_t timeout_ms)
         }
 
         held_by_self = ((self_id != 0U) && (mutex->owner_id == self_id));
-        os_critical_exit();
 
         /* Recursive lock attempt would deadlock forever: fail fast. */
-        if (held_by_self)
+        if (held_by_self || (timeout_ms == OS_WAIT_NOTHING) || !os_internal_can_block())
         {
+            os_critical_exit();
             return OS_STATUS_BUSY;
         }
 
-        if (timeout_ms == OS_WAIT_NOTHING)
+        if (remaining_ticks == 0U)
         {
-            return OS_STATUS_BUSY;
+            os_critical_exit();
+            return OS_STATUS_TIMEOUT;
         }
 
-        /* Waiting is only possible from a running task. */
-        if (!os_internal_can_block())
-        {
-            return OS_STATUS_BUSY;
-        }
+        /* Join the waiter list inside the same critical section that saw the
+         * mutex locked (no lost-wakeup window); the switch happens on exit. */
+        os_task_wait_begin(&mutex->waiters, remaining_ticks);
+        os_critical_exit();
 
-        if ((timeout_ms != OS_WAIT_FOREVER) &&
-            ((uint32_t)(os_tick_get() - start_tick) >= timeout_ticks))
+        /* Resumed: unlock signaled us (retry the take - another task may
+         * have been faster) or the wait timed out. */
+        if (!os_task_wait_signaled())
         {
             return OS_STATUS_TIMEOUT;
         }
 
-        /* Sleep one tick and retry; wait queues may replace this later. */
-        os_task_sleep_ticks(1U);
+        remaining_ticks = os_task_wait_remaining_ticks();
     }
 }
 
@@ -164,6 +163,10 @@ os_status os_mutex_unlock(os_mutex_t *mutex)
 
     mutex->locked   = false;
     mutex->owner_id = 0U;
+
+    /* Hand the release to the highest-priority waiter (it re-takes in its
+     * own context; no ownership transfer inside the unlock). */
+    (void)os_task_waiters_wake_one(&mutex->waiters);
 
     os_critical_exit();
     return OS_STATUS_OK;

@@ -68,9 +68,47 @@ void os_task_wake(uint32_t task_id);
 
 /******************************************************************************************************/
 /**
+ * @brief Queue the calling task on an object's waiter list and block it; call inside a critical
+ *        section from task context, the switch happens when the caller exits it (task.c).
+ */
+void os_task_wait_begin(os_list_t *waiters, uint32_t timeout_ticks);
+
+/******************************************************************************************************/
+/**
+ * @brief After resuming from a wait: true = object signaled, false = timeout (task.c).
+ */
+bool os_task_wait_signaled(void);
+
+/******************************************************************************************************/
+/**
+ * @brief After a signaled resume: remaining timeout budget in ticks for the retry (task.c).
+ */
+uint32_t os_task_wait_remaining_ticks(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Wake the highest-priority waiter of an object; true when one was woken
+ *        (task.c, call inside a critical section, ISR-safe).
+ */
+bool os_task_waiters_wake_one(os_list_t *waiters);
+
+/******************************************************************************************************/
+/**
+ * @brief Wake every waiter of an object (task.c, call inside a critical section, ISR-safe).
+ */
+void os_task_waiters_wake_all(os_list_t *waiters);
+
+/******************************************************************************************************/
+/**
  * @brief Get the id of the current task, 0 when idle/none/pre-scheduler (task.c).
  */
 uint32_t os_task_current_id_get(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Check whether the idle task is currently running (task.c, ISR-safe).
+ */
+bool os_task_current_is_idle(void);
 
 /******************************************************************************************************/
 /**
@@ -88,7 +126,7 @@ void os_task_stack_save_current(uint32_t *stack_ptr);
 /**
  * @brief Select the next task to run and return its stack pointer; never NULL (task.c, called from PendSV/SVC).
  */
-uint32_t *os_task_stack_select_next(void);
+uint32_t* os_task_stack_select_next(void);
 
 /******************************************************************************************************/
 /**

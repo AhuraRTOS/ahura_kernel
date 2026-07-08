@@ -13,7 +13,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include "ahura_config.h"
+/* os_arch_port.h includes and validates the application's ahura_config.h
+ * (copy ahura_kernel/ahura_config_template.h, see README "Configuration"). */
 #include "os_arch_port.h"
 
 #ifdef __cplusplus
@@ -86,8 +87,36 @@ typedef struct
     uint32_t        priority;
     void            *stack_memory;
     size_t          stack_bytes;
+    uint32_t        core_affinity; /**< Bitmask of cores the task may run on;
+                                        OS_TASK_CORE_ANY (0) = any core.
+                                        Ignored on single-core builds. */
 
 } os_task_config_t;
+
+/******************************************************************************************************/
+/**
+ * @brief Intrusive list node object. Always available: the scheduler and the
+ *        blocking primitives run on these lists, so the list module cannot
+ *        be configured out. Declared before the kernel objects because they
+ *        embed waiter lists.
+ */
+typedef struct os_list_node
+{
+    struct os_list_node *next;
+    struct os_list_node *prev;
+
+} os_list_node_t;
+
+/******************************************************************************************************/
+/**
+ * @brief Intrusive list container.
+ */
+typedef struct
+{
+    os_list_node_t *head;
+    os_list_node_t *tail;
+
+} os_list_t;
 
 #if (OS_CONFIG_QUEUE_ENABLE == 1U)
 /******************************************************************************************************/
@@ -96,12 +125,14 @@ typedef struct
  */
 typedef struct
 {
-    uint8_t *buffer;
-    size_t  item_size;
-    size_t  capacity;
-    size_t  head;
-    size_t  tail;
-    size_t  count;
+    uint8_t   *buffer;
+    size_t    item_size;
+    size_t    capacity;
+    size_t    head;
+    size_t    tail;
+    size_t    count;
+    os_list_t send_waiters;    /**< Tasks blocked because the queue is full.  */
+    os_list_t receive_waiters; /**< Tasks blocked because the queue is empty. */
 
 } os_queue_t;
 #endif /* OS_CONFIG_QUEUE_ENABLE */
@@ -113,8 +144,9 @@ typedef struct
  */
 typedef struct
 {
-    bool     locked;   /**< True while held.                                  */
-    uint32_t owner_id; /**< Task id of the holder, 0 when free/unknown owner. */
+    bool      locked;   /**< True while held.                                  */
+    uint32_t  owner_id; /**< Task id of the holder, 0 when free/unknown owner. */
+    os_list_t waiters;  /**< Tasks blocked waiting for the mutex.              */
 
 } os_mutex_t;
 #endif /* OS_CONFIG_MUTEX_ENABLE */
@@ -126,8 +158,9 @@ typedef struct
  */
 typedef struct
 {
-    uint32_t count;
-    uint32_t max_count;
+    uint32_t  count;
+    uint32_t  max_count;
+    os_list_t waiters; /**< Tasks blocked waiting for a token. */
 
 } os_semaphore_t;
 #endif /* OS_CONFIG_SEMAPHORE_ENABLE */
@@ -139,7 +172,8 @@ typedef struct
  */
 typedef struct
 {
-    uint32_t flags;
+    uint32_t  flags;
+    os_list_t waiters; /**< Tasks blocked waiting for bits to match. */
 
 } os_event_group_t;
 #endif /* OS_CONFIG_EVENT_ENABLE */
@@ -216,30 +250,6 @@ typedef struct
 } os_memory_pool_t;
 #endif /* OS_CONFIG_MEMORY_POOL_ENABLE */
 
-#if (OS_CONFIG_LIST_ENABLE == 1U)
-/******************************************************************************************************/
-/**
- * @brief Intrusive list node object.
- */
-typedef struct os_list_node
-{
-    struct os_list_node *next;
-    struct os_list_node *prev;
-
-} os_list_node_t;
-
-/******************************************************************************************************/
-/**
- * @brief Intrusive list container.
- */
-typedef struct
-{
-    os_list_node_t *head;
-    os_list_node_t *tail;
-
-} os_list_t;
-#endif /* OS_CONFIG_LIST_ENABLE */
-
 /*
  * ***********************************************************************************************************
  * Macros
@@ -256,6 +266,10 @@ typedef struct
  *  for the kernel work/timer service tasks. */
 #define OS_TASK_PRIORITY_USER_MIN   1U
 #define OS_TASK_PRIORITY_USER_MAX   (OS_CONFIG_MAX_PRIORITY - 1U)
+
+/** Core affinity: the task may run on any core (multi-core builds; the
+ *  affinity is a bitmask otherwise, bit n = may run on core n). */
+#define OS_TASK_CORE_ANY        0U
 
 #define OS_TICKS_FROM_S(sec)    ((uint32_t)((uint64_t)(sec) * (uint64_t)OS_CONFIG_TICK_HZ))
 #define OS_TICKS_FROM_MS(ms)    ((uint32_t)((((uint64_t)(ms) * (uint64_t)OS_CONFIG_TICK_HZ) + 999ULL) / 1000ULL))
@@ -301,6 +315,22 @@ void os_init(void);
  * @brief Start the scheduler and switch to task context. Does not return.
  */
 void os_start(void);
+
+#if (OS_CONFIG_CORE_COUNT > 1U)
+/******************************************************************************************************/
+/**
+ * @brief Enter the scheduler on a secondary core. Call after os_start() is running on core 0,
+ *        from the secondary core, once the SoC layer has booted it with a vector table routing
+ *        SVC/PendSV/SysTick to the kernel handlers. Does not return.
+ */
+void os_core_start(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Change which cores a task may run on (bitmask, OS_TASK_CORE_ANY = any core).
+ */
+os_status os_task_core_affinity_set(os_task_t *task, uint32_t core_affinity);
+#endif /* OS_CONFIG_CORE_COUNT > 1U */
 
 /******************************************************************************************************/
 /**
@@ -358,6 +388,15 @@ os_status os_task_stack_watermark_get(const os_task_t *task, size_t *min_free_by
  */
 uint32_t os_tick_get(void);
 
+#if (OS_CONFIG_CPU_USAGE_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Get the CPU usage in percent (0..100) since the previous call; one-tick resolution,
+ *        so sample at a period well above the tick period (e.g. once per second).
+ */
+uint32_t os_cpu_usage_get(void);
+#endif /* OS_CONFIG_CPU_USAGE_ENABLE */
+
 /******************************************************************************************************/
 /**
  * @brief Pre-sleep callback invoked before entering low-power mode.
@@ -369,6 +408,46 @@ void os_tickless_pre_sleep_cb(void);
  * @brief Post-sleep callback invoked after leaving low-power mode.
  */
 void os_tickless_post_sleep_cb(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Platform callback: return the CPU clock in Hz (0 = unknown). The weak default returns
+ *        OS_CONFIG_CPU_CLOCK_HZ when configured, else the CMSIS SystemCoreClock global when the
+ *        platform provides one. Platforms with another clock convention override this.
+ */
+uint32_t os_clock_hz_get_cb(void);
+
+#if (OS_CONFIG_TRUSTZONE == OS_CONFIG_TRUSTZONE_NON_SECURE)
+/******************************************************************************************************/
+/**
+ * @brief TrustZone callback: bank the secure-side context of the task being switched out
+ *        (task_id 0 = idle task, no secure context). Weak default does nothing.
+ */
+void os_arch_tz_context_save_cb(uint32_t task_id);
+
+/******************************************************************************************************/
+/**
+ * @brief TrustZone callback: restore the secure-side context of the task being switched in.
+ *        Weak default does nothing.
+ */
+void os_arch_tz_context_restore_cb(uint32_t task_id);
+#endif /* OS_CONFIG_TRUSTZONE_NON_SECURE */
+
+#if (OS_CONFIG_CORE_COUNT > 1U)
+/******************************************************************************************************/
+/**
+ * @brief Multi-core SoC callback: return the index of the calling core (0-based).
+ *        Weak default returns 0.
+ */
+uint32_t os_arch_core_id_get_cb(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Multi-core SoC callback: interrupt another core so it re-evaluates scheduling.
+ *        Weak default does nothing (the core then reacts at its next tick).
+ */
+void os_arch_core_ipi_request_cb(uint32_t core_id);
+#endif /* OS_CONFIG_CORE_COUNT > 1U */
 
 /******************************************************************************************************/
 /**
@@ -555,7 +634,7 @@ os_status os_memory_pool_init(os_memory_pool_t *pool, void *buffer, void *usage_
 /**
  * @brief Allocate one block from a memory pool (ISR-safe).
  */
-void *os_memory_pool_alloc(os_memory_pool_t *pool);
+void* os_memory_pool_alloc(os_memory_pool_t *pool);
 
 /******************************************************************************************************/
 /**
@@ -564,7 +643,32 @@ void *os_memory_pool_alloc(os_memory_pool_t *pool);
 os_status os_memory_pool_free(os_memory_pool_t *pool, void *block);
 #endif /* OS_CONFIG_MEMORY_POOL_ENABLE */
 
-#if (OS_CONFIG_LIST_ENABLE == 1U)
+#if (OS_CONFIG_ALLOC_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Allocate memory from the kernel heap (8-byte aligned; NULL when exhausted).
+ */
+void* os_alloc(size_t size);
+
+/******************************************************************************************************/
+/**
+ * @brief Return memory obtained from os_alloc to the kernel heap (NULL is ignored).
+ */
+void os_free(void *memory);
+
+/******************************************************************************************************/
+/**
+ * @brief Get the number of bytes currently free in the kernel heap.
+ */
+size_t os_alloc_free_bytes_get(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Get the smallest amount of free heap ever observed (worst case since boot).
+ */
+size_t os_alloc_min_free_bytes_get(void);
+#endif /* OS_CONFIG_ALLOC_ENABLE */
+
 /******************************************************************************************************/
 /**
  * @brief Initialize list container.
@@ -587,8 +691,19 @@ void os_list_push_back(os_list_t *list, os_list_node_t *node);
 /**
  * @brief Pop one node from list head.
  */
-os_list_node_t *os_list_pop_front(os_list_t *list);
-#endif /* OS_CONFIG_LIST_ENABLE */
+os_list_node_t* os_list_pop_front(os_list_t *list);
+
+/******************************************************************************************************/
+/**
+ * @brief Remove a node from anywhere in the list (detached nodes are ignored).
+ */
+void os_list_remove(os_list_t *list, os_list_node_t *node);
+
+/******************************************************************************************************/
+/**
+ * @brief Insert a node before the given position (NULL position appends at the tail).
+ */
+void os_list_insert_before(os_list_t *list, os_list_node_t *position, os_list_node_t *node);
 
 #ifdef __cplusplus
 }

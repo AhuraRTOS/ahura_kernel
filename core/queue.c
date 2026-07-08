@@ -48,6 +48,8 @@ os_status os_queue_init(os_queue_t *queue, void *buffer, size_t item_size, size_
     queue->head      = 0U;
     queue->tail      = 0U;
     queue->count     = 0U;
+    os_list_init(&queue->send_waiters);
+    os_list_init(&queue->receive_waiters);
 
     return OS_STATUS_OK;
 }
@@ -67,16 +69,14 @@ os_status os_queue_init(os_queue_t *queue, void *buffer, size_t item_size, size_
  */
 os_status os_queue_send(os_queue_t *queue, const void *item, uint32_t timeout_ms)
 {
-    uint32_t start_tick;
-    uint32_t timeout_ticks;
+    uint32_t remaining_ticks;
 
     if ((queue == NULL) || (item == NULL))
     {
         return OS_STATUS_INVALID_ARG;
     }
 
-    timeout_ticks = os_internal_timeout_to_ticks(timeout_ms);
-    start_tick    = os_tick_get();
+    remaining_ticks = os_internal_timeout_to_ticks(timeout_ms);
 
     for (;;)
     {
@@ -90,30 +90,37 @@ os_status os_queue_send(os_queue_t *queue, const void *item, uint32_t timeout_ms
             queue->tail = (queue->tail + 1U) % queue->capacity;
             queue->count++;
 
+            /* An item arrived: release the highest-priority receiver. */
+            (void)os_task_waiters_wake_one(&queue->receive_waiters);
+
             os_critical_exit();
             return OS_STATUS_OK;
         }
 
+        if ((timeout_ms == OS_WAIT_NOTHING) || !os_internal_can_block())
+        {
+            os_critical_exit();
+            return OS_STATUS_FULL;
+        }
+
+        if (remaining_ticks == 0U)
+        {
+            os_critical_exit();
+            return OS_STATUS_TIMEOUT;
+        }
+
+        /* Join the senders' waiter list inside the same critical section
+         * that saw the queue full (no lost-wakeup window). */
+        os_task_wait_begin(&queue->send_waiters, remaining_ticks);
         os_critical_exit();
 
-        if (timeout_ms == OS_WAIT_NOTHING)
-        {
-            return OS_STATUS_FULL;
-        }
-
-        if (!os_internal_can_block())
-        {
-            return OS_STATUS_FULL;
-        }
-
-        if ((timeout_ms != OS_WAIT_FOREVER) &&
-            ((uint32_t)(os_tick_get() - start_tick) >= timeout_ticks))
+        /* Resumed: a receive freed a slot (retry) or the wait timed out. */
+        if (!os_task_wait_signaled())
         {
             return OS_STATUS_TIMEOUT;
         }
 
-        /* Sleep one tick and retry; wait queues may replace this later. */
-        os_task_sleep_ticks(1U);
+        remaining_ticks = os_task_wait_remaining_ticks();
     }
 }
 
@@ -129,16 +136,14 @@ os_status os_queue_send(os_queue_t *queue, const void *item, uint32_t timeout_ms
  */
 os_status os_queue_receive(os_queue_t *queue, void *item_out, uint32_t timeout_ms)
 {
-    uint32_t start_tick;
-    uint32_t timeout_ticks;
+    uint32_t remaining_ticks;
 
     if ((queue == NULL) || (item_out == NULL))
     {
         return OS_STATUS_INVALID_ARG;
     }
 
-    timeout_ticks = os_internal_timeout_to_ticks(timeout_ms);
-    start_tick    = os_tick_get();
+    remaining_ticks = os_internal_timeout_to_ticks(timeout_ms);
 
     for (;;)
     {
@@ -152,30 +157,37 @@ os_status os_queue_receive(os_queue_t *queue, void *item_out, uint32_t timeout_m
             queue->head = (queue->head + 1U) % queue->capacity;
             queue->count--;
 
+            /* A slot freed up: release the highest-priority sender. */
+            (void)os_task_waiters_wake_one(&queue->send_waiters);
+
             os_critical_exit();
             return OS_STATUS_OK;
         }
 
+        if ((timeout_ms == OS_WAIT_NOTHING) || !os_internal_can_block())
+        {
+            os_critical_exit();
+            return OS_STATUS_EMPTY;
+        }
+
+        if (remaining_ticks == 0U)
+        {
+            os_critical_exit();
+            return OS_STATUS_TIMEOUT;
+        }
+
+        /* Join the receivers' waiter list inside the same critical section
+         * that saw the queue empty (no lost-wakeup window). */
+        os_task_wait_begin(&queue->receive_waiters, remaining_ticks);
         os_critical_exit();
 
-        if (timeout_ms == OS_WAIT_NOTHING)
-        {
-            return OS_STATUS_EMPTY;
-        }
-
-        if (!os_internal_can_block())
-        {
-            return OS_STATUS_EMPTY;
-        }
-
-        if ((timeout_ms != OS_WAIT_FOREVER) &&
-            ((uint32_t)(os_tick_get() - start_tick) >= timeout_ticks))
+        /* Resumed: a send delivered an item (retry) or the wait timed out. */
+        if (!os_task_wait_signaled())
         {
             return OS_STATUS_TIMEOUT;
         }
 
-        /* Sleep one tick and retry; wait queues may replace this later. */
-        os_task_sleep_ticks(1U);
+        remaining_ticks = os_task_wait_remaining_ticks();
     }
 }
 
