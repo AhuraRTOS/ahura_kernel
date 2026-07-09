@@ -1,5 +1,5 @@
 /**
- * @file alloc.c
+ * @file os_alloc.c
  * @brief Kernel heap: os_alloc/os_free over a static heap array.
  *
  * First-fit allocator with an address-ordered free list and coalescing of

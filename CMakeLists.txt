@@ -69,20 +69,20 @@ message(STATUS "Ahura kernel arch: ${OS_ARCH_VARIANT}")
 
 add_library(ahura_kernel STATIC
 	arch/arm/${OS_ARCH_VARIANT}/os_arch_port.c
-	core/alloc.c
-	core/critical.c
-	core/delay.c
-	core/event.c
-	core/kernel.c
-	core/list.c
-	core/memory_pool.c
-	core/mutex.c
-	core/queue.c
-	core/semaphore.c
-	core/task.c
-	core/tick.c
-	core/timer.c
-	core/work.c
+	core/os_alloc.c
+	core/os_critical.c
+	core/os_delay.c
+	core/os_event.c
+	core/os_kernel.c
+	core/os_list.c
+	core/os_memory_pool.c
+	core/os_mutex.c
+	core/os_queue.c
+	core/os_semaphore.c
+	core/os_task.c
+	core/os_tick.c
+	core/os_timer.c
+	core/os_work.c
 )
 
 target_include_directories(ahura_kernel PUBLIC
@@ -91,8 +91,8 @@ target_include_directories(ahura_kernel PUBLIC
 )
 
 # Application configuration: set OS_CONFIG_DIR (before add_subdirectory, or as
-# a cache variable) to the directory holding the project's ahura_config.h —
-# copied from ahura_config_template.h; the project layout does not matter,
+# a cache variable) to the directory holding the project's os_config.h —
+# copied from os_config_template.h; the project layout does not matter,
 # any directory works. PUBLIC so the kernel library and everything linking it
 # see the exact same configuration — a mismatch would silently change
 # structure sizes.
@@ -101,14 +101,25 @@ if(OS_CONFIG_DIR)
 else()
 	message(WARNING
 		"OS_CONFIG_DIR is not set: the Ahura kernel needs the directory containing "
-		"your ahura_config.h (copy ahura_kernel/ahura_config_template.h). Set it "
+		"your os_config.h (copy ahura_kernel/os_config_template.h). Set it "
 		"before add_subdirectory(ahura_kernel), or add the directory to the "
 		"ahura_kernel target include paths yourself.")
 endif()
 
-# Note: the two template files are deliberately NOT part of this build.
-# - ahura_config_template.h: headers are never compiled; copy it into the
-#   application as ahura_config.h (see OS_CONFIG_DIR above).
-# - ahura_cb_template.c: copy it into the application source tree as
-#   ahura_cb.c and add it to the APPLICATION build; its functions override
-#   the kernel's weak _cb defaults.
+# Note: the template files are deliberately NOT part of this build.
+# - os_config_template.h: headers are never compiled; copy it into the
+#   application as os_config.h (see OS_CONFIG_DIR above).
+# - os_cb_template.c: copy it into the application source tree as os_cb.c
+#   and add it to the APPLICATION build; its functions override the
+#   kernel's weak _cb defaults (platform clock, tickless sleep, TrustZone,
+#   multi-core SoC glue).
+# - os_main_template.c: copy it into the application source tree as
+#   os_main.c and add it to the APPLICATION build; it defines os_main() -
+#   the default application task's body (not a "_cb" function: this is
+#   where the application's own code runs). Task creation itself is
+#   unconditional in os_kernel.c's os_init(), gated by
+#   OS_CONFIG_MAIN_TASK_ENABLE; see README "Default application task".
+#
+# The self-test suite (ahura_kernel/test/) is different: it IS a build
+# target (its own CMakeLists.txt), not a template - see
+# ahura_kernel/test/CMakeLists.txt and README "Self-test suite".

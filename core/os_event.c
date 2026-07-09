@@ -1,5 +1,5 @@
 /**
- * @file event.c
+ * @file os_event.c
  * @brief Event group module implementation with timeouts.
  *
  * @copyright (c) 2026 Ahura Project Contributors

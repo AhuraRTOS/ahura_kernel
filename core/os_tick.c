@@ -1,5 +1,5 @@
 /**
- * @file tick.c
+ * @file os_tick.c
  * @brief Kernel tick management implementation.
  *
  * @copyright (c) 2026 Ahura Project Contributors

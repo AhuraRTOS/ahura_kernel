@@ -1,5 +1,5 @@
 /**
- * @file memory_pool.c
+ * @file os_memory_pool.c
  * @brief Fixed-block memory pool module implementation.
  *
  * @copyright (c) 2026 Ahura Project Contributors

@@ -1,5 +1,5 @@
 /**
- * @file list.c
+ * @file os_list.c
  * @brief Intrusive list utility implementation.
  *
  * Always compiled: the scheduler (ready lists, delay list) runs on these

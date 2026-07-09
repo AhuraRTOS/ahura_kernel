@@ -1,5 +1,5 @@
 /**
- * @file queue.c
+ * @file os_queue.c
  * @brief Queue module implementation with timeouts.
  *
  * @copyright (c) 2026 Ahura Project Contributors

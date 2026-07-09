@@ -22,37 +22,42 @@
 
 /*
  * The application provides the kernel configuration: copy
- * ahura_kernel/ahura_config_template.h into the project as ahura_config.h
+ * ahura_kernel/os_config_template.h into the project as os_config.h
  * and make its directory visible to the kernel build (OS_CONFIG_DIR in
  * CMake, see the README "Configuration" section).
  */
 #if defined(__has_include)
-#if !__has_include("ahura_config.h")
-#error "No ahura_config.h found: copy ahura_kernel/ahura_config_template.h into your project as ahura_config.h and put its directory on the kernel include path (OS_CONFIG_DIR)."
+#if !__has_include("os_config.h")
+#error "No os_config.h found: copy ahura_kernel/os_config_template.h into your project as os_config.h and put its directory on the kernel include path (OS_CONFIG_DIR)."
 #endif
 #endif
 
-#include "ahura_config.h"
+#include "os_config.h"
 
 /* Reject incomplete configurations: a missing option would otherwise read
  * as 0 in #if directives and silently disable or misconfigure features.
- * Start from ahura_config_template.h, which lists every required option. */
+ * Start from os_config_template.h, which lists every required option. */
 #if !defined(OS_CONFIG_MUTEX_ENABLE) || !defined(OS_CONFIG_SEMAPHORE_ENABLE) ||                        \
     !defined(OS_CONFIG_QUEUE_ENABLE) || !defined(OS_CONFIG_EVENT_ENABLE) ||                            \
     !defined(OS_CONFIG_TIMER_ENABLE) || !defined(OS_CONFIG_WORK_ENABLE) ||                             \
     !defined(OS_CONFIG_MEMORY_POOL_ENABLE) || !defined(OS_CONFIG_ALLOC_ENABLE) ||                      \
     !defined(OS_CONFIG_STACK_WATERMARK_ENABLE) ||                                                      \
-    !defined(OS_CONFIG_CPU_USAGE_ENABLE) || !defined(OS_CONFIG_TICK_HZ) ||                             \
+    !defined(OS_CONFIG_CPU_USAGE_ENABLE) || !defined(OS_CONFIG_MAIN_TASK_ENABLE) ||                    \
+    !defined(OS_CONFIG_TEST_ENABLE) ||                                                                 \
+    !defined(OS_CONFIG_TICK_HZ) ||                                                                     \
     !defined(OS_CONFIG_CPU_CLOCK_HZ) || !defined(OS_CONFIG_HEAP_SIZE) ||                               \
     !defined(OS_CONFIG_MAX_PRIORITY) || !defined(OS_CONFIG_MAX_TASKS) ||                               \
     !defined(OS_CONFIG_MAX_TIMERS) || !defined(OS_CONFIG_MAX_WORKS) ||                                 \
     !defined(OS_CONFIG_MIN_STACK_SIZE) || !defined(OS_CONFIG_WORK_STACK_SIZE) ||                       \
     !defined(OS_CONFIG_TIMER_STACK_SIZE) || !defined(OS_CONFIG_WORK_CORE_AFFINITY) ||                  \
-    !defined(OS_CONFIG_TIMER_CORE_AFFINITY) || !defined(OS_CONFIG_TRUSTZONE) ||                        \
+    !defined(OS_CONFIG_TIMER_CORE_AFFINITY) ||                                                         \
+    !defined(OS_CONFIG_MAIN_TASK_STACK_SIZE) || !defined(OS_CONFIG_MAIN_TASK_PRIORITY) ||               \
+    !defined(OS_CONFIG_TEST_STACK_SIZE) || !defined(OS_CONFIG_TEST_PRIORITY) ||                        \
+    !defined(OS_CONFIG_TRUSTZONE) ||                                                                   \
     !defined(OS_CONFIG_CORE_COUNT) || !defined(OS_CONFIG_TICKLESS_ENABLE) ||                           \
     !defined(OS_CONFIG_TICKLESS_MIN_IDLE) || !defined(OS_CONFIG_LPTIM_CLOCK_HZ) ||                     \
     !defined(OS_CONFIG_MAX_SUPPRESSED_TICKS)
-#error "ahura_config.h is incomplete: it must define every option listed in ahura_kernel/ahura_config_template.h."
+#error "os_config.h is incomplete: it must define every option listed in ahura_kernel/os_config_template.h."
 #endif
 
 #if (OS_CONFIG_CORE_COUNT < 1U)
@@ -140,7 +145,7 @@ extern "C"
  * The System Control Space is banked per core, so this pends PendSV on the
  * calling core - which is correct now that every scheduling core runs its
  * own PendSV. When a task can only run on another core, the scheduler
- * routes the request through the SoC IPI callback instead (task.c,
+ * routes the request through the SoC IPI callback instead (os_task.c,
  * os_task_preempt_request).
  */
 #define OS_ARCH_CONTEXT_SWITCH_REQUEST()  do { OS_ARCH_REG_ICSR = OS_ARCH_ICSR_PENDSVSET_MSK; OS_ARCH_DSB(); OS_ARCH_ISB(); } while (0)
@@ -340,7 +345,7 @@ void os_arch_tz_context_restore_cb(uint32_t task_id);
 
 /******************************************************************************************************/
 /**
- * @brief Platform callback: return the CPU clock in Hz (0 = unknown). The weak default (kernel.c)
+ * @brief Platform callback: return the CPU clock in Hz (0 = unknown). The weak default (os_kernel.c)
  *        returns OS_CONFIG_CPU_CLOCK_HZ when configured, else the CMSIS SystemCoreClock global when
  *        the platform provides one; platforms with another clock convention override it.
  */

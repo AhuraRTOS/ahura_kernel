@@ -1,9 +1,9 @@
 /**
- * @file ahura_cb_template.c
+ * @file os_cb_template.c
  * @brief Template for the application-side kernel callbacks (_cb functions).
  *
  * NOT part of the kernel build (and it must never be added to it): copy this
- * file into the application source tree as ahura_cb.c, add that copy to the
+ * file into the application source tree as os_cb.c, add that copy to the
  * application build and adapt the bodies to the platform. Every function
  * here overrides a weak kernel default, so both the file and every single
  * function in it are optional — delete what you do not need.
@@ -55,6 +55,14 @@ uint32_t os_clock_hz_get_cb(void)
 /******************************************************************************************************/
 /**
  * @brief Called right before the idle sleep: select the sleep mode (e.g. SLEEPDEEP), gate clocks.
+ *
+ * Empty body = plain SLEEP (SLEEPDEEP left clear): the CPU clock stops but every peripheral clock -
+ * UARTs, timers, DMA - keeps running, so nothing needs saving here and os_tickless_post_sleep_cb()
+ * has nothing to restore. If a peripheral's completion must be guaranteed before the CPU naps (e.g.
+ * flush a debug UART so the last line is fully transmitted), block on its busy/TX-complete flag
+ * here. Selecting a deeper mode (STOP/SLEEPDEEP) instead means gated peripheral and system clocks -
+ * restore them (and re-run the clock configuration if PLL/HSE were affected) in
+ * os_tickless_post_sleep_cb() before anything relies on them again.
  */
 void os_tickless_pre_sleep_cb(void)
 {

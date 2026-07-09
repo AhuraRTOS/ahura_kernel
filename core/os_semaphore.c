@@ -1,5 +1,5 @@
 /**
- * @file semaphore.c
+ * @file os_semaphore.c
  * @brief Semaphore module implementation with timeouts.
  *
  * @copyright (c) 2026 Ahura Project Contributors

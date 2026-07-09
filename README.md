@@ -5,37 +5,56 @@ A small preemptive RTOS kernel for ARM Cortex-M.
 ## Layout
 
 - `ahura.h` — public umbrella API (the only header applications include).
-- `ahura_config_template.h` — template for the application's `ahura_config.h`:
+  Declares `os_main()` and `os_test()` too (see "Default application task"
+  and "Self-test suite") even though the kernel only ships weak defaults for
+  them — overriding/linking the real body is the application's job. Neither
+  carries the `_cb` suffix used elsewhere in this header: that suffix is
+  reserved for callbacks the kernel queries for platform behavior
+  (`os_clock_hz_get_cb`, `os_tickless_pre_sleep_cb`, ...); `os_main()`/
+  `os_test()` are where the application's/suite's own code runs instead,
+  even though they are wired up the same way (weak default, strong
+  override).
+- `os_config_template.h` — template for the application's `os_config.h`:
   every build-time option, active at its default value (tick rate, task/timer
   limits, stack sizes, heap size, TrustZone mode, core count, and the
   per-feature switches `OS_CONFIG_<FEATURE>_ENABLE` for mutex, semaphore,
-  queue, event, timer, work, memory pool, alloc, stack watermark, CPU
-  usage; the intrusive list module has no switch — the scheduler runs on
-  it). Never included by the kernel: copy it into the project — see
-  "Configuration". Disabling a feature compiles out its code and API;
-  disabling timer/work also removes the corresponding kernel service task and
-  its stack.
-- `ahura_cb_template.c` — template for the application-side callbacks,
+  queue, event, timer, work, memory pool, alloc, stack watermark, CPU usage,
+  the default application task, the self-test task; the intrusive list module
+  has no switch — the scheduler runs on it). Never included by the kernel:
+  copy it into the project — see "Configuration". Disabling a feature
+  compiles out its code and API; disabling timer/work/the default
+  task/the self-test task also removes the corresponding kernel service
+  task and its stack.
+- `os_cb_template.c` — template for the application-side callbacks,
   deliberately not compiled into the kernel — see "Application callbacks".
-- `core/` — portable kernel modules:
-  - `kernel.c` — lifecycle (`os_init`, `os_start`, running flag) and the
-    platform clock callback (`os_clock_hz_get_cb`, see "Platform clock").
-  - `alloc.c` — kernel heap (`os_alloc`/`os_free`): first-fit allocator with
+- `os_main_template.c` — template for the default application task's body,
+  deliberately not compiled into the kernel — see "Default application
+  task".
+- `test/` — the kernel self-test suite (`os_test.c`), its own buildable
+  module (target `os_test`) with its own `CMakeLists.txt` — see "Self-test
+  suite".
+- `core/` — portable kernel modules (all filenames `os_`-prefixed):
+  - `os_kernel.c` — lifecycle (`os_init`, `os_start`, running flag), the
+    platform clock callback (`os_clock_hz_get_cb`, see "Platform clock"),
+    the default application task (`os_main`, see "Default application
+    task"), and the self-test task (`os_test`, see "Self-test suite").
+  - `os_alloc.c` — kernel heap (`os_alloc`/`os_free`): first-fit allocator with
     coalescing over a static `OS_CONFIG_HEAP_SIZE` heap.
-  - `task.c` — static TCB pool with O(1) list-based scheduling: one FIFO
+  - `os_task.c` — static TCB pool with O(1) list-based scheduling: one FIFO
     ready list per priority plus a ready bitmap (highest set bit = next
     priority to run, one `CLZ` on ARMv7-M and up), round-robin by list
     rotation, and a delay list holding only the finite-delay sleepers.
-  - `tick.c` — tick counter, tick handler (wakes delays, drives timers, preempts).
-  - `delay.c` — blocking millisecond/second delays, DWT-precise microsecond busy-wait.
-  - `critical.c` — PRIMASK-based nesting critical sections.
-  - `mutex.c`, `semaphore.c`, `queue.c`, `event.c` — sync/IPC primitives with `timeout_ms` waits.
-  - `timer.c` — software timers; expiry is detected by the tick, callbacks run on the
+  - `os_tick.c` — tick counter, tick handler (wakes delays, drives timers, preempts).
+  - `os_delay.c` — blocking millisecond/second delays, DWT-precise microsecond busy-wait.
+  - `os_critical.c` — PRIMASK-based nesting critical sections.
+  - `os_mutex.c`, `os_semaphore.c`, `os_queue.c`, `os_event.c` — sync/IPC primitives with
+    `timeout_ms` waits.
+  - `os_timer.c` — software timers; expiry is detected by the tick, callbacks run on the
     kernel timer task (`tsk_timer`, highest priority).
-  - `work.c` — Zephyr-style deferrable work queue; items run on the kernel work task
+  - `os_work.c` — Zephyr-style deferrable work queue; items run on the kernel work task
     (`tsk_work`, highest priority).
-  - `memory_pool.c` — fixed-block pool utility.
-  - `list.c` — intrusive doubly-linked list; always compiled (the scheduler
+  - `os_memory_pool.c` — fixed-block pool utility.
+  - `os_list.c` — intrusive doubly-linked list; always compiled (the scheduler
     itself runs on it, so it cannot be configured out), also public API.
   - `os_internal.h` — internal cross-module contract (not for applications).
 - `arch/arm/` — port layer: SysTick tick source, SVC first-task start,
@@ -93,8 +112,8 @@ Projects never edit kernel files, and the kernel ships no editable
 configuration of its own — the application owns the one and only config
 file (the FreeRTOSConfig.h model):
 
-1. Copy `ahura_kernel/ahura_config_template.h` into the project as
-   `ahura_config.h` (any directory — the project layout does not matter).
+1. Copy `ahura_kernel/os_config_template.h` into the project as
+   `os_config.h` (any directory — the project layout does not matter).
    Every option is active at its default value; adjust values in place.
 2. Make that directory visible to the **kernel library build**, not just
    the application — set `OS_CONFIG_DIR` before
@@ -108,23 +127,23 @@ file (the FreeRTOSConfig.h model):
    If only the application saw the file, kernel and application would
    compile with different `OS_CONFIG_` values and structure sizes would
    silently disagree. The kernel CMakeLists warns when `OS_CONFIG_DIR` is
-   unset, and the build stops with a clear `#error` when no `ahura_config.h`
+   unset, and the build stops with a clear `#error` when no `os_config.h`
    is found or when it is missing options (a missing option would otherwise
    read as 0 in `#if` and silently disable features — so keep all options,
    the template lists exactly what is required).
 
-`ahura_config.h` is the single source of configuration: all options are
+`os_config.h` is the single source of configuration: all options are
 plain defines, so do not additionally define `OS_CONFIG_` macros from the
 build system (`target_compile_definitions`) — that would redefine them. The
 `OS_CONFIG_TRUSTZONE_*` mode values are kernel-owned
 (`os_arch_port_common.h`); the config file only selects among them.
 
-## Application callbacks (ahura_cb.c)
+## Application callbacks (os_cb.c)
 
 All user-overridable hooks are weak `_cb` functions, so overriding is
 optional per function. For a clean starting point, copy
-`ahura_kernel/ahura_cb_template.c` into the application source tree as
-`ahura_cb.c`, add it to the **application** build (never to the kernel — the
+`ahura_kernel/os_cb_template.c` into the application source tree as
+`os_cb.c`, add it to the **application** build (never to the kernel — the
 template is deliberately absent from the kernel CMakeLists), and adapt:
 
 - `os_clock_hz_get_cb` — CPU clock in Hz (see "Platform clock").
@@ -135,8 +154,105 @@ template is deliberately absent from the kernel CMakeLists), and adapt:
   glue; plus `os_arch_spinlock_acquire_cb`/`_release_cb` on ARMv6-M
   multi-core SoCs (mandatory there).
 
-This project keeps its copy in `Core/Src/ahura_cb.c` with its configuration
-in `Core/Inc/ahura_config.h`.
+This project keeps its copy in `Core/Src/os_cb.c` with its configuration
+in `Core/Inc/os_config.h`.
+
+## Default application task
+
+Most RTOS applications create every task by hand in `main()` before calling
+`os_start()`. Ahura instead gives every application one default task for
+free: `os_init()` unconditionally creates and starts it (gated by
+`OS_CONFIG_MAIN_TASK_ENABLE`, see `os_kernel.c`'s `os_main_system_init()`), so
+`main()` needs nothing beyond the usual
+
+```c
+os_init();
+os_start();
+```
+
+The task's body is the weak function `os_main()` (prototype in `ahura.h`,
+weak default in `os_kernel.c` idles forever) — **not** a `_cb` function, on
+purpose: this is where the application's own code runs, not a kernel query
+for platform behavior, even though it is wired up the same way (weak
+default, strong override). Override it with its own template, separate from
+`os_cb_template.c`: copy `ahura_kernel/os_main_template.c` into the project
+as `os_main.c`, add it to the **application** build (never to the kernel —
+deliberately absent from the kernel CMakeLists, like `os_cb_template.c`),
+and replace `os_main()`'s body with the application's own code (a plain
+`while (1)` loop, or spawn further tasks from it). Sized by two config
+options:
+
+```c
+#define OS_CONFIG_MAIN_TASK_ENABLE      1U     /* 0 = no default task at all           */
+#define OS_CONFIG_MAIN_TASK_STACK_SIZE  1024U  /* bytes                                */
+#define OS_CONFIG_MAIN_TASK_PRIORITY    1U     /* OS_TASK_PRIORITY_USER_MIN..USER_MAX  */
+```
+
+Set `OS_CONFIG_MAIN_TASK_ENABLE` to `0` for applications that create every
+task by hand instead (the task, its stack, and `os_main()` all compile
+out). Tasks that must exist before the scheduler starts (rare) still belong
+in `main()`, created the usual way. This project keeps its copy in
+`Core/Src/os_main.c`, toggling the user LED.
+
+## Self-test suite (ahura_kernel/test/)
+
+Unlike the `_template` files above, the self-test suite is not copied into
+the application — it is a normal buildable module with its own
+`CMakeLists.txt` (`ahura_kernel/test/CMakeLists.txt`), producing a static
+library `os_test` that links against `ahura_kernel` and supplies the strong
+override of the weak `os_test()` (prototype in `ahura.h`, empty default in
+`os_kernel.c`; not a `_cb` function - see "Layout"). Any project that
+already builds the kernel can add it:
+
+```cmake
+add_subdirectory(ahura_kernel)
+add_subdirectory(ahura_kernel/test)   # builds the os_test library
+# ...
+target_link_libraries(my_app PRIVATE
+    ahura_kernel
+    -Wl,--whole-archive
+    os_test
+    -Wl,--no-whole-archive
+)
+```
+
+**The `--whole-archive` wrapping is required, not optional.** `os_test` only
+*overrides* the weak `os_test()` - it never adds a new undefined symbol
+for the linker to resolve. A normal (non-whole-archive) static-library link
+only pulls in an archive member when something is still undefined at that
+point; since `os_kernel.c.o` (pulled in for `os_init`/`os_start` regardless)
+already *defines* `os_test` weakly, the linker has no reason to ever look
+inside `libos_test.a`, and the entire suite - along with its RAM/flash
+footprint - silently disappears from the build with no warning. Whole-archive
+forces every object in the library into the link so the strong definition is
+actually present to win over the weak one. (The default application task
+does not need this: `os_cb.c` is compiled directly into the application's own
+object list, not packaged into a separate archive, so ordinary objects always
+link in and strong-over-weak resolution works normally.)
+
+Same automatic-task pattern as the default application task: once linked,
+`os_init()` creates and starts the self-test task by itself (gated by
+`OS_CONFIG_TEST_ENABLE`, off by default in the template - opt in per
+project). Nothing to call:
+
+```c
+os_init();   /* creates and starts tsk_test too, since os_test is linked and TEST_ENABLE=1 */
+os_start();
+```
+
+The task runs `os_test()` once: exercises whichever
+`OS_CONFIG_<FEATURE>_ENABLE` switches are on (tasks, delays, critical
+sections, mutexes, semaphores, queues, event groups, timers, work items,
+memory pools, the kernel heap, stack watermarks, CPU usage, the intrusive
+list), and prints a detailed PASS/FAIL log via `printf` followed by a
+pass/fail summary, sized by `OS_CONFIG_TEST_STACK_SIZE` /
+`OS_CONFIG_TEST_PRIORITY`. The suite depends on nothing but `ahura.h` — no
+board or HAL headers — so it runs on real hardware for any arch/board the
+kernel supports; retarget `printf`'s destination (typically a UART) in the
+application to see the log. This project links `os_test` into the same
+firmware as the application (see the top-level `CMakeLists.txt`) with
+`OS_CONFIG_TEST_ENABLE` set to 1, so flashing the normal build also runs the
+test on the device.
 
 ## CPU usage
 
@@ -175,7 +291,10 @@ be disabled in option bytes (e.g. `TZEN` on STM32H5) — that case uses
    are provided by the port — do not define them in `stm32*_it.c`.
 2. Call `os_init()` after clocks are configured (it reads the CPU clock
    through `os_clock_hz_get_cb`, see "Platform clock").
-3. Create and start tasks, then call `os_start()` (never returns).
+3. Create and start any tasks the application needs before the scheduler runs
+   (`os_init()` already created the default task, see "Default application
+   task", unless `OS_CONFIG_MAIN_TASK_ENABLE` is 0), then call `os_start()`
+   (never returns).
 4. Task stacks: use `OS_TASK_DEFINE(name, stack_bytes)`; the size is in bytes
    (rounded up to an 8-byte multiple by the macro) and must be at least
    `OS_CONFIG_MIN_STACK_SIZE`.
@@ -186,7 +305,12 @@ be disabled in option bytes (e.g. `TZEN` on STM32H5) — that case uses
 - `OS_CONFIG_MAX_PRIORITY` — kernel service tasks (`tsk_work`, `tsk_timer`), created
   automatically by `os_init()`; they occupy two `OS_CONFIG_MAX_TASKS` slots.
 - `OS_TASK_PRIORITY_USER_MIN .. OS_TASK_PRIORITY_USER_MAX` (1 .. MAX-1) — user tasks;
-  `os_task_create` rejects anything outside this range.
+  `os_task_create` rejects anything outside this range. The default application
+  task (`tsk_main`, see "Default application task") and the self-test task
+  (`tsk_test`, see "Self-test suite") both live in this range too, at
+  `OS_CONFIG_MAIN_TASK_PRIORITY` / `OS_CONFIG_TEST_PRIORITY` — unlike
+  `tsk_work`/`tsk_timer` they are not priority-reserved, so pick values that
+  fit alongside the application's own tasks.
 
 ## Work queue
 
@@ -354,7 +478,7 @@ void os_tickless_pre_sleep_cb(void)   { /* select sleep mode (e.g. SLEEPDEEP), g
 void os_tickless_post_sleep_cb(void)  { /* clear SLEEPDEEP, restore clocks */ }
 ```
 
-Status: the flow in `tick.c` (`os_tickless_idle_process`) is complete in shape
+Status: the flow in `os_tick.c` (`os_tickless_idle_process`) is complete in shape
 but is not yet invoked — the idle task still runs a plain `WFI` loop, so
 enabling the config flag currently changes nothing. Remaining work before it
 can be wired in:

@@ -1,5 +1,5 @@
 /**
- * @file work.c
+ * @file os_work.c
  * @brief Deferrable work queue: items run on a kernel task at the highest priority.
  *
  * @copyright (c) 2026 Ahura Project Contributors

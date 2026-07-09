@@ -1,5 +1,5 @@
 /**
- * @file mutex.c
+ * @file os_mutex.c
  * @brief Mutex module implementation with owner tracking and timeouts.
  *
  * @copyright (c) 2026 Ahura Project Contributors

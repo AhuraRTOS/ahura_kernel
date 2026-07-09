@@ -1,13 +1,13 @@
 /**
- * @file ahura_config_template.h
- * @brief Template for the application's ahura_config.h — the complete Ahura
+ * @file os_config_template.h
+ * @brief Template for the application's os_config.h — the complete Ahura
  *        kernel configuration with every option at its default value.
  *
  * NOT included by the kernel: copy this file into the application source
- * tree as ahura_config.h, adjust the values, and make its directory visible
+ * tree as os_config.h, adjust the values, and make its directory visible
  * to BOTH the application and the kernel library build (set OS_CONFIG_DIR
  * before add_subdirectory(ahura_kernel) — see the README "Configuration"
- * section). The kernel refuses to build without a complete ahura_config.h.
+ * section). The kernel refuses to build without a complete os_config.h.
  *
  * This file is the single source of configuration: all options are plain
  * defines, so do not additionally define OS_CONFIG_ macros from the build
@@ -20,8 +20,8 @@
  *            See LICENSE.md in the project root for the full license text.
  */
 
-#ifndef AHURA_CONFIG_H
-#define AHURA_CONFIG_H
+#ifndef OS_CONFIG_H
+#define OS_CONFIG_H
 
 /*
  * ***********************************************************************************************************
@@ -57,6 +57,19 @@
  * since the previous call. Costs two counter updates per tick. */
 #define OS_CONFIG_CPU_USAGE_ENABLE        1U
 
+/* os_init() creates and starts a default application task running the weak
+ * os_main() (override it in the application, e.g. os_main.c, copied from
+ * os_main_template.c) - sized in "Kernel sizing" below, see the README
+ * "Default application task" section. */
+#define OS_CONFIG_MAIN_TASK_ENABLE        1U
+
+/* os_init() creates and starts a self-test task running the weak os_test()
+ * (empty by default; link ahura_kernel/test - the "os_test" library - to run
+ * the real kernel self-test suite there) - sized in "Kernel sizing" below,
+ * see the README "Self-test suite" section. Off by default: opt in per
+ * project. */
+#define OS_CONFIG_TEST_ENABLE             0U
+
 /*
  * ***********************************************************************************************************
  * Kernel sizing
@@ -88,7 +101,10 @@
 #define OS_CONFIG_MAX_PRIORITY          15U
 
 /* Task table size; each enabled kernel service task (work, timer) occupies
- * one of these slots. */
+ * one of these slots - and so does the default application task (tsk_main,
+ * OS_CONFIG_MAIN_TASK_ENABLE above) and the self-test task (tsk_test,
+ * OS_CONFIG_TEST_ENABLE above) when enabled. Budget for all of them plus
+ * the application's own tasks. */
 #define OS_CONFIG_MAX_TASKS             10U
 
 #define OS_CONFIG_MAX_TIMERS            8U
@@ -104,6 +120,25 @@
 /* Stack sizes for the kernel service tasks; user callbacks run on these. */
 #define OS_CONFIG_WORK_STACK_SIZE       512U
 #define OS_CONFIG_TIMER_STACK_SIZE      512U
+
+/* Stack size / priority for the default application task (os_main(), see
+ * OS_CONFIG_MAIN_TASK_ENABLE above and the README "Default application
+ * task" section). os_init() discards the creation status for this task
+ * (void, matching the work/timer system-init calls above) - an
+ * out-of-range priority (must be OS_TASK_PRIORITY_USER_MIN..USER_MAX) or a
+ * too-small stack (must be at least OS_CONFIG_MIN_STACK_SIZE above) fails
+ * SILENTLY: the firmware still builds, boots and schedules, but os_main()
+ * simply never runs. */
+#define OS_CONFIG_MAIN_TASK_STACK_SIZE  1024U
+#define OS_CONFIG_MAIN_TASK_PRIORITY    1U
+
+/* Stack size / priority for the self-test task (os_test(), see
+ * OS_CONFIG_TEST_ENABLE above and the README "Self-test suite" section).
+ * The suite itself needs a generous stack - it exercises every kernel
+ * feature, including nested helper tasks. Same silent-failure caveat as
+ * OS_CONFIG_MAIN_TASK_* above. */
+#define OS_CONFIG_TEST_STACK_SIZE       2048U
+#define OS_CONFIG_TEST_PRIORITY         2U
 
 /* Which cores the kernel service tasks (and so the work handlers and timer
  * callbacks) may run on: core-affinity bitmasks, 0 = any core. Only
@@ -148,7 +183,7 @@
  * cores enter the scheduler through os_core_start(). The SoC layer must
  * provide os_arch_core_id_get_cb() (plus the IPI callback, and the hardware
  * spinlock callbacks on cores without LDREX/STREX, e.g. Cortex-M0+ SoCs);
- * see ahura_cb_template.c and the README "Multi-core" section.
+ * see os_cb_template.c and the README "Multi-core" section.
 */
 
 #define OS_CONFIG_CORE_COUNT            1U
@@ -164,4 +199,4 @@
 #define OS_CONFIG_LPTIM_CLOCK_HZ        32768U
 #define OS_CONFIG_MAX_SUPPRESSED_TICKS  0x00FFFFFFUL
 
-#endif /* AHURA_CONFIG_H */
+#endif /* OS_CONFIG_H */

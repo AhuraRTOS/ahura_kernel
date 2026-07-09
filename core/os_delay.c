@@ -1,5 +1,5 @@
 /**
- * @file delay.c
+ * @file os_delay.c
  * @brief Delay service implementation: blocking tick delays and precise busy-waits.
  *
  * @copyright (c) 2026 Ahura Project Contributors

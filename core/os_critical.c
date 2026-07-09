@@ -1,5 +1,5 @@
 /**
- * @file critical.c
+ * @file os_critical.c
  * @brief Critical section module implementation (PRIMASK based, nesting aware).
  *
  * On multi-core builds (OS_CONFIG_CORE_COUNT > 1) the outermost enter also

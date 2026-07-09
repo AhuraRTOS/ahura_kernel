@@ -13,8 +13,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-/* os_arch_port.h includes and validates the application's ahura_config.h
- * (copy ahura_kernel/ahura_config_template.h, see README "Configuration"). */
+/* os_arch_port.h includes and validates the application's os_config.h
+ * (copy ahura_kernel/os_config_template.h, see README "Configuration"). */
 #include "os_arch_port.h"
 
 #ifdef __cplusplus
@@ -315,6 +315,29 @@ void os_init(void);
  * @brief Start the scheduler and switch to task context. Does not return.
  */
 void os_start(void);
+
+#if (OS_CONFIG_MAIN_TASK_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Default application task body (see OS_CONFIG_MAIN_TASK_* in os_config.h). os_init()
+ *        creates and starts this task automatically; weak default idles - override in the
+ *        application (copy of os_main_template.c, see README "Default application task") with
+ *        real code. Not a "_cb" hook: this is where the application's own code runs, not a
+ *        kernel query for platform behavior.
+ */
+void os_main(void);
+#endif /* OS_CONFIG_MAIN_TASK_ENABLE */
+
+#if (OS_CONFIG_TEST_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Kernel self-test suite entry point (see OS_CONFIG_TEST_* in os_config.h). os_init()
+ *        creates and starts a task that calls this automatically; weak default does nothing -
+ *        link the ahura_kernel/test library (CMake target "os_test") to run the real suite
+ *        (see README "Self-test suite"). Not a "_cb" hook, same reasoning as os_main().
+ */
+void os_test(void);
+#endif /* OS_CONFIG_TEST_ENABLE */
 
 #if (OS_CONFIG_CORE_COUNT > 1U)
 /******************************************************************************************************/

@@ -1,5 +1,5 @@
 /**
- * @file timer.c
+ * @file os_timer.c
  * @brief Software timers: expiry detected by the kernel tick, callbacks run on
  *        a kernel timer task at the highest priority.
  *

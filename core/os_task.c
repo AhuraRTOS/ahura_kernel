@@ -1,5 +1,5 @@
 /**
- * @file task.c
+ * @file os_task.c
  * @brief Task subsystem implementation: static TCB pool, O(1) list-based
  *        scheduling (per-priority ready lists + ready bitmap, round-robin by
  *        list rotation), delay list, blocking, idle task.
