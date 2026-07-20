@@ -75,7 +75,7 @@ void os_tick_handler(void)
      * or elapsed time would be counted once per core. */
     if (os_arch_core_id_get() != 0U)
     {
-        if (os_kernel_is_running())
+        if (os_kernel_is_running() && os_task_reschedule_possible())
         {
             OS_ARCH_CONTEXT_SWITCH_REQUEST();
         }
@@ -102,10 +102,15 @@ void os_tick_handler(void)
 #endif
     os_task_tick_update(1U);
 
-    /* Preempt every tick: wakes expired delays and round-robins tasks of
-     * equal priority. PendSV is the lowest priority, so it runs after all
+    /* Pend PendSV only when it would actually do something: a wake this tick
+     * (work/timer/delay expiry) or an equal-priority peer to round-robin
+     * with both already show up as a ready-bitmap bit at or above the
+     * running task's priority, so os_task_reschedule_possible catches every
+     * case that mattered under the old unconditional pend - a quiescent
+     * tick now costs one bitmap check instead of a full PendSV round trip.
+     * PendSV is the lowest priority, so a real one still runs after all
      * pending interrupts complete. */
-    if (os_kernel_is_running())
+    if (os_kernel_is_running() && os_task_reschedule_possible())
     {
         OS_ARCH_CONTEXT_SWITCH_REQUEST();
     }
@@ -120,6 +125,10 @@ void os_tick_handler(void)
  */
 void os_tick_announce(uint32_t elapsed_ticks)
 {
+    /* Unlike os_tick_handler this runs in task context (tickless idle), so
+     * the counter updates are guarded against a concurrent tick interrupt. */
+    uint32_t mask_state = os_arch_kernel_mask_save();
+
     os_tick_count += elapsed_ticks;
 
 #if (OS_CONFIG_CPU_USAGE_ENABLE == 1U)
@@ -127,6 +136,8 @@ void os_tick_announce(uint32_t elapsed_ticks)
     os_tick_usage_total_ticks += elapsed_ticks;
     os_tick_usage_idle_ticks  += elapsed_ticks;
 #endif
+
+    os_arch_kernel_mask_restore(mask_state);
 
 #if (OS_CONFIG_WORK_ENABLE == 1U)
     os_work_tick_process(elapsed_ticks);
@@ -136,7 +147,7 @@ void os_tick_announce(uint32_t elapsed_ticks)
 #endif
     os_task_tick_update(elapsed_ticks);
 
-    if (os_kernel_is_running())
+    if (os_kernel_is_running() && os_task_reschedule_possible())
     {
         OS_ARCH_CONTEXT_SWITCH_REQUEST();
     }
@@ -191,15 +202,32 @@ uint32_t os_cpu_usage_get(void)
 uint32_t os_tickless_expected_idle_ticks_get(void)
 {
 #if (OS_CONFIG_TICKLESS_ENABLE == 1U)
-#if (OS_CONFIG_TIMER_ENABLE == 1U)
-    uint32_t idle_ticks = os_timer_next_expiry_ticks_get();
-#else
+    /* The suppressed-tick window must not overrun ANY kernel time source:
+     * the earliest software timer expiry, the earliest delayed work item,
+     * and the earliest finite-delay task sleeper all bound it. */
     uint32_t idle_ticks = OS_CONFIG_MAX_SUPPRESSED_TICKS;
+    uint32_t candidate;
+
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
+    candidate = os_timer_next_expiry_ticks_get();
+    if (candidate < idle_ticks)
+    {
+        idle_ticks = candidate;
+    }
 #endif
 
-    if (idle_ticks > OS_CONFIG_MAX_SUPPRESSED_TICKS)
+#if (OS_CONFIG_WORK_ENABLE == 1U)
+    candidate = os_work_next_ready_ticks_get();
+    if (candidate < idle_ticks)
     {
-        idle_ticks = OS_CONFIG_MAX_SUPPRESSED_TICKS;
+        idle_ticks = candidate;
+    }
+#endif
+
+    candidate = os_task_next_delay_ticks_get();
+    if (candidate < idle_ticks)
+    {
+        idle_ticks = candidate;
     }
 
     return idle_ticks;

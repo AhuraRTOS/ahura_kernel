@@ -57,13 +57,14 @@
  * since the previous call. Costs two counter updates per tick. */
 #define OS_CONFIG_CPU_USAGE_ENABLE        1U
 
-/* os_init() creates and starts a default application task running the weak
- * os_main() (override it in the application, e.g. os_main.c, copied from
- * os_main_template.c) - sized in "Kernel sizing" below, see the README
- * "Default application task" section. */
-#define OS_CONFIG_MAIN_TASK_ENABLE        1U
-
-/* os_init() creates and starts a self-test task running the weak os_test()
+/* os_init() unconditionally creates and starts a default application task
+ * running the weak os_main() (override it in the application, e.g.
+ * os_main.c, copied from os_main_template.c) - sized in "Kernel sizing"
+ * below, see the README "Default application task" section. Not created
+ * when OS_CONFIG_TEST_ENABLE below is 1: the self-test task runs alone
+ * instead (see the README "Self-test suite" section).
+ *
+ * os_init() creates and starts a self-test task running the weak os_test()
  * (empty by default; link ahura_kernel/test - the "os_test" library - to run
  * the real kernel self-test suite there) - sized in "Kernel sizing" below,
  * see the README "Self-test suite" section. Off by default: opt in per
@@ -92,19 +93,11 @@
 /* Kernel heap size in bytes for os_alloc/os_free. */
 #define OS_CONFIG_HEAP_SIZE             4096U
 
-/*
- * Priority 0 is the idle task and OS_CONFIG_MAX_PRIORITY is reserved for the
- * kernel service tasks (work queue, timers). User tasks must use priorities
- * 1 .. OS_CONFIG_MAX_PRIORITY-1, so this value must be at least 2 - and at
- * most 31, because the scheduler's ready bitmap is 32 bits wide.
- */
-#define OS_CONFIG_MAX_PRIORITY          15U
-
 /* Task table size; each enabled kernel service task (work, timer) occupies
  * one of these slots - and so does the default application task (tsk_main,
- * OS_CONFIG_MAIN_TASK_ENABLE above) and the self-test task (tsk_test,
- * OS_CONFIG_TEST_ENABLE above) when enabled. Budget for all of them plus
- * the application's own tasks. */
+ * unconditional unless OS_CONFIG_TEST_ENABLE above is 1) and the self-test
+ * task (tsk_test, OS_CONFIG_TEST_ENABLE above) when enabled. Budget for all
+ * of them plus the application's own tasks. */
 #define OS_CONFIG_MAX_TASKS             10U
 
 #define OS_CONFIG_MAX_TIMERS            8U
@@ -122,13 +115,12 @@
 #define OS_CONFIG_TIMER_STACK_SIZE      512U
 
 /* Stack size / priority for the default application task (os_main(), see
- * OS_CONFIG_MAIN_TASK_ENABLE above and the README "Default application
- * task" section). os_init() discards the creation status for this task
- * (void, matching the work/timer system-init calls above) - an
- * out-of-range priority (must be OS_TASK_PRIORITY_USER_MIN..USER_MAX) or a
- * too-small stack (must be at least OS_CONFIG_MIN_STACK_SIZE above) fails
- * SILENTLY: the firmware still builds, boots and schedules, but os_main()
- * simply never runs. */
+ * the README "Default application task" section). os_init() discards the
+ * creation status for this task (void, matching the work/timer system-init
+ * calls above) - an out-of-range priority (must be
+ * OS_TASK_PRIO_USER_MIN..USER_MAX) or a too-small stack (must be at
+ * least OS_CONFIG_MIN_STACK_SIZE above) fails SILENTLY: the firmware still
+ * builds, boots and schedules, but os_main() simply never runs. */
 #define OS_CONFIG_MAIN_TASK_STACK_SIZE  1024U
 #define OS_CONFIG_MAIN_TASK_PRIORITY    1U
 
@@ -174,6 +166,40 @@
 
 /*
  * ***********************************************************************************************************
+ * Kernel interrupt mask (zero-latency interrupts, BASEPRI)
+ * ***********************************************************************************************************
+ *
+ * 0 (default): kernel critical sections mask ALL interrupts with PRIMASK.
+ * Simple contract - every ISR may call the ISR-safe kernel APIs - at the
+ * cost of the kernel's critical sections adding latency to every interrupt.
+ * The only choice on cores without BASEPRI (Cortex-M0/M0+/M23).
+ *
+ * Nonzero: kernel critical sections raise BASEPRI to this value instead
+ * (Cortex-M3/M4/M7/M33/M35P/M52/M55/M85). Interrupts whose NVIC priority is
+ * numerically LOWER (more urgent) than this value are never masked by the
+ * kernel - zero kernel-induced latency - but they MUST NOT call any kernel
+ * API (os_critical_enter traps violations; a misconfigured ISR then parks in
+ * os_arch_config_fault_trap). Interrupts at numerically equal or higher
+ * priority values keep full kernel API access.
+ *
+ * The value is the raw 8-bit priority byte as written to the NVIC, i.e.
+ * pre-shifted into the device's implemented priority bits:
+ *
+ *   value = logical_priority << (8 - __NVIC_PRIO_BITS)
+ *
+ * Example, STM32 (4 priority bits): 0x50 = logical priority 5. ISRs at
+ * logical 0..4 become zero-latency/no-kernel-API; ISRs at logical 5..15 may
+ * use the kernel. os_arch_init verifies two things at boot and parks in
+ * os_arch_config_fault_trap on violation: the value must fit the device's
+ * implemented priority bits exactly (no truncation), and the NVIC priority
+ * grouping must dedicate every implemented bit to preemption - no
+ * subpriority bits (STM32 HAL: NVIC_PRIORITYGROUP_4, the CubeMX default).
+*/
+
+#define OS_CONFIG_MAX_SYSCALL_INTERRUPT_PRIORITY  0U
+
+/*
+ * ***********************************************************************************************************
  * Multi-core (experimental scaffold)
  * ***********************************************************************************************************
  *
@@ -184,9 +210,56 @@
  * provide os_arch_core_id_get_cb() (plus the IPI callback, and the hardware
  * spinlock callbacks on cores without LDREX/STREX, e.g. Cortex-M0+ SoCs);
  * see os_cb_template.c and the README "Multi-core" section.
+ *
+ * Two more preconditions the kernel cannot verify or provide for on its own
+ * - both are SoC/hardware properties, not something a portable C source file
+ * can guarantee - so satisfying them is the SoC integrator's responsibility
+ * before setting this above 1:
+ *
+ *   1. Global exclusive monitor. The kernel's inter-core spinlock
+ *      (os_arch_port_common.h) is built on LDREX/STREX whenever the target
+ *      has them (all v7-M/v8-M cores). STREX only excludes another core when
+ *      the interconnect implements a GLOBAL exclusive monitor for the lock's
+ *      address AND that address is Shareable-mapped; both are SoC/MPU
+ *      choices. Without them, both cores' local monitors can grant STREX
+ *      success simultaneously and the "lock" silently stops excluding
+ *      anything - no fault, just corruption. Verify your SoC's TRM documents
+ *      a global monitor for the memory region the spinlock lives in (a
+ *      static in this library's .bss), and mark that region Shareable.
+ *   2. Cache coherency. Cortex-M has no inter-core cache coherency. On D-cache
+ *      cores (M7, M55, M85) a volatile store to write-back-cacheable SRAM
+ *      only reaches the local cache; DSB is not cache maintenance. Every
+ *      cross-core shared kernel object (the ready/delay lists, the work/timer
+ *      registries, os_task_current[], the spinlock word itself) must live in
+ *      a non-cacheable or cache-coherent region, or the SoC must bracket
+ *      cross-core handoffs with explicit clean/invalidate - typically done by
+ *      placing the whole kernel's shared statics in a dedicated non-cacheable
+ *      MPU region via the linker script.
+ *
+ * Neither precondition has a portable fallback for cache coherency - that
+ * still requires SoC-specific MPU/linker placement. The exclusive-monitor
+ * precondition does have one: set OS_CONFIG_MULTICORE_SPINLOCK_SOC_BACKEND
+ * below to route the kernel spinlock through your own hardware semaphore
+ * (os_arch_spinlock_acquire_cb/_release_cb in os_cb_template.c) instead of
+ * the built-in LDREX/STREX backend.
 */
 
 #define OS_CONFIG_CORE_COUNT            1U
+
+/*
+ * 0 (default): the kernel spinlock uses the built-in LDREX/STREX backend on
+ * cores that have it (all v7-M/v8-M cores); ARMv6-M multi-core SoCs (no
+ * LDREX/STREX) always use the callback backend regardless of this setting.
+ * 1: force the callback backend even on an exclusives-capable core - set
+ * this when your SoC's interconnect has no GLOBAL exclusive monitor for the
+ * spinlock's memory, or that memory cannot be marked Shareable (see the
+ * OS_CONFIG_CORE_COUNT precondition notes above); implement
+ * os_arch_spinlock_acquire_cb/_release_cb (os_cb_template.c) against your
+ * SoC's hardware semaphore in that case. Only meaningful when
+ * OS_CONFIG_CORE_COUNT > 1; keep 0 on single-core builds.
+*/
+
+#define OS_CONFIG_MULTICORE_SPINLOCK_SOC_BACKEND  0U
 
 /*
  * ***********************************************************************************************************

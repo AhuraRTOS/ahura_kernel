@@ -27,8 +27,13 @@
 /**
  * @brief Initialize a mutex object.
  *
+ * Re-initializing a mutex that still has queued waiters is refused: resetting
+ * the waiter list would strand the queued tasks on dangling intrusive nodes
+ * and corrupt the list. (The check reads the object's current memory, so
+ * first-time init must run on zero-initialized storage - static objects are.)
+ *
  * @param[in,out] mutex  Mutex object.
- * @return os_status Status code.
+ * @return os_status  OK, or BUSY while tasks are waiting on it.
  */
 os_status os_mutex_init(os_mutex_t *mutex)
 {
@@ -37,10 +42,19 @@ os_status os_mutex_init(os_mutex_t *mutex)
         return OS_STATUS_INVALID_ARG;
     }
 
+    os_critical_enter();
+
+    if (mutex->waiters.head != NULL)
+    {
+        os_critical_exit();
+        return OS_STATUS_BUSY;
+    }
+
     mutex->locked   = false;
     mutex->owner_id = 0U;
     os_list_init(&mutex->waiters);
 
+    os_critical_exit();
     return OS_STATUS_OK;
 }
 
@@ -48,27 +62,33 @@ os_status os_mutex_init(os_mutex_t *mutex)
 /**
  * @brief Acquire a mutex, waiting up to timeout_ms when contended.
  *
- * Must not be called with a nonzero timeout from interrupt context. The
+ * A mutex is an ownership object, so it is task-only: calls from interrupt
+ * context are rejected (an ISR has no identity of its own - it would
+ * silently borrow the identity of whichever task it interrupted). The
  * mutex is not recursive: locking a mutex the caller already holds fails
  * with OS_STATUS_BUSY instead of deadlocking.
  *
  * @param[in,out] mutex       Mutex object.
  * @param[in]     timeout_ms  OS_WAIT_NOTHING, a duration in ms, or OS_WAIT_FOREVER.
  * @return os_status  OK on acquisition, BUSY when unavailable without waiting,
- *                    TIMEOUT when the wait elapsed.
+ *                    TIMEOUT when the wait elapsed, INVALID_ARG from an ISR.
  */
 os_status os_mutex_lock(os_mutex_t *mutex, uint32_t timeout_ms)
 {
     uint32_t self_id;
+    uint32_t budget_ticks;
+    uint32_t start_tick;
     uint32_t remaining_ticks;
 
-    if (mutex == NULL)
+    if ((mutex == NULL) || os_arch_in_isr())
     {
         return OS_STATUS_INVALID_ARG;
     }
 
     self_id         = os_task_current_id_get();
-    remaining_ticks = os_internal_timeout_to_ticks(timeout_ms);
+    budget_ticks    = os_internal_timeout_to_ticks(timeout_ms);
+    start_tick      = os_tick_get();
+    remaining_ticks = budget_ticks;
 
     for (;;)
     {
@@ -105,13 +125,14 @@ os_status os_mutex_lock(os_mutex_t *mutex, uint32_t timeout_ms)
         os_critical_exit();
 
         /* Resumed: unlock signaled us (retry the take - another task may
-         * have been faster) or the wait timed out. */
+         * have been faster) or the wait timed out. The budget is recomputed
+         * against the wall clock so READY time counts toward the timeout. */
         if (!os_task_wait_signaled())
         {
             return OS_STATUS_TIMEOUT;
         }
 
-        remaining_ticks = os_task_wait_remaining_ticks();
+        remaining_ticks = os_internal_wait_remaining(budget_ticks, start_tick);
     }
 }
 
@@ -129,17 +150,17 @@ os_status os_mutex_try_lock(os_mutex_t *mutex)
 
 /******************************************************************************************************/
 /**
- * @brief Release a mutex object (only the owner may unlock).
+ * @brief Release a mutex object (only the owner may unlock; task-only, like os_mutex_lock).
  *
  * @param[in,out] mutex  Mutex object.
  * @return os_status  OK on release, ERROR when not locked,
- *                    NOT_OWNER when held by another task.
+ *                    NOT_OWNER when held by another task, INVALID_ARG from an ISR.
  */
 os_status os_mutex_unlock(os_mutex_t *mutex)
 {
     uint32_t self_id;
 
-    if (mutex == NULL)
+    if ((mutex == NULL) || os_arch_in_isr())
     {
         return OS_STATUS_INVALID_ARG;
     }

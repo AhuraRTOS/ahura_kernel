@@ -61,7 +61,7 @@ typedef struct os_alloc_block
 
 static uint8_t           os_alloc_heap[OS_CONFIG_HEAP_SIZE];
 static os_alloc_block_t  os_alloc_start;
-static os_alloc_block_t  *os_alloc_end           = (os_alloc_block_t *)0;
+static os_alloc_block_t  *os_alloc_end           = NULL;
 static size_t            os_alloc_free_bytes     = 0U;
 static size_t            os_alloc_min_free_bytes = 0U;
 
@@ -91,12 +91,12 @@ void* os_alloc(size_t size)
 {
     os_alloc_block_t *prev;
     os_alloc_block_t *block;
-    void             *memory = (void *)0;
+    void             *memory = NULL;
     size_t           need;
 
     if (size == 0U)
     {
-        return (void *)0;
+        return NULL;
     }
 
     /* Whole-block size: header + payload rounded up to the alignment. The
@@ -105,12 +105,12 @@ void* os_alloc(size_t size)
     need = OS_ALLOC_HEADER_SIZE + ((size + OS_ALLOC_ALIGN_MSK) & ~OS_ALLOC_ALIGN_MSK);
     if ((need < size) || ((need & OS_ALLOC_ALLOCATED_MSK) != 0U))
     {
-        return (void *)0;
+        return NULL;
     }
 
     os_critical_enter();
 
-    if (os_alloc_end == (os_alloc_block_t *)0)
+    if (os_alloc_end == NULL)
     {
         os_alloc_init();
     }
@@ -126,16 +126,27 @@ void* os_alloc(size_t size)
 
     if (block != os_alloc_end)
     {
-        prev->next = block->next;
+        os_alloc_block_t *next_free = block->next; /* capture before either relink below */
 
-        /* Split when the leftover still makes a usable free block. */
+        /* Split when the leftover still makes a usable free block. The
+         * remainder's position in the address-ordered list is already known
+         * (between prev and next_free) so it is relinked directly instead of
+         * re-walking the whole free list via os_alloc_block_insert: neither
+         * merge could ever fire here (the predecessor is the block just
+         * removed, and a touching successor would already have been merged
+         * when this free block was inserted). */
         if ((block->size - need) >= OS_ALLOC_MIN_BLOCK_SIZE)
         {
             os_alloc_block_t *remainder = (os_alloc_block_t *)(void *)((uint8_t *)block + need);
 
             remainder->size = block->size - need;
+            remainder->next = next_free;
+            prev->next      = remainder;
             block->size     = need;
-            os_alloc_block_insert(remainder);
+        }
+        else
+        {
+            prev->next = next_free;
         }
 
         os_alloc_free_bytes -= block->size;
@@ -145,7 +156,7 @@ void* os_alloc(size_t size)
         }
 
         block->size |= OS_ALLOC_ALLOCATED_MSK;
-        block->next = (os_alloc_block_t *)0;
+        block->next = NULL;
 
         memory = (void *)((uint8_t *)block + OS_ALLOC_HEADER_SIZE);
     }
@@ -168,7 +179,7 @@ void os_free(void *memory)
 {
     os_alloc_block_t *block;
 
-    if ((memory == (void *)0) || (os_alloc_end == (os_alloc_block_t *)0))
+    if ((memory == NULL) || (os_alloc_end == NULL))
     {
         return;
     }
@@ -181,16 +192,22 @@ void os_free(void *memory)
 
     block = (os_alloc_block_t *)(void *)((uint8_t *)memory - OS_ALLOC_HEADER_SIZE);
 
-    /* An os_alloc block carries the allocated flag and a cleared link. */
-    if (((block->size & OS_ALLOC_ALLOCATED_MSK) == 0U) || (block->next != (os_alloc_block_t *)0))
+    os_critical_enter();
+
+    /* An os_alloc block carries the allocated flag and a cleared link.
+     * Validated and cleared inside the critical section: a racing free of
+     * the same pointer (a higher-priority ISR, or another core) must never
+     * observe the flag still set after this check passes - otherwise both
+     * callers complete the free and the block gets linked into the free
+     * list twice (self-loop, or a live allocation freed out from under its
+     * owner). */
+    if (((block->size & OS_ALLOC_ALLOCATED_MSK) == 0U) || (block->next != NULL))
     {
+        os_critical_exit();
         return;
     }
 
     block->size &= ~OS_ALLOC_ALLOCATED_MSK;
-
-    os_critical_enter();
-
     os_alloc_free_bytes += block->size;
     os_alloc_block_insert(block);
 
@@ -209,7 +226,7 @@ size_t os_alloc_free_bytes_get(void)
 
     os_critical_enter();
 
-    if (os_alloc_end == (os_alloc_block_t *)0)
+    if (os_alloc_end == NULL)
     {
         os_alloc_init();
     }
@@ -233,7 +250,7 @@ size_t os_alloc_min_free_bytes_get(void)
 
     os_critical_enter();
 
-    if (os_alloc_end == (os_alloc_block_t *)0)
+    if (os_alloc_end == NULL)
     {
         os_alloc_init();
     }
@@ -268,7 +285,7 @@ static void os_alloc_init(void)
     os_alloc_block_t *first      = (os_alloc_block_t *)heap_start;
 
     os_alloc_end       = (os_alloc_block_t *)heap_end;
-    os_alloc_end->next = (os_alloc_block_t *)0;
+    os_alloc_end->next = NULL;
     os_alloc_end->size = 0U;
 
     first->size = (size_t)(heap_end - heap_start);

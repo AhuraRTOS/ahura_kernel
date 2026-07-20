@@ -26,8 +26,13 @@
  * ***********************************************************************************************************
 */
 
-static uint8_t              timer_task_stack[OS_CONFIG_TIMER_STACK_SIZE] OS_STACK_ALIGNED;
-static os_task_t            timer_task_handle;
+static uint8_t              os_timer_task_stack[OS_CONFIG_TIMER_STACK_SIZE] OS_STACK_ALIGNED;
+static os_task_t            os_timer_task_handle;
+
+/* Resolved once in os_timer_system_init: the timer task is never deleted, so
+ * this handle stays valid for the kernel's lifetime and the tick-time expiry
+ * wake skips the id lookup. */
+static void                 *os_timer_task_tcb = NULL;
 
 /* Registry of started timers, advanced on every kernel tick. Fixed slots so
  * tick-time iteration stays safe against concurrent start/stop calls.
@@ -35,7 +40,7 @@ static os_task_t            timer_task_handle;
  * typedef lets __IO qualify the slot rather than the pointed-to timer. */
 typedef os_timer_t *os_timer_slot_t;
 
-static __IO os_timer_slot_t timer_registry[OS_CONFIG_MAX_TIMERS];
+static __IO os_timer_slot_t os_timer_registry[OS_CONFIG_MAX_TIMERS];
 
 /*
  * ***********************************************************************************************************
@@ -43,10 +48,11 @@ static __IO os_timer_slot_t timer_registry[OS_CONFIG_MAX_TIMERS];
  * ***********************************************************************************************************
 */
 
-static void        timer_task_entry(void *context);
-static os_timer_t* timer_expired_fetch(void);
-static bool        timer_expired_exists(void);
-static uint32_t    timer_registry_slot_find(const os_timer_t *timer);
+static void        os_timer_task_entry(void *context);
+static os_timer_t* os_timer_expired_fetch(void);
+static bool        os_timer_expired_exists(void);
+static uint32_t    os_timer_registry_slot_find(const os_timer_t *timer);
+static uint32_t    os_timer_registry_slot_acquire(const os_timer_t *timer);
 
 /*
  * ***********************************************************************************************************
@@ -102,12 +108,10 @@ os_status os_timer_start(os_timer_t *timer)
 
     os_critical_enter();
 
-    /* Restarting an already-registered timer just reloads it. */
-    slot = timer_registry_slot_find(timer);
-    if (slot >= OS_CONFIG_MAX_TIMERS)
-    {
-        slot = timer_registry_slot_find(NULL);
-    }
+    /* Single pass: restarting an already-registered timer takes its own
+     * slot rather than a free one, and both the match and the free-slot
+     * fallback are found in one walk instead of two. */
+    slot = os_timer_registry_slot_acquire(timer);
 
     if (slot >= OS_CONFIG_MAX_TIMERS)
     {
@@ -115,9 +119,9 @@ os_status os_timer_start(os_timer_t *timer)
         return OS_STATUS_FULL;
     }
 
-    timer_registry[slot]   = timer;
-    timer->remaining_ticks = timer->period_ticks;
-    timer->active          = true;
+    os_timer_registry[slot] = timer;
+    timer->remaining_ticks  = timer->period_ticks;
+    timer->active           = true;
 
     os_critical_exit();
     return OS_STATUS_OK;
@@ -143,10 +147,10 @@ os_status os_timer_stop(os_timer_t *timer)
 
     timer->active  = false;
     timer->expired = false;
-    slot           = timer_registry_slot_find(timer);
+    slot           = os_timer_registry_slot_find(timer);
     if (slot < OS_CONFIG_MAX_TIMERS)
     {
-        timer_registry[slot] = NULL;
+        os_timer_registry[slot] = NULL;
     }
 
     os_critical_exit();
@@ -167,26 +171,36 @@ os_status os_timer_system_init(void)
     os_task_config_t config =
     {
         "tsk_timer",
-        timer_task_entry,
-        (void *)0,
-        OS_CONFIG_MAX_PRIORITY,
-        (void *)timer_task_stack,
-        sizeof(timer_task_stack),
+        os_timer_task_entry,
+        NULL,
+        OS_TASK_PRIO_MAX,
+        (void *)os_timer_task_stack,
+        sizeof(os_timer_task_stack),
         OS_CONFIG_TIMER_CORE_AFFINITY
     };
 
     for (slot = 0U; slot < OS_CONFIG_MAX_TIMERS; slot++)
     {
-        timer_registry[slot] = NULL;
+        os_timer_registry[slot] = NULL;
     }
 
-    status = os_task_create_system(&timer_task_handle, &config);
+    status = os_task_create_system(&os_timer_task_handle, &config);
     if (status != OS_STATUS_OK)
     {
         return status;
     }
 
-    return os_task_start(&timer_task_handle);
+    status = os_task_start(&os_timer_task_handle);
+    if (status != OS_STATUS_OK)
+    {
+        return status;
+    }
+
+    /* Resolved once: the timer task is never deleted, so the tick-time
+     * expiry wake can skip the id lookup from here on. */
+    os_timer_task_tcb = os_task_tcb_resolve(os_timer_task_handle.id);
+
+    return OS_STATUS_OK;
 }
 
 /******************************************************************************************************/
@@ -202,6 +216,7 @@ os_status os_timer_system_init(void)
  */
 void os_timer_tick_process(uint32_t elapsed_ticks)
 {
+    uint32_t mask_state;
     uint32_t slot;
     bool     wake_needed = false;
 
@@ -210,9 +225,21 @@ void os_timer_tick_process(uint32_t elapsed_ticks)
         return;
     }
 
+    /* The kernel mask is raised so a preempting ISR starting or stopping
+     * timers cannot interleave with the active-check/expired-write pair
+     * below (a stop landing in between would be silently undone). Also
+     * covers the tickless announce path, which calls this from task context.
+     * On multi-core builds the cross-core spinlock additionally excludes the
+     * other cores' os_timer_start/os_timer_stop callers, who hold it via
+     * os_critical_enter - the local mask alone only stops this core's own
+     * interrupts. Released before os_task_wake below, which acquires the
+     * same lock itself (never hold both at once - not recursive). */
+    mask_state = os_arch_kernel_mask_save();
+    os_critical_multicore_lock();
+
     for (slot = 0U; slot < OS_CONFIG_MAX_TIMERS; slot++)
     {
-        os_timer_t *timer = timer_registry[slot];
+        os_timer_t *timer = os_timer_registry[slot];
 
         if ((timer == NULL) || (!timer->active))
         {
@@ -241,8 +268,16 @@ void os_timer_tick_process(uint32_t elapsed_ticks)
 
     if (wake_needed)
     {
-        os_task_wake(timer_task_handle.id);
+        /* Direct-handle wake: skips both the id lookup and the nested
+         * critical section os_task_wake would pay on every expiring tick;
+         * safe here because the kernel mask and (multi-core) spinlock this
+         * function already holds are exactly what os_task_wake_tcb
+         * requires the caller to provide. */
+        os_task_wake_tcb(os_timer_task_tcb);
     }
+
+    os_critical_multicore_unlock();
+    os_arch_kernel_mask_restore(mask_state);
 }
 
 /******************************************************************************************************/
@@ -260,7 +295,7 @@ uint32_t os_timer_next_expiry_ticks_get(void)
 
     for (slot = 0U; slot < OS_CONFIG_MAX_TIMERS; slot++)
     {
-        const os_timer_t *timer = timer_registry[slot];
+        const os_timer_t *timer = os_timer_registry[slot];
 
         if ((timer != NULL) && timer->active && (timer->remaining_ticks < minimum))
         {
@@ -285,13 +320,13 @@ uint32_t os_timer_next_expiry_ticks_get(void)
  * @param[in] context  Unused.
  * @return None.
  */
-static void timer_task_entry(void *context)
+static void os_timer_task_entry(void *context)
 {
     (void)context;
 
     while (1)
     {
-        os_timer_t *timer = timer_expired_fetch();
+        os_timer_t *timer = os_timer_expired_fetch();
 
         if (timer != NULL)
         {
@@ -304,7 +339,7 @@ static void timer_task_entry(void *context)
          * lost: it is seen here, or its wake lands after the block. */
         os_critical_enter();
 
-        if (!timer_expired_exists())
+        if (!os_timer_expired_exists())
         {
             os_task_sleep_ticks(OS_WAIT_FOREVER);
         }
@@ -322,7 +357,7 @@ static void timer_task_entry(void *context)
  *
  * @return os_timer_t*  Expired timer, or NULL when none.
  */
-static os_timer_t* timer_expired_fetch(void)
+static os_timer_t* os_timer_expired_fetch(void)
 {
     os_timer_t *timer = NULL;
     uint32_t   slot;
@@ -331,7 +366,7 @@ static os_timer_t* timer_expired_fetch(void)
 
     for (slot = 0U; slot < OS_CONFIG_MAX_TIMERS; slot++)
     {
-        os_timer_t *candidate = timer_registry[slot];
+        os_timer_t *candidate = os_timer_registry[slot];
 
         if ((candidate != NULL) && candidate->expired)
         {
@@ -339,7 +374,7 @@ static os_timer_t* timer_expired_fetch(void)
 
             if (!candidate->active)
             {
-                timer_registry[slot] = NULL;
+                os_timer_registry[slot] = NULL;
             }
 
             timer = candidate;
@@ -357,13 +392,13 @@ static os_timer_t* timer_expired_fetch(void)
  *
  * @return bool  True when at least one expiry awaits delivery.
  */
-static bool timer_expired_exists(void)
+static bool os_timer_expired_exists(void)
 {
     uint32_t slot;
 
     for (slot = 0U; slot < OS_CONFIG_MAX_TIMERS; slot++)
     {
-        if ((timer_registry[slot] != NULL) && timer_registry[slot]->expired)
+        if ((os_timer_registry[slot] != NULL) && os_timer_registry[slot]->expired)
         {
             return true;
         }
@@ -379,19 +414,52 @@ static bool timer_expired_exists(void)
  * @param[in] timer  Timer pointer to search for, or NULL.
  * @return uint32_t  Slot index, or OS_CONFIG_MAX_TIMERS when not found.
  */
-static uint32_t timer_registry_slot_find(const os_timer_t *timer)
+static uint32_t os_timer_registry_slot_find(const os_timer_t *timer)
 {
     uint32_t slot;
 
     for (slot = 0U; slot < OS_CONFIG_MAX_TIMERS; slot++)
     {
-        if (timer_registry[slot] == timer)
+        if (os_timer_registry[slot] == timer)
         {
             return slot;
         }
     }
 
     return OS_CONFIG_MAX_TIMERS;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Find timer's existing slot, or the first free slot if it has none - in one pass.
+ *
+ * Used by os_timer_start, where restarting an already-registered timer must take that
+ * timer's own slot rather than a free one; a match found mid-scan still wins even if a free
+ * slot was noticed earlier, since the loop keeps searching for it until either the match is
+ * found or the whole registry has been seen.
+ *
+ * @param[in] timer  Timer pointer to search for.
+ * @return uint32_t  timer's existing slot, else the first free slot, else OS_CONFIG_MAX_TIMERS.
+ */
+static uint32_t os_timer_registry_slot_acquire(const os_timer_t *timer)
+{
+    uint32_t free_slot = OS_CONFIG_MAX_TIMERS;
+    uint32_t slot;
+
+    for (slot = 0U; slot < OS_CONFIG_MAX_TIMERS; slot++)
+    {
+        if (os_timer_registry[slot] == timer)
+        {
+            return slot;
+        }
+
+        if ((os_timer_registry[slot] == NULL) && (free_slot >= OS_CONFIG_MAX_TIMERS))
+        {
+            free_slot = slot;
+        }
+    }
+
+    return free_slot;
 }
 
 #endif /* OS_CONFIG_TIMER_ENABLE */

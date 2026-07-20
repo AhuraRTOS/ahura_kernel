@@ -45,6 +45,7 @@
 
 #define OS_ARCH_REG_SHPR2                    (*(__IO uint32_t *)0xE000ED1CUL)
 #define OS_ARCH_REG_SHPR3                    (*(__IO uint32_t *)0xE000ED20UL)
+#define OS_ARCH_REG_AIRCR                    (*(__IO uint32_t *)0xE000ED0CUL)
 #define OS_ARCH_REG_DEMCR                    (*(__IO uint32_t *)0xE000EDFCUL)
 #define OS_ARCH_REG_DWT_CTRL                 (*(__IO uint32_t *)0xE0001000UL)
 #define OS_ARCH_REG_DWT_CYCCNT               (*(__IO uint32_t *)0xE0001004UL)
@@ -194,7 +195,7 @@ extern uint32_t os_task_current_id_get(void);
 extern uint32_t __StackLimit OS_WEAK;
 extern uint32_t _sstack      OS_WEAK;
 
-static void os_arch_task_exit_trap(void);
+static void     os_arch_task_exit_trap(void);
 
 /*
  * ***********************************************************************************************************
@@ -213,6 +214,21 @@ void os_arch_init(void)
     uint32_t shpr2 = OS_ARCH_REG_SHPR2;
     uint32_t shpr3 = OS_ARCH_REG_SHPR3;
 
+    /* PSP == 0 is the sentinel PendSV_Handler uses to recognize "no task
+     * context yet" (see PendSV_Handler / os_arch_start_first_task below).
+     * Primed here - the very first arch call from os_init(), before
+     * os_tick_init() ever enables SysTick - rather than only right before
+     * the bootstrap SVC in os_arch_start_first_task: os_kernel_running is
+     * set true in os_start() a few instructions before that function
+     * re-primes PSP, and interrupts stay enabled the whole time (the kernel
+     * never masks them at boot), so a tick landing in that gap would pend a
+     * PendSV that reads PSP's architecturally-unpredictable power-on-reset
+     * value instead of the sentinel - PSP is not the active stack pointer
+     * yet (Thread mode still runs on MSP), so priming it this early has no
+     * other effect and closes the window unconditionally. */
+    __asm volatile("msr psp, %0" :: "r"(0U));
+    OS_ARCH_ISB();
+
     /* SVC highest so os_start always reaches it; PendSV/SysTick lowest so
      * context switches never preempt application interrupts. */
     shpr2 &= ~(0xFFUL << OS_ARCH_SHPR2_SVC_PRI_POS);
@@ -225,12 +241,43 @@ void os_arch_init(void)
     OS_ARCH_REG_SHPR2 = shpr2;
     OS_ARCH_REG_SHPR3 = shpr3;
 
+#if (OS_CONFIG_MAX_SYSCALL_INTERRUPT_PRIORITY != 0U)
+    /* The raw-byte comparisons in os_arch_isr_priority_check are only exact
+     * when (1) the configured threshold lives entirely in this device's
+     * implemented priority bits (write-back must return it unchanged; a
+     * truncated value would mask at a different level than the check tests)
+     * and (2) the priority grouping dedicates every implemented bit to
+     * preemption - no subpriority bits (BASEPRI masks by GROUP priority, so
+     * subpriority bits would let the byte compare disagree with the
+     * hardware's masking decision). Violations park here at boot instead of
+     * running with checks that silently differ from the mask. */
+    {
+        uint32_t readback;
+        uint32_t implemented;
+        uint32_t prigroup;
+
+        __asm volatile("msr basepri, %0" :: "r"((uint32_t)OS_CONFIG_MAX_SYSCALL_INTERRUPT_PRIORITY) : "memory");
+        __asm volatile("mrs %0, basepri" : "=r"(readback));
+        __asm volatile("msr basepri, %0" :: "r"(0xFFU) : "memory");
+        __asm volatile("mrs %0, basepri" : "=r"(implemented));
+        __asm volatile("msr basepri, %0" :: "r"(0U) : "memory");
+
+        prigroup = (OS_ARCH_REG_AIRCR >> 8) & 0x7U;
+
+        if ((readback != (uint32_t)OS_CONFIG_MAX_SYSCALL_INTERRUPT_PRIORITY) ||
+            ((implemented & ((1UL << (prigroup + 1U)) - 1U)) != 0U))
+        {
+            os_arch_config_fault_trap();
+        }
+    }
+#endif
+
     /* Start the cycle counter used for precise busy-wait delays and tickless
      * accounting. The LAR write unlocks DWT on cores implementing the
      * CoreSight software lock; it is ignored elsewhere. */
     OS_ARCH_REG_DEMCR      |= OS_ARCH_DEMCR_TRCENA_MSK;
-    OS_ARCH_REG_DWT_LAR     = OS_ARCH_DWT_LAR_UNLOCK_KEY;
-    OS_ARCH_REG_DWT_CYCCNT  = 0U;
+    OS_ARCH_REG_DWT_LAR    = OS_ARCH_DWT_LAR_UNLOCK_KEY;
+    OS_ARCH_REG_DWT_CYCCNT = 0U;
     OS_ARCH_REG_DWT_CTRL   |= OS_ARCH_DWT_CTRL_CYCCNTENA_MSK;
 
     os_arch_sleep_entry_cycles = OS_ARCH_REG_DWT_CYCCNT;
@@ -243,12 +290,12 @@ void os_arch_init(void)
     {
         uint32_t *stack_limit = &__StackLimit;
 
-        if (stack_limit == (uint32_t *)0)
+        if (stack_limit == NULL)
         {
             stack_limit = &_sstack;
         }
 
-        if (stack_limit != (uint32_t *)0)
+        if (stack_limit != NULL)
         {
             uint32_t msp_limit = ((uint32_t)(uintptr_t)stack_limit + 7U) & ~(uint32_t)0x7U;
 
@@ -335,9 +382,9 @@ uint32_t* os_arch_task_stack_initialize(uint8_t *stack_base, size_t stack_bytes,
 {
     uint32_t *stack_top;
 
-    if ((stack_base == (uint8_t *)0) || (entry == (void (*)(void *))0) || (stack_bytes < OS_CONFIG_MIN_STACK_SIZE))
+    if ((stack_base == NULL) || (entry == (void (*)(void *))0) || (stack_bytes < OS_CONFIG_MIN_STACK_SIZE))
     {
-        return (uint32_t *)0;
+        return NULL;
     }
 
     /* The hardware exception frame must sit on an 8-byte aligned address. */

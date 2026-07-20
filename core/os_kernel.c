@@ -27,7 +27,7 @@
 extern uint32_t SystemCoreClock OS_WEAK;
 #endif
 
-#if (OS_CONFIG_MAIN_TASK_ENABLE == 1U)
+#if (OS_CONFIG_TEST_ENABLE == 0U)
 static os_status os_main_system_init(void);
 static void      os_main_task_entry(void *context);
 #endif
@@ -45,7 +45,7 @@ static void      os_test_task_entry(void *context);
 
 static __IO bool os_kernel_running = false;
 
-#if (OS_CONFIG_MAIN_TASK_ENABLE == 1U)
+#if (OS_CONFIG_TEST_ENABLE == 0U)
 static uint8_t   os_main_task_stack[OS_CONFIG_MAIN_TASK_STACK_SIZE] OS_STACK_ALIGNED;
 static os_task_t os_main_task_handle;
 #endif
@@ -81,7 +81,12 @@ void os_init(void)
 #if (OS_CONFIG_TIMER_ENABLE == 1U)
     (void)os_timer_system_init();
 #endif
-#if (OS_CONFIG_MAIN_TASK_ENABLE == 1U)
+    /* The self-test suite takes priority over the default application task:
+     * both otherwise run tsk_main-priority-range code from os_init(), and a
+     * test build's job is to exercise the kernel in isolation, not race the
+     * application's own task against it. Outside test builds, tsk_main is
+     * created unconditionally. */
+#if (OS_CONFIG_TEST_ENABLE == 0U)
     (void)os_main_system_init();
 #endif
 #if (OS_CONFIG_TEST_ENABLE == 1U)
@@ -166,7 +171,7 @@ OS_WEAK uint32_t os_clock_hz_get_cb(void)
 #if (OS_CONFIG_CPU_CLOCK_HZ > 0U)
     return OS_CONFIG_CPU_CLOCK_HZ;
 #else
-    if (&SystemCoreClock != (uint32_t *)0)
+    if (&SystemCoreClock != NULL)
     {
         return SystemCoreClock;
     }
@@ -175,7 +180,6 @@ OS_WEAK uint32_t os_clock_hz_get_cb(void)
 #endif
 }
 
-#if (OS_CONFIG_MAIN_TASK_ENABLE == 1U)
 /******************************************************************************************************/
 /**
  * @brief Default application task body (see OS_CONFIG_MAIN_TASK_* in os_config.h).
@@ -183,6 +187,10 @@ OS_WEAK uint32_t os_clock_hz_get_cb(void)
  * Weak default: idles forever. Override in the application (copy of os_main_template.c
  * as os_main.c) with real application code - a plain while(1) loop, or spawn further
  * tasks from here. Not a "_cb" hook: this is where the application's own code runs.
+ *
+ * Never called when OS_CONFIG_TEST_ENABLE is also 1 (os_init() does not create tsk_main
+ * in that build - see os_init()); the symbol still compiles so an application's os_main.c
+ * links unchanged whether or not the test suite is enabled alongside it.
  *
  * @return None.
  */
@@ -193,7 +201,6 @@ OS_WEAK void os_main(void)
         (void)os_delay_ms(1000U);
     }
 }
-#endif /* OS_CONFIG_MAIN_TASK_ENABLE */
 
 #if (OS_CONFIG_TEST_ENABLE == 1U)
 /******************************************************************************************************/
@@ -217,10 +224,13 @@ OS_WEAK void os_test(void)
  * ***********************************************************************************************************
 */
 
-#if (OS_CONFIG_MAIN_TASK_ENABLE == 1U)
+#if (OS_CONFIG_TEST_ENABLE == 0U)
 /******************************************************************************************************/
 /**
  * @brief Create and start the default application task. Called from os_init().
+ *
+ * Not compiled in when OS_CONFIG_TEST_ENABLE is also 1: the self-test suite
+ * runs instead of the application's own task in that build (see os_init()).
  *
  * @return os_status  Status code.
  */
@@ -232,7 +242,7 @@ static os_status os_main_system_init(void)
     {
         "tsk_main",
         os_main_task_entry,
-        (void *)0,
+        NULL,
         OS_CONFIG_MAIN_TASK_PRIORITY,
         (void *)os_main_task_stack,
         sizeof(os_main_task_stack),
@@ -261,7 +271,7 @@ static void os_main_task_entry(void *context)
     (void)context;
     os_main();
 }
-#endif /* OS_CONFIG_MAIN_TASK_ENABLE */
+#endif /* OS_CONFIG_TEST_ENABLE == 0U */
 
 #if (OS_CONFIG_TEST_ENABLE == 1U)
 /******************************************************************************************************/
@@ -278,7 +288,7 @@ static os_status os_test_system_init(void)
     {
         "tsk_test",
         os_test_task_entry,
-        (void *)0,
+        NULL,
         OS_CONFIG_TEST_PRIORITY,
         (void *)os_test_task_stack,
         sizeof(os_test_task_stack),

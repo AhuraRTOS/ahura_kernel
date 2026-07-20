@@ -262,14 +262,66 @@ typedef struct
 /** Timeout value: do not wait, fail immediately when unavailable. */
 #define OS_WAIT_NOTHING         0U
 
-/** User task priority range: 0 is idle, OS_CONFIG_MAX_PRIORITY is reserved
+/** Number of priority levels, fixed (not application-configurable): the
+ *  scheduler's ready bitmap is a single 32-bit word, one bit per priority,
+ *  so 31 is the most this port can ever support. */
+#define OS_TASK_PRIO_MAX        31U
+
+/** User task priority range: 0 is idle, OS_TASK_PRIO_MAX is reserved
  *  for the kernel work/timer service tasks. */
-#define OS_TASK_PRIORITY_USER_MIN   1U
-#define OS_TASK_PRIORITY_USER_MAX   (OS_CONFIG_MAX_PRIORITY - 1U)
+#define OS_TASK_PRIO_USER_MIN   1U
+#define OS_TASK_PRIO_USER_MAX   (OS_TASK_PRIO_MAX - 1U)
+
+/** Named task priority levels: one name per level, OS_TASK_PRIO_1 (lowest)
+ *  through OS_TASK_PRIO_30 (highest a user task may request) - matching
+ *  OS_TASK_PRIO_USER_MIN..OS_TASK_PRIO_USER_MAX exactly, level N = value N.
+ *  Safe to enumerate directly like this because OS_TASK_PRIO_MAX is a fixed
+ *  kernel constant (not application-configurable), so this range never
+ *  changes. Using a name here is purely a style choice - a plain number in
+ *  OS_TASK_PRIO_USER_MIN..OS_TASK_PRIO_USER_MAX works exactly the same,
+ *  since os_task_config_t.priority remains a plain uint32_t. */
+typedef enum
+{
+    OS_TASK_PRIO_1  = 1U,
+    OS_TASK_PRIO_2  = 2U,
+    OS_TASK_PRIO_3  = 3U,
+    OS_TASK_PRIO_4  = 4U,
+    OS_TASK_PRIO_5  = 5U,
+    OS_TASK_PRIO_6  = 6U,
+    OS_TASK_PRIO_7  = 7U,
+    OS_TASK_PRIO_8  = 8U,
+    OS_TASK_PRIO_9  = 9U,
+    OS_TASK_PRIO_10 = 10U,
+    OS_TASK_PRIO_11 = 11U,
+    OS_TASK_PRIO_12 = 12U,
+    OS_TASK_PRIO_13 = 13U,
+    OS_TASK_PRIO_14 = 14U,
+    OS_TASK_PRIO_15 = 15U,
+    OS_TASK_PRIO_16 = 16U,
+    OS_TASK_PRIO_17 = 17U,
+    OS_TASK_PRIO_18 = 18U,
+    OS_TASK_PRIO_19 = 19U,
+    OS_TASK_PRIO_20 = 20U,
+    OS_TASK_PRIO_21 = 21U,
+    OS_TASK_PRIO_22 = 22U,
+    OS_TASK_PRIO_23 = 23U,
+    OS_TASK_PRIO_24 = 24U,
+    OS_TASK_PRIO_25 = 25U,
+    OS_TASK_PRIO_26 = 26U,
+    OS_TASK_PRIO_27 = 27U,
+    OS_TASK_PRIO_28 = 28U,
+    OS_TASK_PRIO_29 = 29U,
+    OS_TASK_PRIO_30 = 30U
+
+} os_task_priority_t;
 
 /** Core affinity: the task may run on any core (multi-core builds; the
  *  affinity is a bitmask otherwise, bit n = may run on core n). */
 #define OS_TASK_CORE_ANY        0U
+
+/** Core affinity: the task may run only on core n. Combine with | for a set
+ *  of allowed cores: OS_TASK_CORE(0) | OS_TASK_CORE(2). */
+#define OS_TASK_CORE(n)         (1UL << (n))
 
 #define OS_TICKS_FROM_S(sec)    ((uint32_t)((uint64_t)(sec) * (uint64_t)OS_CONFIG_TICK_HZ))
 #define OS_TICKS_FROM_MS(ms)    ((uint32_t)((((uint64_t)(ms) * (uint64_t)OS_CONFIG_TICK_HZ) + 999ULL) / 1000ULL))
@@ -288,15 +340,24 @@ typedef struct
     static uint8_t   name##_STACK[(((stack_bytes) + 7U) & ~7U)] OS_STACK_ALIGNED; \
     static os_task_t name##_TASK
 
-#define OS_TASK_CONFIG(name, entry, context, priority) \
+/** Task configuration bound to specific cores: core_affinity is a bitmask
+ *  (OS_TASK_CORE(n), OR-combinable; OS_TASK_CORE_ANY = any core). Bits naming
+ *  cores beyond OS_CONFIG_CORE_COUNT make os_task_create fail with
+ *  OS_STATUS_INVALID_ARG, so a stale pin is caught, not silently ignored. */
+#define OS_TASK_CONFIG_CORE(name, entry, context, priority, core_affinity) \
     &(os_task_config_t) { \
         #name, \
         (entry), \
         (context), \
         (priority), \
         (void *)(name##_STACK), \
-        sizeof(name##_STACK) \
+        sizeof(name##_STACK), \
+        (core_affinity) \
     }
+
+/** Task configuration runnable on any core (single-core builds use this). */
+#define OS_TASK_CONFIG(name, entry, context, priority) \
+    OS_TASK_CONFIG_CORE(name, entry, context, priority, OS_TASK_CORE_ANY)
 
 /*
  * ***********************************************************************************************************
@@ -316,7 +377,6 @@ void os_init(void);
  */
 void os_start(void);
 
-#if (OS_CONFIG_MAIN_TASK_ENABLE == 1U)
 /******************************************************************************************************/
 /**
  * @brief Default application task body (see OS_CONFIG_MAIN_TASK_* in os_config.h). os_init()
@@ -324,9 +384,11 @@ void os_start(void);
  *        application (copy of os_main_template.c, see README "Default application task") with
  *        real code. Not a "_cb" hook: this is where the application's own code runs, not a
  *        kernel query for platform behavior.
+ *
+ *        Not started when OS_CONFIG_TEST_ENABLE is also 1: the self-test suite runs alone in
+ *        that build instead of racing the application's own task (see README "Self-test suite").
  */
 void os_main(void);
-#endif /* OS_CONFIG_MAIN_TASK_ENABLE */
 
 #if (OS_CONFIG_TEST_ENABLE == 1U)
 /******************************************************************************************************/
@@ -363,7 +425,7 @@ bool os_kernel_is_running(void);
 
 /******************************************************************************************************/
 /**
- * @brief Create a task; priority must be OS_TASK_PRIORITY_USER_MIN..OS_TASK_PRIORITY_USER_MAX.
+ * @brief Create a task; priority must be OS_TASK_PRIO_USER_MIN..OS_TASK_PRIO_USER_MAX.
  */
 os_status os_task_create(os_task_t *task, const os_task_config_t *config);
 
@@ -475,6 +537,7 @@ void os_arch_core_ipi_request_cb(uint32_t core_id);
 /******************************************************************************************************/
 /**
  * @brief Block the calling task for the requested milliseconds (busy-waits before os_start).
+ *        OS_WAIT_FOREVER parks the calling task permanently (never returns).
  */
 os_status os_delay_ms(uint32_t milliseconds);
 
@@ -487,6 +550,7 @@ os_status os_delay_us(uint32_t microseconds);
 /******************************************************************************************************/
 /**
  * @brief Block the calling task for the requested seconds (busy-waits before os_start).
+ *        OS_WAIT_FOREVER parks the calling task permanently (never returns).
  */
 os_status os_delay_s(uint32_t seconds);
 
@@ -595,9 +659,11 @@ os_status os_event_group_clear_bits(os_event_group_t *group, uint32_t bits);
 
 /******************************************************************************************************/
 /**
- * @brief Wait for event bits, waiting up to timeout_ms until they match.
+ * @brief Wait for event bits, waiting up to timeout_ms until they match. clear_on_exit true
+ *        consumes the requested bits atomically with the match (no lost set between the
+ *        wait returning and a separate manual clear).
  */
-os_status os_event_group_wait_bits(os_event_group_t *group, uint32_t bits, bool wait_all, uint32_t *matched_bits, uint32_t timeout_ms);
+os_status os_event_group_wait_bits(os_event_group_t *group, uint32_t bits, bool wait_all, bool clear_on_exit, uint32_t *matched_bits, uint32_t timeout_ms);
 #endif /* OS_CONFIG_EVENT_ENABLE */
 
 #if (OS_CONFIG_TIMER_ENABLE == 1U)
@@ -649,7 +715,9 @@ bool os_work_is_pending(const os_work_t *work);
 #if (OS_CONFIG_MEMORY_POOL_ENABLE == 1U)
 /******************************************************************************************************/
 /**
- * @brief Initialize a fixed-block memory pool.
+ * @brief Initialize a fixed-block memory pool. block_size and buffer must be 8-byte
+ *        aligned; returns OS_STATUS_BUSY instead of resetting a pool with blocks
+ *        still outstanding.
  */
 os_status os_memory_pool_init(os_memory_pool_t *pool, void *buffer, void *usage_map, size_t block_size, size_t block_count);
 

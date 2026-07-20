@@ -42,6 +42,17 @@ os_status os_queue_init(os_queue_t *queue, void *buffer, size_t item_size, size_
         return OS_STATUS_INVALID_ARG;
     }
 
+    os_critical_enter();
+
+    /* Re-initializing with queued waiters would strand them on dangling
+     * intrusive nodes and corrupt the lists (first-time init must run on
+     * zero-initialized storage - static objects are). */
+    if ((queue->send_waiters.head != NULL) || (queue->receive_waiters.head != NULL))
+    {
+        os_critical_exit();
+        return OS_STATUS_BUSY;
+    }
+
     queue->buffer    = (uint8_t *)buffer;
     queue->item_size = item_size;
     queue->capacity  = capacity;
@@ -51,6 +62,7 @@ os_status os_queue_init(os_queue_t *queue, void *buffer, size_t item_size, size_
     os_list_init(&queue->send_waiters);
     os_list_init(&queue->receive_waiters);
 
+    os_critical_exit();
     return OS_STATUS_OK;
 }
 
@@ -69,6 +81,8 @@ os_status os_queue_init(os_queue_t *queue, void *buffer, size_t item_size, size_
  */
 os_status os_queue_send(os_queue_t *queue, const void *item, uint32_t timeout_ms)
 {
+    uint32_t budget_ticks;
+    uint32_t start_tick;
     uint32_t remaining_ticks;
 
     if ((queue == NULL) || (item == NULL))
@@ -76,7 +90,9 @@ os_status os_queue_send(os_queue_t *queue, const void *item, uint32_t timeout_ms
         return OS_STATUS_INVALID_ARG;
     }
 
-    remaining_ticks = os_internal_timeout_to_ticks(timeout_ms);
+    budget_ticks    = os_internal_timeout_to_ticks(timeout_ms);
+    start_tick      = os_tick_get();
+    remaining_ticks = budget_ticks;
 
     for (;;)
     {
@@ -114,13 +130,15 @@ os_status os_queue_send(os_queue_t *queue, const void *item, uint32_t timeout_ms
         os_task_wait_begin(&queue->send_waiters, remaining_ticks);
         os_critical_exit();
 
-        /* Resumed: a receive freed a slot (retry) or the wait timed out. */
+        /* Resumed: a receive freed a slot (retry) or the wait timed out.
+         * The budget is recomputed against the wall clock so READY time
+         * counts toward the timeout. */
         if (!os_task_wait_signaled())
         {
             return OS_STATUS_TIMEOUT;
         }
 
-        remaining_ticks = os_task_wait_remaining_ticks();
+        remaining_ticks = os_internal_wait_remaining(budget_ticks, start_tick);
     }
 }
 
@@ -136,6 +154,8 @@ os_status os_queue_send(os_queue_t *queue, const void *item, uint32_t timeout_ms
  */
 os_status os_queue_receive(os_queue_t *queue, void *item_out, uint32_t timeout_ms)
 {
+    uint32_t budget_ticks;
+    uint32_t start_tick;
     uint32_t remaining_ticks;
 
     if ((queue == NULL) || (item_out == NULL))
@@ -143,7 +163,9 @@ os_status os_queue_receive(os_queue_t *queue, void *item_out, uint32_t timeout_m
         return OS_STATUS_INVALID_ARG;
     }
 
-    remaining_ticks = os_internal_timeout_to_ticks(timeout_ms);
+    budget_ticks    = os_internal_timeout_to_ticks(timeout_ms);
+    start_tick      = os_tick_get();
+    remaining_ticks = budget_ticks;
 
     for (;;)
     {
@@ -181,13 +203,15 @@ os_status os_queue_receive(os_queue_t *queue, void *item_out, uint32_t timeout_m
         os_task_wait_begin(&queue->receive_waiters, remaining_ticks);
         os_critical_exit();
 
-        /* Resumed: a send delivered an item (retry) or the wait timed out. */
+        /* Resumed: a send delivered an item (retry) or the wait timed out.
+         * The budget is recomputed against the wall clock so READY time
+         * counts toward the timeout. */
         if (!os_task_wait_signaled())
         {
             return OS_STATUS_TIMEOUT;
         }
 
-        remaining_ticks = os_task_wait_remaining_ticks();
+        remaining_ticks = os_internal_wait_remaining(budget_ticks, start_tick);
     }
 }
 

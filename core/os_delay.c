@@ -31,6 +31,7 @@
  * ***********************************************************************************************************
 */
 
+static os_status os_delay_forever(void);
 static os_status os_delay_ticks(uint32_t ticks);
 static void      os_delay_cycle_wait(uint64_t cycle_count);
 
@@ -46,14 +47,22 @@ static void      os_delay_cycle_wait(uint64_t cycle_count);
  *
  * Blocks the calling task (yields the CPU) once the scheduler is running;
  * falls back to a busy-wait before os_start or from interrupt context.
+ * OS_WAIT_FOREVER parks the calling task permanently (never returns).
  *
- * @param[in] milliseconds  Delay duration in milliseconds.
+ * @param[in] milliseconds  Delay duration in milliseconds, or OS_WAIT_FOREVER.
  * @return os_status        Status code.
  */
 os_status os_delay_ms(uint32_t milliseconds)
 {
-    uint64_t ticks_u64 = ((uint64_t)milliseconds * (uint64_t)OS_CONFIG_TICK_HZ + (OS_DELAY_MS_PER_SECOND - 1ULL)) /
-                         OS_DELAY_MS_PER_SECOND;
+    uint64_t ticks_u64;
+
+    if (milliseconds == OS_WAIT_FOREVER)
+    {
+        return os_delay_forever();
+    }
+
+    ticks_u64 = ((uint64_t)milliseconds * (uint64_t)OS_CONFIG_TICK_HZ + (OS_DELAY_MS_PER_SECOND - 1ULL)) /
+                OS_DELAY_MS_PER_SECOND;
 
     if (ticks_u64 > (uint64_t)UINT32_MAX)
     {
@@ -100,12 +109,21 @@ os_status os_delay_us(uint32_t microseconds)
 /**
  * @brief Delay current execution for the requested seconds.
  *
- * @param[in] seconds  Delay duration in seconds.
+ * OS_WAIT_FOREVER parks the calling task permanently (never returns).
+ *
+ * @param[in] seconds  Delay duration in seconds, or OS_WAIT_FOREVER.
  * @return os_status   Status code.
  */
 os_status os_delay_s(uint32_t seconds)
 {
-    uint64_t ticks_u64 = (uint64_t)seconds * (uint64_t)OS_CONFIG_TICK_HZ;
+    uint64_t ticks_u64;
+
+    if (seconds == OS_WAIT_FOREVER)
+    {
+        return os_delay_forever();
+    }
+
+    ticks_u64 = (uint64_t)seconds * (uint64_t)OS_CONFIG_TICK_HZ;
 
     if (ticks_u64 > (uint64_t)UINT32_MAX)
     {
@@ -123,7 +141,30 @@ os_status os_delay_s(uint32_t seconds)
 
 /******************************************************************************************************/
 /**
- * @brief Delay execution by scheduler ticks: block when possible, busy-wait otherwise.
+ * @brief Park the calling task permanently (OS_WAIT_FOREVER delay). Never returns on success.
+ *
+ * @return os_status  INVALID_ARG when the caller cannot block (ISR or pre-scheduler).
+ */
+static os_status os_delay_forever(void)
+{
+    if (!os_internal_can_block())
+    {
+        /* A permanent busy-wait would hang the system: refuse instead. */
+        return OS_STATUS_INVALID_ARG;
+    }
+
+    /* Re-arm on any spurious wake (forced os_task_wake aimed at a kernel
+     * service task): forever really is forever. */
+    while (1)
+    {
+        os_task_sleep_ticks(OS_WAIT_FOREVER);
+    }
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Delay execution by a finite number of scheduler ticks: block when possible,
+ *        busy-wait otherwise.
  *
  * @param[in] ticks  Number of ticks to delay.
  * @return os_status Status code.
@@ -138,10 +179,31 @@ static os_status os_delay_ticks(uint32_t ticks)
         return OS_STATUS_OK;
     }
 
-    /* Preferred path: yield the CPU to other tasks until the delay expires. */
+    /* The callers route an intentional OS_WAIT_FOREVER to os_delay_forever
+     * before converting, so the sentinel value can only be reached here as
+     * a FINITE duration whose tick conversion collides with it numerically.
+     * One tick short keeps it out of the sleep primitive's "until woken"
+     * meaning at a cost of 1 tick in ~49 days (at 1 kHz). */
+    if (ticks == OS_WAIT_FOREVER)
+    {
+        ticks--;
+    }
+
+    /* Preferred path: yield the CPU to other tasks until the delay expires.
+     * The sleep is re-armed until the duration has really elapsed: a forced
+     * os_task_wake aimed at a kernel service task (new work/timer expiry
+     * while its handler delays) must not cut the delay short. */
     if (os_internal_can_block())
     {
-        os_task_sleep_ticks(ticks);
+        uint32_t start_tick = os_tick_get();
+        uint32_t elapsed    = 0U;
+
+        while (elapsed < ticks)
+        {
+            os_task_sleep_ticks(ticks - elapsed);
+            elapsed = os_tick_get() - start_tick; /* wrap-safe unsigned diff */
+        }
+
         return OS_STATUS_OK;
     }
 

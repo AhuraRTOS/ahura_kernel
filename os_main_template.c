@@ -5,8 +5,8 @@
  * NOT part of the kernel build (like os_cb_template.c): copy this file into
  * the application source tree as os_main.c, add it to the APPLICATION
  * build, and write the application's own code inside os_main(). Its
- * prototype already lives in ahura.h (guarded by OS_CONFIG_MAIN_TASK_ENABLE),
- * so no separate header is needed for this one.
+ * prototype already lives in ahura.h, so no separate header is needed for
+ * this one.
  *
  * os_main() is deliberately not named with the "_cb" suffix used elsewhere
  * in this kernel: that suffix is reserved for callbacks the kernel queries
@@ -16,8 +16,9 @@
  * wired up the same way (a weak default in os_kernel.c, overridden here).
  *
  * Task creation itself lives in the kernel (os_kernel.c's os_main_system_init(),
- * called from os_init()) and is unconditional whenever OS_CONFIG_MAIN_TASK_ENABLE
- * is 1 - nothing to call from main(). Sized by OS_CONFIG_MAIN_TASK_STACK_SIZE /
+ * called from os_init()) and is unconditional except in self-test builds
+ * (OS_CONFIG_TEST_ENABLE=1, see the kernel README "Self-test suite") -
+ * nothing to call from main(). Sized by OS_CONFIG_MAIN_TASK_STACK_SIZE /
  * OS_CONFIG_MAIN_TASK_PRIORITY in os_config.h.
  *
  * @copyright (c) 2026 Ahura Project Contributors

@@ -39,10 +39,22 @@ os_status os_semaphore_init(os_semaphore_t *semaphore, uint32_t initial_count, u
         return OS_STATUS_INVALID_ARG;
     }
 
+    os_critical_enter();
+
+    /* Re-initializing with queued waiters would strand them on dangling
+     * intrusive nodes and corrupt the list (first-time init must run on
+     * zero-initialized storage - static objects are). */
+    if (semaphore->waiters.head != NULL)
+    {
+        os_critical_exit();
+        return OS_STATUS_BUSY;
+    }
+
     semaphore->count     = initial_count;
     semaphore->max_count = max_count;
     os_list_init(&semaphore->waiters);
 
+    os_critical_exit();
     return OS_STATUS_OK;
 }
 
@@ -95,6 +107,8 @@ os_status os_semaphore_give(os_semaphore_t *semaphore)
  */
 os_status os_semaphore_take(os_semaphore_t *semaphore, uint32_t timeout_ms)
 {
+    uint32_t budget_ticks;
+    uint32_t start_tick;
     uint32_t remaining_ticks;
 
     if (semaphore == NULL)
@@ -102,7 +116,9 @@ os_status os_semaphore_take(os_semaphore_t *semaphore, uint32_t timeout_ms)
         return OS_STATUS_INVALID_ARG;
     }
 
-    remaining_ticks = os_internal_timeout_to_ticks(timeout_ms);
+    budget_ticks    = os_internal_timeout_to_ticks(timeout_ms);
+    start_tick      = os_tick_get();
+    remaining_ticks = budget_ticks;
 
     for (;;)
     {
@@ -132,13 +148,15 @@ os_status os_semaphore_take(os_semaphore_t *semaphore, uint32_t timeout_ms)
         os_task_wait_begin(&semaphore->waiters, remaining_ticks);
         os_critical_exit();
 
-        /* Resumed: a give signaled us (retry the take) or the wait timed out. */
+        /* Resumed: a give signaled us (retry the take) or the wait timed
+         * out. The budget is recomputed against the wall clock so READY
+         * time counts toward the timeout. */
         if (!os_task_wait_signaled())
         {
             return OS_STATUS_TIMEOUT;
         }
 
-        remaining_ticks = os_task_wait_remaining_ticks();
+        remaining_ticks = os_internal_wait_remaining(budget_ticks, start_tick);
     }
 }
 

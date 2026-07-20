@@ -190,7 +190,7 @@ __asm(
 extern void     os_task_exit(void);
 extern uint32_t os_task_current_id_get(void);
 
-static void os_arch_task_exit_trap(void);
+static void     os_arch_task_exit_trap(void);
 
 /*
  * ***********************************************************************************************************
@@ -208,6 +208,21 @@ void os_arch_init(void)
 {
     uint32_t shpr2 = OS_ARCH_REG_SHPR2;
     uint32_t shpr3 = OS_ARCH_REG_SHPR3;
+
+    /* PSP == 0 is the sentinel PendSV_Handler uses to recognize "no task
+     * context yet" (see PendSV_Handler / os_arch_start_first_task below).
+     * Primed here - the very first arch call from os_init(), before
+     * os_tick_init() ever enables SysTick - rather than only right before
+     * the bootstrap SVC in os_arch_start_first_task: os_kernel_running is
+     * set true in os_start() a few instructions before that function
+     * re-primes PSP, and interrupts stay enabled the whole time (the kernel
+     * never masks them at boot), so a tick landing in that gap would pend a
+     * PendSV that reads PSP's architecturally-unpredictable power-on-reset
+     * value instead of the sentinel - PSP is not the active stack pointer
+     * yet (Thread mode still runs on MSP), so priming it this early has no
+     * other effect and closes the window unconditionally. */
+    __asm volatile("msr psp, %0" :: "r"(0U));
+    OS_ARCH_ISB();
 
     /* SVC highest so os_start always reaches it; PendSV/SysTick lowest so
      * context switches never preempt application interrupts. ARMv6-M
@@ -294,9 +309,9 @@ uint32_t* os_arch_task_stack_initialize(uint8_t *stack_base, size_t stack_bytes,
 {
     uint32_t *stack_top;
 
-    if ((stack_base == (uint8_t *)0) || (entry == (void (*)(void *))0) || (stack_bytes < OS_CONFIG_MIN_STACK_SIZE))
+    if ((stack_base == NULL) || (entry == (void (*)(void *))0) || (stack_bytes < OS_CONFIG_MIN_STACK_SIZE))
     {
-        return (uint32_t *)0;
+        return NULL;
     }
 
     /* The hardware exception frame must sit on an 8-byte aligned address. */

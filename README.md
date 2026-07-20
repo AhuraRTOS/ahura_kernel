@@ -137,6 +137,9 @@ plain defines, so do not additionally define `OS_CONFIG_` macros from the
 build system (`target_compile_definitions`) — that would redefine them. The
 `OS_CONFIG_TRUSTZONE_*` mode values are kernel-owned
 (`os_arch_port_common.h`); the config file only selects among them.
+`OS_TASK_PRIO_MAX` is kernel-owned too (fixed at `31` in `ahura.h`,
+the most the 32-bit ready bitmap can ever support) — it is not one of the
+options `os_config.h` defines.
 
 ## Application callbacks (os_cb.c)
 
@@ -161,9 +164,9 @@ in `Core/Inc/os_config.h`.
 
 Most RTOS applications create every task by hand in `main()` before calling
 `os_start()`. Ahura instead gives every application one default task for
-free: `os_init()` unconditionally creates and starts it (gated by
-`OS_CONFIG_MAIN_TASK_ENABLE`, see `os_kernel.c`'s `os_main_system_init()`), so
-`main()` needs nothing beyond the usual
+free: `os_init()` unconditionally creates and starts it (see `os_kernel.c`'s
+`os_main_system_init()`), except in self-test builds (see "Self-test suite"
+below), so `main()` needs nothing beyond the usual
 
 ```c
 os_init();
@@ -183,16 +186,21 @@ and replace `os_main()`'s body with the application's own code (a plain
 options:
 
 ```c
-#define OS_CONFIG_MAIN_TASK_ENABLE      1U     /* 0 = no default task at all           */
 #define OS_CONFIG_MAIN_TASK_STACK_SIZE  1024U  /* bytes                                */
-#define OS_CONFIG_MAIN_TASK_PRIORITY    1U     /* OS_TASK_PRIORITY_USER_MIN..USER_MAX  */
+#define OS_CONFIG_MAIN_TASK_PRIORITY    1U     /* OS_TASK_PRIO_USER_MIN..USER_MAX  */
 ```
 
-Set `OS_CONFIG_MAIN_TASK_ENABLE` to `0` for applications that create every
-task by hand instead (the task, its stack, and `os_main()` all compile
-out). Tasks that must exist before the scheduler starts (rare) still belong
-in `main()`, created the usual way. This project keeps its copy in
-`Core/Src/os_main.c`, toggling the user LED.
+There is no switch to compile the default task out — it always exists
+unless the build is a self-test build (see below). Tasks that must exist
+before the scheduler starts (rare) still belong in `main()`, created the
+usual way. This project keeps its copy in `Core/Src/os_main.c`, toggling
+the user LED.
+
+When `OS_CONFIG_TEST_ENABLE` is `1`, `os_init()` does not create `tsk_main`
+at all — the self-test suite runs alone instead of racing the application's
+own task (see "Self-test suite" below). `os_main()` itself still compiles
+(an application's `os_main.c` links unchanged either way); it is simply
+never called in that build.
 
 ## Self-test suite (ahura_kernel/test/)
 
@@ -239,6 +247,12 @@ project). Nothing to call:
 os_init();   /* creates and starts tsk_test too, since os_test is linked and TEST_ENABLE=1 */
 os_start();
 ```
+
+`tsk_main` is **not** created alongside `tsk_test` - the self-test suite
+takes priority and runs alone, rather than the application's own task
+racing it for CPU time and task-table slots (see "Default application task"
+above). Set `OS_CONFIG_TEST_ENABLE` back to `0` to get `tsk_main` running
+normally again.
 
 The task runs `os_test()` once: exercises whichever
 `OS_CONFIG_<FEATURE>_ENABLE` switches are on (tasks, delays, critical
@@ -293,7 +307,7 @@ be disabled in option bytes (e.g. `TZEN` on STM32H5) — that case uses
    through `os_clock_hz_get_cb`, see "Platform clock").
 3. Create and start any tasks the application needs before the scheduler runs
    (`os_init()` already created the default task, see "Default application
-   task", unless `OS_CONFIG_MAIN_TASK_ENABLE` is 0), then call `os_start()`
+   task", unless this is a self-test build), then call `os_start()`
    (never returns).
 4. Task stacks: use `OS_TASK_DEFINE(name, stack_bytes)`; the size is in bytes
    (rounded up to an 8-byte multiple by the macro) and must be at least
@@ -302,9 +316,9 @@ be disabled in option bytes (e.g. `TZEN` on STM32H5) — that case uses
 ## Task priorities
 
 - `0` — idle task (kernel).
-- `OS_CONFIG_MAX_PRIORITY` — kernel service tasks (`tsk_work`, `tsk_timer`), created
+- `OS_TASK_PRIO_MAX` — kernel service tasks (`tsk_work`, `tsk_timer`), created
   automatically by `os_init()`; they occupy two `OS_CONFIG_MAX_TASKS` slots.
-- `OS_TASK_PRIORITY_USER_MIN .. OS_TASK_PRIORITY_USER_MAX` (1 .. MAX-1) — user tasks;
+- `OS_TASK_PRIO_USER_MIN .. OS_TASK_PRIO_USER_MAX` (1 .. MAX-1) — user tasks;
   `os_task_create` rejects anything outside this range. The default application
   task (`tsk_main`, see "Default application task") and the self-test task
   (`tsk_test`, see "Self-test suite") both live in this range too, at

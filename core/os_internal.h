@@ -68,6 +68,20 @@ void os_task_wake(uint32_t task_id);
 
 /******************************************************************************************************/
 /**
+ * @brief Resolve a task id to an opaque handle once, for os_task_wake_tcb (os_task.c, ISR-safe).
+ */
+void* os_task_tcb_resolve(uint32_t task_id);
+
+/******************************************************************************************************/
+/**
+ * @brief Wake a BLOCKED task by its os_task_tcb_resolve handle, skipping the id lookup and the
+ *        nested critical section os_task_wake pays - caller must already hold the kernel mask
+ *        (and, on multi-core builds, os_critical_multicore_lock) (os_task.c, ISR-safe).
+ */
+void os_task_wake_tcb(void *tcb_handle);
+
+/******************************************************************************************************/
+/**
  * @brief Queue the calling task on an object's waiter list and block it; call inside a critical
  *        section from task context, the switch happens when the caller exits it (os_task.c).
  */
@@ -81,9 +95,33 @@ bool os_task_wait_signaled(void);
 
 /******************************************************************************************************/
 /**
- * @brief After a signaled resume: remaining timeout budget in ticks for the retry (os_task.c).
+ * @brief Attach two words of per-wait data to the calling task before os_task_wait_begin;
+ *        a waker's match callback reads them to evaluate the waiter's condition (os_task.c).
  */
-uint32_t os_task_wait_remaining_ticks(void);
+void os_task_wait_data_set(uint32_t data0, uint32_t data1);
+
+/******************************************************************************************************/
+/**
+ * @brief After a signaled resume: the result value the waker stored for this task via
+ *        os_task_waiters_wake_match, 0 when woken any other way (os_task.c).
+ */
+uint32_t os_task_wait_result_get(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Waker-side condition callback for os_task_waiters_wake_match: receives one waiter's
+ *        wait data; returns true to wake that waiter and stores its delivery in *result_out.
+ */
+typedef bool (*os_task_wait_match_fn)(uint32_t data0, uint32_t data1, void *context, uint32_t *result_out);
+
+/******************************************************************************************************/
+/**
+ * @brief Wake every waiter whose condition the callback confirms, storing each waiter's result
+ *        for os_task_wait_result_get. Call inside a critical section; ISR-safe (os_task.c).
+ *
+ * @return uint32_t  Number of waiters woken.
+ */
+uint32_t os_task_waiters_wake_match(os_list_t *waiters, os_task_wait_match_fn match, void *context);
 
 /******************************************************************************************************/
 /**
@@ -109,6 +147,13 @@ uint32_t os_task_current_id_get(void);
  * @brief Check whether the idle task is currently running (os_task.c, ISR-safe).
  */
 bool os_task_current_is_idle(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Whether a PendSV on this core would actually switch or round-robin (os_task.c,
+ *        ISR-safe). Lets the tick handler skip a pointless PendSV round trip.
+ */
+bool os_task_reschedule_possible(void);
 
 /******************************************************************************************************/
 /**
@@ -176,11 +221,44 @@ void os_work_tick_process(uint32_t elapsed_ticks);
  */
 uint32_t os_timer_next_expiry_ticks_get(void);
 
+/******************************************************************************************************/
+/**
+ * @brief Return ticks until the next delayed work item becomes ready, 0 when one is already
+ *        ready, UINT32_MAX when none (os_work.c).
+ */
+uint32_t os_work_next_ready_ticks_get(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Return ticks until the next finite-delay sleeper wakes, UINT32_MAX when none (os_task.c).
+ */
+uint32_t os_task_next_delay_ticks_get(void);
+
 /*
  * ***********************************************************************************************************
  * Internal helpers
  * ***********************************************************************************************************
 */
+
+#if (OS_CONFIG_CORE_COUNT > 1U)
+/******************************************************************************************************/
+/**
+ * @brief Acquire the cross-core kernel spinlock only (os_critical.c); caller manages its own
+ *        local kernel mask directly. See os_critical_multicore_lock for the deadlock rule.
+ */
+void os_critical_multicore_lock(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Release the cross-core kernel spinlock acquired by os_critical_multicore_lock.
+ */
+void os_critical_multicore_unlock(void);
+#else
+/* No cross-core exclusion needed on single-core builds: the local kernel mask
+ * (already raised by every caller) is already sufficient by itself. */
+static inline void os_critical_multicore_lock(void)   { }
+static inline void os_critical_multicore_unlock(void) { }
+#endif
 
 /******************************************************************************************************/
 /**
@@ -193,7 +271,9 @@ static inline bool os_internal_can_block(void)
 
 /******************************************************************************************************/
 /**
- * @brief Convert a millisecond timeout to ticks, preserving OS_WAIT_FOREVER.
+ * @brief Convert a millisecond timeout to ticks, preserving OS_WAIT_FOREVER and saturating
+ *        huge finite values one tick short of the sentinel (a finite request must never
+ *        silently become "wait forever").
  */
 static inline uint32_t os_internal_timeout_to_ticks(uint32_t timeout_ms)
 {
@@ -202,7 +282,44 @@ static inline uint32_t os_internal_timeout_to_ticks(uint32_t timeout_ms)
         return OS_WAIT_FOREVER;
     }
 
-    return OS_TICKS_FROM_MS(timeout_ms);
+#if (OS_CONFIG_TICK_HZ == 1000U)
+    /* 1 ms = 1 tick: identity, no 64-bit math on the hot path. */
+    return timeout_ms;
+#else
+    {
+        uint64_t ticks = (((uint64_t)timeout_ms * (uint64_t)OS_CONFIG_TICK_HZ) + 999ULL) / 1000ULL;
+
+        if (ticks >= (uint64_t)OS_WAIT_FOREVER)
+        {
+            return OS_WAIT_FOREVER - 1U;
+        }
+
+        return (uint32_t)ticks;
+    }
+#endif
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Remaining wait budget measured against the wall clock: budget minus ticks elapsed
+ *        since start_tick (wrap-safe), never below 0, OS_WAIT_FOREVER passed through.
+ *
+ * Blocking primitives recompute their budget with this after every spurious wake, so time
+ * spent READY (preempted between wake and re-check) counts against the timeout - a relative
+ * re-arm would freeze the clock and stretch timeouts unboundedly under wake traffic.
+ */
+static inline uint32_t os_internal_wait_remaining(uint32_t budget_ticks, uint32_t start_tick)
+{
+    uint32_t elapsed;
+
+    if (budget_ticks == OS_WAIT_FOREVER)
+    {
+        return OS_WAIT_FOREVER;
+    }
+
+    elapsed = os_tick_get() - start_tick;
+
+    return (elapsed >= budget_ticks) ? 0U : (budget_ticks - elapsed);
 }
 
 #ifdef __cplusplus
