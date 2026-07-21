@@ -100,17 +100,6 @@ static volatile bool     g_work_ran       = false;
 static volatile uint32_t g_work_run_count = 0U;
 #endif
 
-#if (OS_CONFIG_MEMORY_POOL_ENABLE == 1U)
-#define POOL_BLOCK_SIZE  16U
-#define POOL_BLOCK_COUNT 4U
-/* os_memory_pool_init now requires an 8-byte aligned buffer (blocks must be
- * safe to hold any C type); a plain uint8_t array has no alignment
- * guarantee from the language, so it is pinned explicitly. */
-static uint8_t           g_pool_buffer[POOL_BLOCK_SIZE * POOL_BLOCK_COUNT] OS_STACK_ALIGNED;
-static uint8_t           g_pool_usage[POOL_BLOCK_COUNT];
-static os_memory_pool_t  g_pool;
-#endif
-
 typedef enum
 {
     HELPER_NONE = 0,
@@ -259,9 +248,6 @@ static void test_timer(void);
 #if (OS_CONFIG_WORK_ENABLE == 1U)
 static void test_work(void);
 #endif
-#if (OS_CONFIG_MEMORY_POOL_ENABLE == 1U)
-static void test_memory_pool(void);
-#endif
 #if (OS_CONFIG_ALLOC_ENABLE == 1U)
 static void test_alloc(void);
 #endif
@@ -298,9 +284,6 @@ static void      test_stress_soak(void);
 static void      test_stress_task_churn(void);
 #if (OS_CONFIG_TIMER_ENABLE == 1U)
 static void      test_stress_timer_churn(void);
-#endif
-#if (OS_CONFIG_MEMORY_POOL_ENABLE == 1U)
-static void      test_stress_memory_pool_churn(void);
 #endif
 
 /*
@@ -468,13 +451,13 @@ static os_status test_spawn_helper(helper_role_t role, uint32_t hold_ms, uint32_
     g_helper_ctx.bits    = bits;
     g_helper_ctx.value   = value;
 
-    status = os_task_create(&helper_TASK, OS_TASK_CONFIG(helper, test_helper_entry, NULL, 3U));
+    status = os_task_create(&helper, OS_TASK_CONFIG(helper, test_helper_entry, NULL, 3U));
     if (status != OS_STATUS_OK)
     {
         return status;
     }
 
-    return os_task_start(&helper_TASK);
+    return os_task_start(&helper);
 }
 #endif /* OS_CONFIG_SEMAPHORE_ENABLE */
 
@@ -575,51 +558,51 @@ static void test_task_lifecycle(void)
     cfg = *OS_TASK_CONFIG(helper, test_worker_entry, NULL, 1U);
 
     cfg.priority = 0U;
-    AHURA_TEST_CHECK(os_task_create(&helper_TASK, &cfg) == OS_STATUS_INVALID_ARG,
+    AHURA_TEST_CHECK(os_task_create(&helper, &cfg) == OS_STATUS_INVALID_ARG,
                       "os_task_create() rejects priority 0 (idle-reserved)");
 
     cfg.priority = OS_TASK_PRIO_MAX;
-    AHURA_TEST_CHECK(os_task_create(&helper_TASK, &cfg) == OS_STATUS_INVALID_ARG,
+    AHURA_TEST_CHECK(os_task_create(&helper, &cfg) == OS_STATUS_INVALID_ARG,
                       "os_task_create() rejects priority %u (kernel-reserved)", (unsigned)OS_TASK_PRIO_MAX);
 
     cfg.priority    = OS_TASK_PRIO_USER_MIN;
     cfg.stack_bytes = OS_CONFIG_MIN_STACK_SIZE - 8U;
-    AHURA_TEST_CHECK(os_task_create(&helper_TASK, &cfg) == OS_STATUS_INVALID_ARG,
+    AHURA_TEST_CHECK(os_task_create(&helper, &cfg) == OS_STATUS_INVALID_ARG,
                       "os_task_create() rejects a stack smaller than OS_CONFIG_MIN_STACK_SIZE");
 
     cfg.stack_bytes  = sizeof(helper_STACK) - 8U;
     cfg.stack_memory = &helper_STACK[1];
-    AHURA_TEST_CHECK(os_task_create(&helper_TASK, &cfg) == OS_STATUS_INVALID_ARG,
+    AHURA_TEST_CHECK(os_task_create(&helper, &cfg) == OS_STATUS_INVALID_ARG,
                       "os_task_create() rejects a misaligned stack pointer");
 
     /* --- Real worker: create / start / observe / pause / resume / delete. --- */
     g_worker_counter    = 0U;
     g_worker_should_run = true;
 
-    status = os_task_create(&worker_TASK, OS_TASK_CONFIG(worker, test_worker_entry, NULL, 1U));
+    status = os_task_create(&worker, OS_TASK_CONFIG(worker, test_worker_entry, NULL, 1U));
     AHURA_TEST_CHECK(status == OS_STATUS_OK, "os_task_create() creates the worker task");
-    AHURA_TEST_CHECK(os_task_state_get(&worker_TASK) == OS_TASK_STATE_SUSPENDED,
+    AHURA_TEST_CHECK(os_task_state_get(&worker) == OS_TASK_STATE_SUSPENDED,
                       "a created-but-not-started task reports SUSPENDED");
 
-    AHURA_TEST_CHECK(os_task_start(&worker_TASK) == OS_STATUS_OK, "os_task_start() starts the worker task");
+    AHURA_TEST_CHECK(os_task_start(&worker) == OS_STATUS_OK, "os_task_start() starts the worker task");
     (void)os_delay_ms(20U);
     AHURA_TEST_CHECK(g_worker_counter > 0U, "worker task actually executed (counter=%lu)",
                       (unsigned long)g_worker_counter);
-    AHURA_TEST_CHECK(os_task_state_get(&worker_TASK) == OS_TASK_STATE_READY,
+    AHURA_TEST_CHECK(os_task_state_get(&worker) == OS_TASK_STATE_READY,
                       "a lower-priority runnable task reports READY while this task runs");
 
-    AHURA_TEST_CHECK(os_task_pause(&worker_TASK) == OS_STATUS_OK, "os_task_pause() suspends the worker task");
-    AHURA_TEST_CHECK(os_task_state_get(&worker_TASK) == OS_TASK_STATE_SUSPENDED, "paused task reports SUSPENDED");
+    AHURA_TEST_CHECK(os_task_pause(&worker) == OS_STATUS_OK, "os_task_pause() suspends the worker task");
+    AHURA_TEST_CHECK(os_task_state_get(&worker) == OS_TASK_STATE_SUSPENDED, "paused task reports SUSPENDED");
     snapshot = g_worker_counter;
     (void)os_delay_ms(20U);
     AHURA_TEST_CHECK(g_worker_counter == snapshot, "counter is frozen while the worker is paused");
 
-    AHURA_TEST_CHECK(os_task_start(&worker_TASK) == OS_STATUS_OK, "os_task_start() resumes a paused task");
+    AHURA_TEST_CHECK(os_task_start(&worker) == OS_STATUS_OK, "os_task_start() resumes a paused task");
     (void)os_delay_ms(20U);
     AHURA_TEST_CHECK(g_worker_counter > snapshot, "counter resumes advancing after os_task_start()");
 
-    AHURA_TEST_CHECK(os_task_delete(&worker_TASK) == OS_STATUS_OK, "os_task_delete() deletes the live worker task");
-    AHURA_TEST_CHECK(os_task_state_get(&worker_TASK) == OS_TASK_STATE_INACTIVE,
+    AHURA_TEST_CHECK(os_task_delete(&worker) == OS_STATUS_OK, "os_task_delete() deletes the live worker task");
+    AHURA_TEST_CHECK(os_task_state_get(&worker) == OS_TASK_STATE_INACTIVE,
                       "a deleted task's handle reports INACTIVE");
     snapshot = g_worker_counter;
     (void)os_delay_ms(20U);
@@ -627,15 +610,15 @@ static void test_task_lifecycle(void)
 
     /* --- NULL means "current task": the worker pauses itself; we resume it. --- */
     g_worker_counter = 0U;
-    status = os_task_create(&worker_TASK, OS_TASK_CONFIG(worker, test_self_pause_worker_entry, NULL, 1U));
+    status = os_task_create(&worker, OS_TASK_CONFIG(worker, test_self_pause_worker_entry, NULL, 1U));
     AHURA_TEST_CHECK(status == OS_STATUS_OK, "worker task re-created for the self-pause test");
-    AHURA_TEST_CHECK(os_task_start(&worker_TASK) == OS_STATUS_OK, "os_task_start() starts it");
+    AHURA_TEST_CHECK(os_task_start(&worker) == OS_STATUS_OK, "os_task_start() starts it");
 
     (void)os_delay_ms(40U); /* let it reach os_task_pause(NULL) */
-    AHURA_TEST_CHECK(os_task_state_get(&worker_TASK) == OS_TASK_STATE_SUSPENDED,
+    AHURA_TEST_CHECK(os_task_state_get(&worker) == OS_TASK_STATE_SUSPENDED,
                       "os_task_pause(NULL) suspends the calling task itself");
 
-    AHURA_TEST_CHECK(os_task_start(&worker_TASK) == OS_STATUS_OK,
+    AHURA_TEST_CHECK(os_task_start(&worker) == OS_STATUS_OK,
                       "os_task_start() resumes a task that paused itself");
     (void)os_delay_ms(20U);
     AHURA_TEST_CHECK(g_worker_counter == 42U, "the resumed task continued executing past its self-pause point");
@@ -643,7 +626,7 @@ static void test_task_lifecycle(void)
     /* test_self_pause_worker_entry() already returned above (auto-exiting via the arch port's
      * os_task_exit() trampoline) - no explicit os_task_delete() here, that would fail with
      * INVALID_ARG since the slot is already freed. Just confirm the self-exit completed. */
-    AHURA_TEST_CHECK(test_wait_inactive(&worker_TASK, 200U), "the resumed worker terminates cleanly on its own");
+    AHURA_TEST_CHECK(test_wait_inactive(&worker, 200U), "the resumed worker terminates cleanly on its own");
 }
 
 /*
@@ -669,9 +652,9 @@ static void test_priority_preemption(void)
 
     g_busy_counter    = 0U;
     g_busy_should_run = true;
-    status = os_task_create(&worker_TASK, OS_TASK_CONFIG(worker, test_busy_spin_entry, NULL, 1U));
+    status = os_task_create(&worker, OS_TASK_CONFIG(worker, test_busy_spin_entry, NULL, 1U));
     AHURA_TEST_CHECK(status == OS_STATUS_OK, "low-priority spinner task created (priority 1)");
-    AHURA_TEST_CHECK(os_task_start(&worker_TASK) == OS_STATUS_OK, "low-priority spinner started");
+    AHURA_TEST_CHECK(os_task_start(&worker) == OS_STATUS_OK, "low-priority spinner started");
 
     (void)os_delay_ms(20U);
     snapshot_before = g_busy_counter;
@@ -681,18 +664,18 @@ static void test_priority_preemption(void)
 
     /* A task at a strictly higher priority than both the spinner and this test task never
      * yields/delays for its whole burst - so the spinner cannot possibly run until it is gone. */
-    status = os_task_create(&helper_TASK, OS_TASK_CONFIG(helper, test_burst_spin_entry, NULL,
+    status = os_task_create(&helper, OS_TASK_CONFIG(helper, test_burst_spin_entry, NULL,
                                                             OS_CONFIG_TEST_PRIORITY + 1U));
     AHURA_TEST_CHECK(status == OS_STATUS_OK, "higher-priority burst task created (priority %u)",
                       (unsigned)(OS_CONFIG_TEST_PRIORITY + 1U));
 
-    AHURA_TEST_CHECK(os_task_start(&helper_TASK) == OS_STATUS_OK, "higher-priority burst task started");
+    AHURA_TEST_CHECK(os_task_start(&helper) == OS_STATUS_OK, "higher-priority burst task started");
     snapshot_immediate = g_busy_counter;
     AHURA_TEST_CHECK(snapshot_immediate == snapshot_before,
                       "the spinner has not advanced right after the higher-priority task starts (count=%lu)",
                       (unsigned long)snapshot_immediate);
 
-    AHURA_TEST_CHECK(test_wait_inactive(&helper_TASK, 200U),
+    AHURA_TEST_CHECK(test_wait_inactive(&helper, 200U),
                       "the higher-priority burst task ran to completion and self-terminated");
 
     (void)os_delay_ms(10U);
@@ -702,7 +685,7 @@ static void test_priority_preemption(void)
                       (unsigned long)snapshot_after);
 
     g_busy_should_run = false;
-    AHURA_TEST_CHECK(test_wait_inactive(&worker_TASK, 200U), "low-priority spinner stops cleanly");
+    AHURA_TEST_CHECK(test_wait_inactive(&worker, 200U), "low-priority spinner stops cleanly");
 }
 
 /*
@@ -752,7 +735,7 @@ static void test_mutex(void)
                       (unsigned long)delta);
 
     AHURA_TEST_CHECK(os_mutex_unlock(&g_mutex) == OS_STATUS_OK, "final os_mutex_unlock() releases the mutex");
-    AHURA_TEST_CHECK(test_wait_inactive(&helper_TASK, 200U), "mutex-holder helper task terminated cleanly");
+    AHURA_TEST_CHECK(test_wait_inactive(&helper, 200U), "mutex-holder helper task terminated cleanly");
 #endif
 }
 #endif /* OS_CONFIG_MUTEX_ENABLE */
@@ -802,7 +785,7 @@ static void test_semaphore(void)
     AHURA_TEST_CHECK(status == OS_STATUS_OK, "blocking take succeeds once the helper gives");
     AHURA_TEST_CHECK((delta >= 70U) && (delta <= 200U), "take woke ~when the helper gave (%lu ticks)",
                       (unsigned long)delta);
-    AHURA_TEST_CHECK(test_wait_inactive(&helper_TASK, 200U), "semaphore-giver helper task terminated cleanly");
+    AHURA_TEST_CHECK(test_wait_inactive(&helper, 200U), "semaphore-giver helper task terminated cleanly");
 }
 #endif /* OS_CONFIG_SEMAPHORE_ENABLE */
 
@@ -872,7 +855,7 @@ static void test_queue(void)
                       "blocking receive gets the helper's item (value=%lu)", (unsigned long)value);
     AHURA_TEST_CHECK((delta >= 70U) && (delta <= 200U), "receive woke ~when the helper sent (%lu ticks)",
                       (unsigned long)delta);
-    AHURA_TEST_CHECK(test_wait_inactive(&helper_TASK, 200U), "queue-sender helper task terminated cleanly");
+    AHURA_TEST_CHECK(test_wait_inactive(&helper, 200U), "queue-sender helper task terminated cleanly");
 }
 #endif /* OS_CONFIG_QUEUE_ENABLE */
 
@@ -926,7 +909,7 @@ static void test_event_group(void)
                       "wait-all matches once the helper sets both bits (matched=0x%02lx)", (unsigned long)matched);
     AHURA_TEST_CHECK((delta >= 70U) && (delta <= 200U), "wait woke ~when the helper set the bits (%lu ticks)",
                       (unsigned long)delta);
-    AHURA_TEST_CHECK(test_wait_inactive(&helper_TASK, 200U), "event-setter helper task terminated cleanly");
+    AHURA_TEST_CHECK(test_wait_inactive(&helper, 200U), "event-setter helper task terminated cleanly");
 }
 #endif /* OS_CONFIG_EVENT_ENABLE */
 
@@ -1040,60 +1023,7 @@ static void test_work(void)
 
 /*
  * ***********************************************************************************************************
- * Memory pool
- * ***********************************************************************************************************
-*/
-
-#if (OS_CONFIG_MEMORY_POOL_ENABLE == 1U)
-/******************************************************************************************************/
-static void test_memory_pool(void)
-{
-    void     *blocks[POOL_BLOCK_COUNT] = { 0 };
-    void     *reused;
-    uint32_t i;
-    bool     all_unique = true;
-
-    test_print_section("Memory Pool");
-
-    AHURA_TEST_CHECK(os_memory_pool_init(&g_pool, g_pool_buffer, g_pool_usage, POOL_BLOCK_SIZE, POOL_BLOCK_COUNT) ==
-                          OS_STATUS_OK,
-                      "os_memory_pool_init() creates a %u x %u-byte pool", (unsigned)POOL_BLOCK_COUNT,
-                      (unsigned)POOL_BLOCK_SIZE);
-
-    for (i = 0U; i < POOL_BLOCK_COUNT; i++)
-    {
-        blocks[i] = os_memory_pool_alloc(&g_pool);
-        if (blocks[i] == NULL)
-        {
-            all_unique = false;
-        }
-    }
-    AHURA_TEST_CHECK(all_unique, "pool yields %u distinct blocks", (unsigned)POOL_BLOCK_COUNT);
-    AHURA_TEST_CHECK(os_memory_pool_alloc(&g_pool) == NULL, "pool returns NULL once exhausted");
-
-    AHURA_TEST_CHECK(os_memory_pool_free(&g_pool, blocks[1]) == OS_STATUS_OK,
-                      "os_memory_pool_free() releases a block");
-    AHURA_TEST_CHECK(os_memory_pool_free(&g_pool, blocks[1]) == OS_STATUS_ERROR,
-                      "double-freeing the same block returns ERROR");
-
-    reused = os_memory_pool_alloc(&g_pool);
-    AHURA_TEST_CHECK(reused == blocks[1], "the freed block is reused by the next alloc");
-
-    AHURA_TEST_CHECK(os_memory_pool_free(&g_pool, g_pool_buffer - 1) == OS_STATUS_INVALID_ARG,
-                      "freeing a pointer before the pool buffer is rejected");
-    AHURA_TEST_CHECK(os_memory_pool_free(&g_pool, g_pool_buffer + 3) == OS_STATUS_INVALID_ARG,
-                      "freeing a misaligned pointer is rejected");
-
-    for (i = 0U; i < POOL_BLOCK_COUNT; i++)
-    {
-        (void)os_memory_pool_free(&g_pool, blocks[i]);
-    }
-}
-#endif /* OS_CONFIG_MEMORY_POOL_ENABLE */
-
-/*
- * ***********************************************************************************************************
- * Kernel heap (os_alloc / os_free)
+ * Kernel heap (os_mem_alloc / os_mem_free)
  * ***********************************************************************************************************
 */
 
@@ -1108,35 +1038,35 @@ static void test_alloc(void)
     void   *p1;
     void   *p2;
 
-    test_print_section("Kernel Heap (os_alloc)");
+    test_print_section("Kernel Heap (os_mem_alloc)");
 
-    free0 = os_alloc_free_bytes_get();
+    free0 = os_mem_free_get();
     AHURA_TEST_CHECK(free0 > 0U, "heap reports free bytes at start (%lu)", (unsigned long)free0);
 
-    p1 = os_alloc(128U);
-    AHURA_TEST_CHECK(p1 != NULL, "os_alloc(128) succeeds");
-    free1 = os_alloc_free_bytes_get();
+    p1 = os_mem_alloc(128U);
+    AHURA_TEST_CHECK(p1 != NULL, "os_mem_alloc(128) succeeds");
+    free1 = os_mem_free_get();
     AHURA_TEST_CHECK(free1 < free0, "free bytes decreased after alloc (%lu -> %lu)", (unsigned long)free0,
                       (unsigned long)free1);
 
-    p2 = os_alloc(64U);
-    AHURA_TEST_CHECK(p2 != NULL, "a second os_alloc(64) succeeds");
+    p2 = os_mem_alloc(64U);
+    AHURA_TEST_CHECK(p2 != NULL, "a second os_mem_alloc(64) succeeds");
     AHURA_TEST_CHECK(p1 != p2, "two live allocations return distinct blocks");
 
-    os_free(p1);
-    os_free(p2);
-    free2 = os_alloc_free_bytes_get();
+    os_mem_free(p1);
+    os_mem_free(p2);
+    free2 = os_mem_free_get();
     AHURA_TEST_CHECK(free2 == free0, "freeing both blocks restores the original free-byte count (coalescing works)");
 
-    min_free = os_alloc_min_free_bytes_get();
+    min_free = os_mem_watermark_get();
     AHURA_TEST_CHECK(min_free <= free0, "watermark min-free (%lu) never exceeds the current free count (%lu)",
                       (unsigned long)min_free, (unsigned long)free0);
 
-    AHURA_TEST_CHECK(os_alloc((size_t)OS_CONFIG_HEAP_SIZE * 2U) == NULL,
+    AHURA_TEST_CHECK(os_mem_alloc((size_t)OS_CONFIG_HEAP_SIZE * 2U) == NULL,
                       "an allocation larger than the whole heap fails cleanly");
 
-    os_free(NULL); /* must not crash */
-    AHURA_TEST_CHECK(true, "os_free(NULL) is a safe no-op");
+    os_mem_free(NULL); /* must not crash */
+    AHURA_TEST_CHECK(true, "os_mem_free(NULL) is a safe no-op");
 }
 #endif /* OS_CONFIG_ALLOC_ENABLE */
 
@@ -1195,9 +1125,9 @@ static void test_cpu_usage(void)
      * have gotten). */
     g_busy_counter    = 0U;
     g_busy_should_run = true;
-    status = os_task_create(&worker_TASK, OS_TASK_CONFIG(worker, test_busy_spin_entry, NULL, 1U));
+    status = os_task_create(&worker, OS_TASK_CONFIG(worker, test_busy_spin_entry, NULL, 1U));
     AHURA_TEST_CHECK(status == OS_STATUS_OK, "busy worker task created to load the CPU (priority 1)");
-    AHURA_TEST_CHECK(os_task_start(&worker_TASK) == OS_STATUS_OK, "busy worker task started");
+    AHURA_TEST_CHECK(os_task_start(&worker) == OS_STATUS_OK, "busy worker task started");
 
     (void)os_cpu_usage_get(); /* reset the sampling window right before the load starts */
     (void)os_delay_ms(300U);
@@ -1208,7 +1138,7 @@ static void test_cpu_usage(void)
                       (unsigned long)g_busy_counter);
 
     g_busy_should_run = false;
-    AHURA_TEST_CHECK(test_wait_inactive(&worker_TASK, 200U), "busy worker task stops cleanly");
+    AHURA_TEST_CHECK(test_wait_inactive(&worker, 200U), "busy worker task stops cleanly");
 }
 #endif /* OS_CONFIG_CPU_USAGE_ENABLE */
 
@@ -1312,24 +1242,24 @@ static void test_pipeline(void)
 
     /* Consumers at a higher priority than producers so they drain the small queue promptly,
      * keeping both producers genuinely blocking on a full queue rather than racing ahead. */
-    status = os_task_create(&helper2_TASK, OS_TASK_CONFIG(helper2, test_pipeline_consumer_entry, NULL, 4U));
+    status = os_task_create(&helper2, OS_TASK_CONFIG(helper2, test_pipeline_consumer_entry, NULL, 4U));
     AHURA_TEST_CHECK(status == OS_STATUS_OK, "consumer task 1 created (priority 4)");
-    status = os_task_create(&helper3_TASK, OS_TASK_CONFIG(helper3, test_pipeline_consumer_entry, NULL, 4U));
+    status = os_task_create(&helper3, OS_TASK_CONFIG(helper3, test_pipeline_consumer_entry, NULL, 4U));
     AHURA_TEST_CHECK(status == OS_STATUS_OK, "consumer task 2 created (priority 4)");
-    status = os_task_create(&worker_TASK, OS_TASK_CONFIG(worker, test_pipeline_producer_entry, &g_producer_ctx[0], 3U));
+    status = os_task_create(&worker, OS_TASK_CONFIG(worker, test_pipeline_producer_entry, &g_producer_ctx[0], 3U));
     AHURA_TEST_CHECK(status == OS_STATUS_OK, "producer task 1 created (priority 3, values 0-5)");
-    status = os_task_create(&helper_TASK, OS_TASK_CONFIG(helper, test_pipeline_producer_entry, &g_producer_ctx[1], 3U));
+    status = os_task_create(&helper, OS_TASK_CONFIG(helper, test_pipeline_producer_entry, &g_producer_ctx[1], 3U));
     AHURA_TEST_CHECK(status == OS_STATUS_OK, "producer task 2 created (priority 3, values 100-105)");
 
-    (void)os_task_start(&helper2_TASK);
-    (void)os_task_start(&helper3_TASK);
-    (void)os_task_start(&worker_TASK);
-    (void)os_task_start(&helper_TASK);
+    (void)os_task_start(&helper2);
+    (void)os_task_start(&helper3);
+    (void)os_task_start(&worker);
+    (void)os_task_start(&helper);
 
-    AHURA_TEST_CHECK(test_wait_inactive(&worker_TASK, 1000U), "producer 1 finished sending its items");
-    AHURA_TEST_CHECK(test_wait_inactive(&helper_TASK, 1000U), "producer 2 finished sending its items");
-    AHURA_TEST_CHECK(test_wait_inactive(&helper2_TASK, 1000U), "consumer 1 drained and stopped");
-    AHURA_TEST_CHECK(test_wait_inactive(&helper3_TASK, 1000U), "consumer 2 drained and stopped");
+    AHURA_TEST_CHECK(test_wait_inactive(&worker, 1000U), "producer 1 finished sending its items");
+    AHURA_TEST_CHECK(test_wait_inactive(&helper, 1000U), "producer 2 finished sending its items");
+    AHURA_TEST_CHECK(test_wait_inactive(&helper2, 1000U), "consumer 1 drained and stopped");
+    AHURA_TEST_CHECK(test_wait_inactive(&helper3, 1000U), "consumer 2 drained and stopped");
 
     AHURA_TEST_CHECK(g_pipeline_processed == TEST_PIPELINE_TOTAL_ITEMS,
                       "both consumers together processed all %u items (processed=%lu)",
@@ -1379,27 +1309,27 @@ static void test_mutex_priority_ordering(void)
     g_prio_ctx[1].priority_tag = 5U;
     g_prio_ctx[2].priority_tag = 6U;
 
-    status = os_task_create(&worker_TASK, OS_TASK_CONFIG(worker, test_prio_waiter_entry, &g_prio_ctx[0], 4U));
+    status = os_task_create(&worker, OS_TASK_CONFIG(worker, test_prio_waiter_entry, &g_prio_ctx[0], 4U));
     AHURA_TEST_CHECK(status == OS_STATUS_OK, "low-priority waiter created (priority 4)");
-    status = os_task_create(&helper_TASK, OS_TASK_CONFIG(helper, test_prio_waiter_entry, &g_prio_ctx[1], 5U));
+    status = os_task_create(&helper, OS_TASK_CONFIG(helper, test_prio_waiter_entry, &g_prio_ctx[1], 5U));
     AHURA_TEST_CHECK(status == OS_STATUS_OK, "medium-priority waiter created (priority 5)");
-    status = os_task_create(&helper2_TASK, OS_TASK_CONFIG(helper2, test_prio_waiter_entry, &g_prio_ctx[2], 6U));
+    status = os_task_create(&helper2, OS_TASK_CONFIG(helper2, test_prio_waiter_entry, &g_prio_ctx[2], 6U));
     AHURA_TEST_CHECK(status == OS_STATUS_OK, "high-priority waiter created (priority 6)");
 
     /* Start low first, high last: if the wake order below still comes out high-to-low, that
      * proves it is driven by priority, not by creation/start order. */
-    (void)os_task_start(&worker_TASK);
-    (void)os_task_start(&helper_TASK);
-    (void)os_task_start(&helper2_TASK);
+    (void)os_task_start(&worker);
+    (void)os_task_start(&helper);
+    (void)os_task_start(&helper2);
 
     (void)os_delay_ms(30U); /* let all 3 reach os_mutex_lock() and join the waiter list */
 
     AHURA_TEST_CHECK(os_mutex_unlock(&g_prio_mutex) == OS_STATUS_OK,
                       "test task releases the mutex with all 3 tasks queued");
 
-    AHURA_TEST_CHECK(test_wait_inactive(&worker_TASK, 300U), "low-priority waiter finished");
-    AHURA_TEST_CHECK(test_wait_inactive(&helper_TASK, 300U), "medium-priority waiter finished");
-    AHURA_TEST_CHECK(test_wait_inactive(&helper2_TASK, 300U), "high-priority waiter finished");
+    AHURA_TEST_CHECK(test_wait_inactive(&worker, 300U), "low-priority waiter finished");
+    AHURA_TEST_CHECK(test_wait_inactive(&helper, 300U), "medium-priority waiter finished");
+    AHURA_TEST_CHECK(test_wait_inactive(&helper2, 300U), "high-priority waiter finished");
 
     AHURA_TEST_CHECK(g_prio_order_count == 3U, "all 3 waiters recorded their turn (count=%lu)",
                       (unsigned long)g_prio_order_count);
@@ -1455,16 +1385,16 @@ static void test_event_queue_fanin(void)
     g_fanin_ctx[2].bit = 0x04U; g_fanin_ctx[2].value = 30U; g_fanin_ctx[2].work_ms = 40U;
     expected_sum = g_fanin_ctx[0].value + g_fanin_ctx[1].value + g_fanin_ctx[2].value;
 
-    status = os_task_create(&worker_TASK, OS_TASK_CONFIG(worker, test_fanin_worker_entry, &g_fanin_ctx[0], 3U));
+    status = os_task_create(&worker, OS_TASK_CONFIG(worker, test_fanin_worker_entry, &g_fanin_ctx[0], 3U));
     AHURA_TEST_CHECK(status == OS_STATUS_OK, "fan-in worker 1 created (bit 0x01, 60 ms work)");
-    status = os_task_create(&helper_TASK, OS_TASK_CONFIG(helper, test_fanin_worker_entry, &g_fanin_ctx[1], 3U));
+    status = os_task_create(&helper, OS_TASK_CONFIG(helper, test_fanin_worker_entry, &g_fanin_ctx[1], 3U));
     AHURA_TEST_CHECK(status == OS_STATUS_OK, "fan-in worker 2 created (bit 0x02, 20 ms work)");
-    status = os_task_create(&helper2_TASK, OS_TASK_CONFIG(helper2, test_fanin_worker_entry, &g_fanin_ctx[2], 3U));
+    status = os_task_create(&helper2, OS_TASK_CONFIG(helper2, test_fanin_worker_entry, &g_fanin_ctx[2], 3U));
     AHURA_TEST_CHECK(status == OS_STATUS_OK, "fan-in worker 3 created (bit 0x04, 40 ms work)");
 
-    (void)os_task_start(&worker_TASK);
-    (void)os_task_start(&helper_TASK);
-    (void)os_task_start(&helper2_TASK);
+    (void)os_task_start(&worker);
+    (void)os_task_start(&helper);
+    (void)os_task_start(&helper2);
 
     status = os_event_group_wait_bits(&g_event, 0x07U, true, false, &matched, 500U);
     AHURA_TEST_CHECK((status == OS_STATUS_OK) && (matched == 0x07U),
@@ -1489,9 +1419,9 @@ static void test_event_queue_fanin(void)
     AHURA_TEST_CHECK(saw[0] && saw[1] && saw[2],
                       "all 3 distinct worker values arrived exactly once each, in any order");
 
-    AHURA_TEST_CHECK(test_wait_inactive(&worker_TASK, 300U), "fan-in worker 1 terminated cleanly");
-    AHURA_TEST_CHECK(test_wait_inactive(&helper_TASK, 300U), "fan-in worker 2 terminated cleanly");
-    AHURA_TEST_CHECK(test_wait_inactive(&helper2_TASK, 300U), "fan-in worker 3 terminated cleanly");
+    AHURA_TEST_CHECK(test_wait_inactive(&worker, 300U), "fan-in worker 1 terminated cleanly");
+    AHURA_TEST_CHECK(test_wait_inactive(&helper, 300U), "fan-in worker 2 terminated cleanly");
+    AHURA_TEST_CHECK(test_wait_inactive(&helper2, 300U), "fan-in worker 3 terminated cleanly");
 }
 #endif /* OS_CONFIG_QUEUE_ENABLE && OS_CONFIG_EVENT_ENABLE */
 
@@ -1604,7 +1534,7 @@ static void test_stress_worker_entry(void *context)
             default:
             {
                 size_t  size = 1U + (test_stress_prng_next(&ctx->prng_state) % 64U);
-                uint8_t *mem = (uint8_t *)os_alloc(size);
+                uint8_t *mem = (uint8_t *)os_mem_alloc(size);
 
                 if (mem != NULL)
                 {
@@ -1617,7 +1547,7 @@ static void test_stress_worker_entry(void *context)
                     {
                         if (mem[i] != pattern) { g_stress_corrupt[ctx->worker_id] = true; }
                     }
-                    os_free(mem);
+                    os_mem_free(mem);
                 }
                 break;
             }
@@ -1669,7 +1599,7 @@ static void test_stress_soak(void)
                       (unsigned)OS_TEST_STRESS_QUEUE_CAPACITY, (unsigned)OS_TEST_STRESS_WORKER_COUNT);
 
     g_stress_shared_counter = 0U;
-    heap_before = os_alloc_free_bytes_get();
+    heap_before = os_mem_free_get();
 
     for (i = 0U; i < OS_TEST_STRESS_WORKER_COUNT; i++)
     {
@@ -1681,24 +1611,24 @@ static void test_stress_soak(void)
         g_stress_ctx[i].prng_state = 0x9E3779B9U ^ (i * 0x2545F491U) ^ (os_tick_get() | 1U);
     }
 
-    status = os_task_create(&worker_TASK, OS_TASK_CONFIG(worker, test_stress_worker_entry, &g_stress_ctx[0], 3U));
+    status = os_task_create(&worker, OS_TASK_CONFIG(worker, test_stress_worker_entry, &g_stress_ctx[0], 3U));
     AHURA_TEST_CHECK(status == OS_STATUS_OK, "stress worker 0 created (priority 3)");
-    status = os_task_create(&helper_TASK, OS_TASK_CONFIG(helper, test_stress_worker_entry, &g_stress_ctx[1], 4U));
+    status = os_task_create(&helper, OS_TASK_CONFIG(helper, test_stress_worker_entry, &g_stress_ctx[1], 4U));
     AHURA_TEST_CHECK(status == OS_STATUS_OK, "stress worker 1 created (priority 4)");
-    status = os_task_create(&helper2_TASK, OS_TASK_CONFIG(helper2, test_stress_worker_entry, &g_stress_ctx[2], 5U));
+    status = os_task_create(&helper2, OS_TASK_CONFIG(helper2, test_stress_worker_entry, &g_stress_ctx[2], 5U));
     AHURA_TEST_CHECK(status == OS_STATUS_OK, "stress worker 2 created (priority 5)");
-    status = os_task_create(&helper3_TASK, OS_TASK_CONFIG(helper3, test_stress_worker_entry, &g_stress_ctx[3], 6U));
+    status = os_task_create(&helper3, OS_TASK_CONFIG(helper3, test_stress_worker_entry, &g_stress_ctx[3], 6U));
     AHURA_TEST_CHECK(status == OS_STATUS_OK, "stress worker 3 created (priority 6)");
 
-    (void)os_task_start(&worker_TASK);
-    (void)os_task_start(&helper_TASK);
-    (void)os_task_start(&helper2_TASK);
-    (void)os_task_start(&helper3_TASK);
+    (void)os_task_start(&worker);
+    (void)os_task_start(&helper);
+    (void)os_task_start(&helper2);
+    (void)os_task_start(&helper3);
 
-    AHURA_TEST_CHECK(test_wait_inactive(&worker_TASK, 15000U), "stress worker 0 terminated cleanly (no deadlock/hang)");
-    AHURA_TEST_CHECK(test_wait_inactive(&helper_TASK, 15000U), "stress worker 1 terminated cleanly (no deadlock/hang)");
-    AHURA_TEST_CHECK(test_wait_inactive(&helper2_TASK, 15000U), "stress worker 2 terminated cleanly (no deadlock/hang)");
-    AHURA_TEST_CHECK(test_wait_inactive(&helper3_TASK, 15000U), "stress worker 3 terminated cleanly (no deadlock/hang)");
+    AHURA_TEST_CHECK(test_wait_inactive(&worker, 15000U), "stress worker 0 terminated cleanly (no deadlock/hang)");
+    AHURA_TEST_CHECK(test_wait_inactive(&helper, 15000U), "stress worker 1 terminated cleanly (no deadlock/hang)");
+    AHURA_TEST_CHECK(test_wait_inactive(&helper2, 15000U), "stress worker 2 terminated cleanly (no deadlock/hang)");
+    AHURA_TEST_CHECK(test_wait_inactive(&helper3, 15000U), "stress worker 3 terminated cleanly (no deadlock/hang)");
 
     for (i = 0U; i < OS_TEST_STRESS_WORKER_COUNT; i++)
     {
@@ -1743,7 +1673,7 @@ static void test_stress_soak(void)
     AHURA_TEST_CHECK(os_mutex_try_lock(&g_stress_mutex) == OS_STATUS_OK, "stress mutex ended unlocked");
     (void)os_mutex_unlock(&g_stress_mutex);
 
-    heap_after = os_alloc_free_bytes_get();
+    heap_after = os_mem_free_get();
     AHURA_TEST_CHECK(heap_after == heap_before,
                       "kernel heap has no leak after the alloc/free churn (before=%lu after=%lu bytes free)",
                       (unsigned long)heap_before, (unsigned long)heap_after);
@@ -1806,21 +1736,21 @@ static void test_stress_task_churn(void)
 
     for (i = 0U; i < OS_TEST_CHURN_ITERATIONS; i++)
     {
-        status = os_task_create(&worker_TASK, OS_TASK_CONFIG(worker, test_churn_worker_entry, NULL, 1U));
+        status = os_task_create(&worker, OS_TASK_CONFIG(worker, test_churn_worker_entry, NULL, 1U));
         if (status != OS_STATUS_OK)
         {
             all_created = false;
             break;
         }
 
-        status = os_task_start(&worker_TASK);
+        status = os_task_start(&worker);
         if (status != OS_STATUS_OK)
         {
             all_started = false;
             break;
         }
 
-        if (!test_wait_inactive(&worker_TASK, 100U))
+        if (!test_wait_inactive(&worker, 100U))
         {
             all_finished = false;
             break;
@@ -1839,7 +1769,7 @@ static void test_stress_task_churn(void)
     {
         size_t min_free;
 
-        if (os_task_stack_watermark_get(&worker_TASK, &min_free) == OS_STATUS_OK)
+        if (os_task_stack_watermark_get(&worker, &min_free) == OS_STATUS_OK)
         {
             AHURA_TEST_CHECK(min_free <= sizeof(worker_STACK),
                               "repeated slot reuse leaves a sane stack watermark (%lu / %lu bytes free)",
@@ -1915,83 +1845,6 @@ static void test_stress_timer_churn(void)
 }
 #endif /* OS_CONFIG_TIMER_ENABLE */
 
-#if (OS_CONFIG_MEMORY_POOL_ENABLE == 1U)
-#define OS_TEST_POOL_CHURN_ITERATIONS 1000U
-
-/******************************************************************************************************/
-/**
- * @brief Hammers os_memory_pool_alloc()/os_memory_pool_free() back-to-back, many times, pattern-
- *        filling and verifying the block's contents on every cycle - catches usage-bitmap
- *        tracking bugs or overlapping-block bugs that only show up after many alloc/free cycles,
- *        not just the handful in test_memory_pool() above. Finishes by draining the whole pool
- *        once more to prove no block was silently lost (leaked) across the churn.
- */
-static void test_stress_memory_pool_churn(void)
-{
-    uint32_t i;
-    bool     all_ok     = true;
-    bool     pattern_ok = true;
-
-    test_print_section("Stress: rapid memory pool alloc/free churn");
-
-    AHURA_TEST_CHECK(os_memory_pool_init(&g_pool, g_pool_buffer, g_pool_usage, POOL_BLOCK_SIZE, POOL_BLOCK_COUNT) ==
-                          OS_STATUS_OK,
-                      "pool re-initialized for the churn run");
-
-    for (i = 0U; i < OS_TEST_POOL_CHURN_ITERATIONS; i++)
-    {
-        uint8_t *block   = (uint8_t *)os_memory_pool_alloc(&g_pool);
-        uint8_t  pattern = (uint8_t)i;
-        size_t   j;
-
-        if (block == NULL)
-        {
-            all_ok = false;
-            break;
-        }
-
-        for (j = 0U; j < POOL_BLOCK_SIZE; j++) { block[j] = pattern; }
-        os_task_yield(); /* widen the window in case a racy free/alloc could hand out an overlapping block */
-        for (j = 0U; j < POOL_BLOCK_SIZE; j++)
-        {
-            if (block[j] != pattern) { pattern_ok = false; }
-        }
-
-        if (os_memory_pool_free(&g_pool, block) != OS_STATUS_OK)
-        {
-            all_ok = false;
-            break;
-        }
-    }
-
-    AHURA_TEST_CHECK(all_ok, "alloc/free succeeds on every one of %u rapid churn cycles",
-                      (unsigned)OS_TEST_POOL_CHURN_ITERATIONS);
-    AHURA_TEST_CHECK(pattern_ok, "no block ever came back with corrupted contents across %u churn cycles",
-                      (unsigned)OS_TEST_POOL_CHURN_ITERATIONS);
-
-    {
-        void *blocks[POOL_BLOCK_COUNT] = { 0 };
-        bool  all_unique = true;
-
-        for (i = 0U; i < POOL_BLOCK_COUNT; i++)
-        {
-            blocks[i] = os_memory_pool_alloc(&g_pool);
-            if (blocks[i] == NULL)
-            {
-                all_unique = false;
-            }
-        }
-        AHURA_TEST_CHECK(all_unique, "pool still yields all %u blocks after the churn (no leak)",
-                          (unsigned)POOL_BLOCK_COUNT);
-
-        for (i = 0U; i < POOL_BLOCK_COUNT; i++)
-        {
-            (void)os_memory_pool_free(&g_pool, blocks[i]);
-        }
-    }
-}
-#endif /* OS_CONFIG_MEMORY_POOL_ENABLE */
-
 /*
  * ***********************************************************************************************************
  * Task / stack footprint and context-switch timing (informational - no "correct" value to assert)
@@ -2045,14 +1898,14 @@ static void test_task_footprint(void)
          * feature applied to a task other than "self". */
         g_busy_counter    = 0U;
         g_busy_should_run = true;
-        status = os_task_create(&worker_TASK, OS_TASK_CONFIG(worker, test_busy_spin_entry, NULL, 1U));
+        status = os_task_create(&worker, OS_TASK_CONFIG(worker, test_busy_spin_entry, NULL, 1U));
         if (status == OS_STATUS_OK)
         {
-            (void)os_task_start(&worker_TASK);
+            (void)os_task_start(&worker);
             (void)os_delay_ms(20U);
             g_busy_should_run = false;
 
-            if (os_task_stack_watermark_get(&worker_TASK, &worker_min_free) == OS_STATUS_OK)
+            if (os_task_stack_watermark_get(&worker, &worker_min_free) == OS_STATUS_OK)
             {
                 printf("  [INFO] worker task peak stack usage: %lu / %lu bytes (%lu%% headroom left)\r\n",
                        (unsigned long)(sizeof(worker_STACK) - worker_min_free),
@@ -2060,7 +1913,7 @@ static void test_task_footprint(void)
                        (unsigned long)((worker_min_free * 100U) / sizeof(worker_STACK)));
             }
 
-            (void)test_wait_inactive(&worker_TASK, 200U);
+            (void)test_wait_inactive(&worker, 200U);
         }
     }
 #else
@@ -2091,14 +1944,14 @@ static void test_context_switch_timing(void)
     g_switch_count      = 0U;
     g_switch_should_run = true;
 
-    status = os_task_create(&worker_TASK, OS_TASK_CONFIG(worker, test_switch_ping_entry, NULL, 1U));
+    status = os_task_create(&worker, OS_TASK_CONFIG(worker, test_switch_ping_entry, NULL, 1U));
     AHURA_TEST_CHECK(status == OS_STATUS_OK, "ping task created for the switch benchmark (priority 1)");
-    status = os_task_create(&helper_TASK, OS_TASK_CONFIG(helper, test_switch_ping_entry, NULL, 1U));
+    status = os_task_create(&helper, OS_TASK_CONFIG(helper, test_switch_ping_entry, NULL, 1U));
     AHURA_TEST_CHECK(status == OS_STATUS_OK, "pong task created for the switch benchmark (priority 1)");
 
     t0 = os_tick_get();
-    (void)os_task_start(&worker_TASK);
-    (void)os_task_start(&helper_TASK);
+    (void)os_task_start(&worker);
+    (void)os_task_start(&helper);
     (void)os_delay_ms(200U); /* let them ping-pong for a fixed window */
     g_switch_should_run = false;
     t1 = os_tick_get();
@@ -2116,8 +1969,8 @@ static void test_context_switch_timing(void)
                (unsigned long)switches, (unsigned long)window_ms, (unsigned long)avg_switch_us);
     }
 
-    AHURA_TEST_CHECK(test_wait_inactive(&worker_TASK, 200U), "ping task stops cleanly");
-    AHURA_TEST_CHECK(test_wait_inactive(&helper_TASK, 200U), "pong task stops cleanly");
+    AHURA_TEST_CHECK(test_wait_inactive(&worker, 200U), "ping task stops cleanly");
+    AHURA_TEST_CHECK(test_wait_inactive(&helper, 200U), "pong task stops cleanly");
 }
 
 /*
@@ -2285,9 +2138,6 @@ void os_test(void)
 #if (OS_CONFIG_WORK_ENABLE == 1U)
     test_work();
 #endif
-#if (OS_CONFIG_MEMORY_POOL_ENABLE == 1U)
-    test_memory_pool();
-#endif
 #if (OS_CONFIG_ALLOC_ENABLE == 1U)
     test_alloc();
 #endif
@@ -2314,9 +2164,6 @@ void os_test(void)
     test_stress_task_churn();
 #if (OS_CONFIG_TIMER_ENABLE == 1U)
     test_stress_timer_churn();
-#endif
-#if (OS_CONFIG_MEMORY_POOL_ENABLE == 1U)
-    test_stress_memory_pool_churn();
 #endif
 
     test_task_footprint();

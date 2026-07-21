@@ -235,21 +235,6 @@ typedef struct
 } os_work_t;
 #endif /* OS_CONFIG_WORK_ENABLE */
 
-#if (OS_CONFIG_MEMORY_POOL_ENABLE == 1U)
-/******************************************************************************************************/
-/**
- * @brief Fixed-block memory pool object.
- */
-typedef struct
-{
-    uint8_t *buffer;
-    uint8_t *in_use;
-    size_t  block_size;
-    size_t  block_count;
-
-} os_memory_pool_t;
-#endif /* OS_CONFIG_MEMORY_POOL_ENABLE */
-
 /*
  * ***********************************************************************************************************
  * Macros
@@ -333,12 +318,15 @@ typedef enum
 #define OS_STACK_ALIGNED
 #endif
 
-/** Define a task stack and handle. The size is in bytes (rounded up to an
- *  8-byte multiple so os_task_create's alignment check cannot fail) and must
- *  be at least OS_CONFIG_MIN_STACK_SIZE. */
+/** Define a task stack and handle: the handle is declared as plain "name" (the
+ *  object every other os_task_* call references), while the backing stack
+ *  buffer gets the decorated "name_STACK" (touched only by OS_TASK_CONFIG
+ *  below, never by hand). The size is in bytes (rounded up to an 8-byte
+ *  multiple so os_task_create's alignment check cannot fail) and must be at
+ *  least OS_CONFIG_MIN_STACK_SIZE. */
 #define OS_TASK_DEFINE(name, stack_bytes) \
     static uint8_t   name##_STACK[(((stack_bytes) + 7U) & ~7U)] OS_STACK_ALIGNED; \
-    static os_task_t name##_TASK
+    static os_task_t name
 
 /** Task configuration bound to specific cores: core_affinity is a bitmask
  *  (OS_TASK_CORE(n), OR-combinable; OS_TASK_CORE_ANY = any core). Bits naming
@@ -712,52 +700,30 @@ os_status os_work_cancel(os_work_t *work);
 bool os_work_is_pending(const os_work_t *work);
 #endif /* OS_CONFIG_WORK_ENABLE */
 
-#if (OS_CONFIG_MEMORY_POOL_ENABLE == 1U)
-/******************************************************************************************************/
-/**
- * @brief Initialize a fixed-block memory pool. block_size and buffer must be 8-byte
- *        aligned; returns OS_STATUS_BUSY instead of resetting a pool with blocks
- *        still outstanding.
- */
-os_status os_memory_pool_init(os_memory_pool_t *pool, void *buffer, void *usage_map, size_t block_size, size_t block_count);
-
-/******************************************************************************************************/
-/**
- * @brief Allocate one block from a memory pool (ISR-safe).
- */
-void* os_memory_pool_alloc(os_memory_pool_t *pool);
-
-/******************************************************************************************************/
-/**
- * @brief Free one block back to a memory pool (ISR-safe).
- */
-os_status os_memory_pool_free(os_memory_pool_t *pool, void *block);
-#endif /* OS_CONFIG_MEMORY_POOL_ENABLE */
-
 #if (OS_CONFIG_ALLOC_ENABLE == 1U)
 /******************************************************************************************************/
 /**
  * @brief Allocate memory from the kernel heap (8-byte aligned; NULL when exhausted).
  */
-void* os_alloc(size_t size);
+void* os_mem_alloc(size_t size);
 
 /******************************************************************************************************/
 /**
- * @brief Return memory obtained from os_alloc to the kernel heap (NULL is ignored).
+ * @brief Return memory obtained from os_mem_alloc to the kernel heap (NULL is ignored).
  */
-void os_free(void *memory);
+void os_mem_free(void *memory);
 
 /******************************************************************************************************/
 /**
  * @brief Get the number of bytes currently free in the kernel heap.
  */
-size_t os_alloc_free_bytes_get(void);
+size_t os_mem_free_get(void);
 
 /******************************************************************************************************/
 /**
  * @brief Get the smallest amount of free heap ever observed (worst case since boot).
  */
-size_t os_alloc_min_free_bytes_get(void);
+size_t os_mem_watermark_get(void);
 #endif /* OS_CONFIG_ALLOC_ENABLE */
 
 /******************************************************************************************************/

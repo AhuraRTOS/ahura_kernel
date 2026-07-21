@@ -39,9 +39,8 @@
 #define OS_CONFIG_EVENT_ENABLE            1U
 #define OS_CONFIG_TIMER_ENABLE            1U
 #define OS_CONFIG_WORK_ENABLE             1U
-#define OS_CONFIG_MEMORY_POOL_ENABLE      1U
 
-/* Kernel heap (os_alloc/os_free): first-fit allocator with coalescing over a
+/* Kernel heap (os_mem_alloc/os_mem_free): first-fit allocator with coalescing over a
  * static heap of OS_CONFIG_HEAP_SIZE bytes. */
 #define OS_CONFIG_ALLOC_ENABLE            1U
 
@@ -90,7 +89,7 @@
  */
 #define OS_CONFIG_CPU_CLOCK_HZ          0U
 
-/* Kernel heap size in bytes for os_alloc/os_free. */
+/* Kernel heap size in bytes for os_mem_alloc/os_mem_free. */
 #define OS_CONFIG_HEAP_SIZE             4096U
 
 /* Task table size; each enabled kernel service task (work, timer) occupies

@@ -69,13 +69,12 @@ message(STATUS "Ahura kernel arch: ${OS_ARCH_VARIANT}")
 
 add_library(ahura_kernel STATIC
 	arch/arm/${OS_ARCH_VARIANT}/os_arch_port.c
-	core/os_alloc.c
 	core/os_critical.c
 	core/os_delay.c
 	core/os_event.c
 	core/os_kernel.c
 	core/os_list.c
-	core/os_memory_pool.c
+	core/os_mem.c
 	core/os_mutex.c
 	core/os_queue.c
 	core/os_semaphore.c

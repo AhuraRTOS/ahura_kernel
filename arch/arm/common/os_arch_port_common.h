@@ -40,7 +40,7 @@
 #if !defined(OS_CONFIG_MUTEX_ENABLE) || !defined(OS_CONFIG_SEMAPHORE_ENABLE) ||                        \
     !defined(OS_CONFIG_QUEUE_ENABLE) || !defined(OS_CONFIG_EVENT_ENABLE) ||                            \
     !defined(OS_CONFIG_TIMER_ENABLE) || !defined(OS_CONFIG_WORK_ENABLE) ||                             \
-    !defined(OS_CONFIG_MEMORY_POOL_ENABLE) || !defined(OS_CONFIG_ALLOC_ENABLE) ||                      \
+    !defined(OS_CONFIG_ALLOC_ENABLE) ||                                                                \
     !defined(OS_CONFIG_STACK_WATERMARK_ENABLE) ||                                                      \
     !defined(OS_CONFIG_CPU_USAGE_ENABLE) ||                                                            \
     !defined(OS_CONFIG_TEST_ENABLE) ||                                                                 \

@@ -18,7 +18,7 @@ A small preemptive RTOS kernel for ARM Cortex-M.
   every build-time option, active at its default value (tick rate, task/timer
   limits, stack sizes, heap size, TrustZone mode, core count, and the
   per-feature switches `OS_CONFIG_<FEATURE>_ENABLE` for mutex, semaphore,
-  queue, event, timer, work, memory pool, alloc, stack watermark, CPU usage,
+  queue, event, timer, work, alloc, stack watermark, CPU usage,
   the default application task, the self-test task; the intrusive list module
   has no switch — the scheduler runs on it). Never included by the kernel:
   copy it into the project — see "Configuration". Disabling a feature
@@ -38,7 +38,7 @@ A small preemptive RTOS kernel for ARM Cortex-M.
     platform clock callback (`os_clock_hz_get_cb`, see "Platform clock"),
     the default application task (`os_main`, see "Default application
     task"), and the self-test task (`os_test`, see "Self-test suite").
-  - `os_alloc.c` — kernel heap (`os_alloc`/`os_free`): first-fit allocator with
+  - `os_mem.c` — kernel heap (`os_mem_alloc`/`os_mem_free`): first-fit allocator with
     coalescing over a static `OS_CONFIG_HEAP_SIZE` heap.
   - `os_task.c` — static TCB pool with O(1) list-based scheduling: one FIFO
     ready list per priority plus a ready bitmap (highest set bit = next
@@ -53,7 +53,6 @@ A small preemptive RTOS kernel for ARM Cortex-M.
     kernel timer task (`tsk_timer`, highest priority).
   - `os_work.c` — Zephyr-style deferrable work queue; items run on the kernel work task
     (`tsk_work`, highest priority).
-  - `os_memory_pool.c` — fixed-block pool utility.
   - `os_list.c` — intrusive doubly-linked list; always compiled (the scheduler
     itself runs on it, so it cannot be configured out), also public API.
   - `os_internal.h` — internal cross-module contract (not for applications).
@@ -257,8 +256,8 @@ normally again.
 The task runs `os_test()` once: exercises whichever
 `OS_CONFIG_<FEATURE>_ENABLE` switches are on (tasks, delays, critical
 sections, mutexes, semaphores, queues, event groups, timers, work items,
-memory pools, the kernel heap, stack watermarks, CPU usage, the intrusive
-list), and prints a detailed PASS/FAIL log via `printf` followed by a
+the kernel heap, stack watermarks, CPU usage, the intrusive list), and
+prints a detailed PASS/FAIL log via `printf` followed by a
 pass/fail summary, sized by `OS_CONFIG_TEST_STACK_SIZE` /
 `OS_CONFIG_TEST_PRIORITY`. The suite depends on nothing but `ahura.h` — no
 board or HAL headers — so it runs on real hardware for any arch/board the
@@ -366,17 +365,17 @@ dynamic frequency scaling) plugs in by overriding the callback in application
 code. When the callback returns 0, tick setup and busy-wait delays refuse to
 run (`OS_STATUS_ERROR`) instead of miscounting.
 
-## Kernel heap (os_alloc / os_free)
+## Kernel heap (os_mem_alloc / os_mem_free)
 
 `OS_CONFIG_ALLOC_ENABLE` (default 1) compiles in a kernel heap of
 `OS_CONFIG_HEAP_SIZE` bytes (default 4096, static array — nothing is taken
 from the linker heap):
 
 ```c
-void  *memory = os_alloc(size);          /* 8-byte aligned, NULL when exhausted   */
-os_free(memory);                         /* NULL/foreign/double free are ignored  */
-size_t now  = os_alloc_free_bytes_get();     /* current free bytes                */
-size_t low  = os_alloc_min_free_bytes_get(); /* worst-case watermark since boot   */
+void  *memory = os_mem_alloc(size);   /* 8-byte aligned, NULL when exhausted   */
+os_mem_free(memory);                  /* NULL/foreign/double free are ignored  */
+size_t now  = os_mem_free_get();      /* current free bytes                    */
+size_t low  = os_mem_watermark_get(); /* worst-case watermark since boot       */
 ```
 
 The allocator is first-fit with an address-ordered free list and coalescing
@@ -384,7 +383,6 @@ of adjacent free blocks (comparable to FreeRTOS `heap_4`), so mixed-size
 alloc/free patterns do not fragment permanently. Calls are protected by the
 kernel critical section: usable from tasks and ISRs, though allocating in an
 ISR is discouraged — the walk over the free list runs with interrupts masked.
-For hot fixed-size objects prefer `os_memory_pool_*` (O(1), no fragmentation).
 
 ## Timeout semantics
 
