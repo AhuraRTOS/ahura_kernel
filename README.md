@@ -1,13 +1,110 @@
 # Ahura Kernel
 
-A small preemptive RTOS kernel for ARM Cortex-M.
+![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
+![Standard: C11](https://img.shields.io/badge/standard-C11-blue.svg)
+![Platform: Cortex-M](https://img.shields.io/badge/platform-Cortex--M-informational.svg)
+
+A small, preemptive, priority-based RTOS kernel for ARM Cortex-M — from M0 to
+M85, TrustZone-aware, with zero mandatory HAL/CMSIS dependencies.
+
+- **Preemptive priority scheduler** — 31 priority levels, O(1) list-based
+  ready queues, round-robin among tasks of equal priority.
+- **Full sync/IPC set** — mutexes, counting semaphores, queues, and event
+  groups, all with millisecond timeouts.
+- **Software timers & a deferrable work queue** — one-shot/periodic timers
+  and a Zephyr-style work queue, each on its own kernel service task.
+- **Optional kernel heap** — first-fit allocator with coalescing (comparable
+  to FreeRTOS `heap_4`), compiled out entirely when unused.
+- **Built-in diagnostics** — stack watermarking and CPU usage sampling,
+  both opt-in and near-zero overhead.
+- **TrustZone-aware** — secure, non-secure, or disabled, selectable per
+  build on ARMv8-M.
+- **Every feature is a compile-time switch** — `OS_CONFIG_<FEATURE>_ENABLE`
+  removes unused code, RAM, and API surface entirely, not just at runtime.
+- **Self-testing** — a built-in suite exercises every enabled feature on
+  real hardware with no board/HAL dependencies.
+- **Broad Cortex-M coverage** — M0/M0+/M23, M3/M4/M7, and
+  M33/M35P/M52/M55/M85 all share just two portable port implementations.
+- **Experimental:** multi-core (SMP) scheduling and tickless idle.
+
+## Table of contents
+
+- [Quick start](#quick-start)
+- [Architecture profiles at a glance](#architecture-profiles-at-a-glance)
+- [Layout](#layout)
+- [Configuration](#configuration)
+- [Integration checklist](#integration-checklist)
+- [Default application task](#default-application-task)
+- [Application callbacks](#application-callbacks)
+- [Task priorities](#task-priorities)
+- [Work queue](#work-queue)
+- [Timeout semantics](#timeout-semantics)
+- [Kernel heap](#kernel-heap)
+- [CPU usage](#cpu-usage)
+- [Platform clock](#platform-clock)
+- [TrustZone](#trustzone)
+- [Multi-core (experimental)](#multi-core-experimental)
+- [Tickless idle (experimental)](#tickless-idle-experimental)
+- [Self-test suite](#self-test-suite)
+- [Examples](#examples)
+- [Notes and constraints](#notes-and-constraints)
+
+## Quick start
+
+1. **Configure.** Copy [`os_config_template.h`](os_config_template.h) into
+   the project as `os_config.h` (any directory — layout doesn't matter).
+   Every option starts at its default value.
+2. **Point the kernel build at it** — *before* `add_subdirectory`, so the
+   kernel library and the application compile against the exact same config:
+
+   ```cmake
+   set(OS_CONFIG_DIR ${CMAKE_CURRENT_SOURCE_DIR}/Core/Inc)  # wherever the copy lives
+   add_subdirectory(ahura_kernel)
+   ```
+
+3. **Boot the kernel** from `main()`, after clocks are configured:
+
+   ```c
+   os_init();
+   os_start();   /* never returns */
+   ```
+
+   `os_init()` has already created and started a default application task —
+   there is nothing else to create just to get moving.
+4. **Write the application** in `os_main()`: copy
+   [`os_main_template.c`](os_main_template.c) into the project as
+   `os_main.c` and replace the body, or spawn further tasks from it with
+   `OS_TASK_DEFINE` + `os_task_create`.
+
+New to a specific feature? [`ahura_examples/kernel/`](../ahura_examples/kernel/)
+has a minimal, standalone example per feature — see [Examples](#examples).
+
+## Architecture profiles at a glance
+
+| Architecture profile | Cortex-M cores | Ahura port | TrustZone support |
+|----------------------|----------------|------------|-------------------|
+| ARMv6-M | M0, M0+ | `v6m` | No (Security Extension absent) — `OS_CONFIG_TRUSTZONE_DISABLED` only |
+| ARMv7-M / ARMv7E-M | M3 / M4, M7 | `v7m` | No — `OS_CONFIG_TRUSTZONE_DISABLED` only |
+| ARMv8-M baseline | M23 | `v6m` | Yes, optional per device — all three `OS_CONFIG_TRUSTZONE` modes |
+| ARMv8-M mainline | M33, M35P | `v8m` | Yes, optional per device — all three modes |
+| ARMv8.1-M | M52, M55, M85 | `v8m` | Yes, optional per device — all three modes |
+
+Notes: M4/M7 are ARMv7E-M (DSP extension) but port-identical to M3 here; M23 is
+baseline (Thumb-1 subset), which is why it shares the `v6m` port rather than the
+mainline one; Cortex-M1 (ARMv6-M, FPGA) is deliberately not supported. "Optional
+per device" means the Security Extension is a silicon-vendor choice and may also
+be disabled in option bytes (e.g. `TZEN` on STM32H5) — that case uses
+`OS_CONFIG_TRUSTZONE_DISABLED`.
 
 ## Layout
 
+### Top-level files
+
 - `ahura.h` — public umbrella API (the only header applications include).
-  Declares `os_main()` and `os_test()` too (see "Default application task"
-  and "Self-test suite") even though the kernel only ships weak defaults for
-  them — overriding/linking the real body is the application's job. Neither
+  Declares `os_main()` and `os_test()` too (see [Default application
+  task](#default-application-task) and [Self-test suite](#self-test-suite))
+  even though the kernel only ships weak defaults for them —
+  overriding/linking the real body is the application's job. Neither
   carries the `_cb` suffix used elsewhere in this header: that suffix is
   reserved for callbacks the kernel queries for platform behavior
   (`os_clock_hz_get_cb`, `os_tickless_pre_sleep_cb`, ...); `os_main()`/
@@ -21,89 +118,98 @@ A small preemptive RTOS kernel for ARM Cortex-M.
   queue, event, timer, work, alloc, stack watermark, CPU usage,
   the default application task, the self-test task; the intrusive list module
   has no switch — the scheduler runs on it). Never included by the kernel:
-  copy it into the project — see "Configuration". Disabling a feature
-  compiles out its code and API; disabling timer/work/the default
+  copy it into the project — see [Configuration](#configuration). Disabling
+  a feature compiles out its code and API; disabling timer/work/the default
   task/the self-test task also removes the corresponding kernel service
   task and its stack.
 - `os_cb_template.c` — template for the application-side callbacks,
-  deliberately not compiled into the kernel — see "Application callbacks".
+  deliberately not compiled into the kernel — see [Application
+  callbacks](#application-callbacks).
 - `os_main_template.c` — template for the default application task's body,
-  deliberately not compiled into the kernel — see "Default application
-  task".
+  deliberately not compiled into the kernel — see [Default application
+  task](#default-application-task).
 - `test/` — the kernel self-test suite (`os_test.c`), its own buildable
-  module (target `os_test`) with its own `CMakeLists.txt` — see "Self-test
-  suite".
-- `core/` — portable kernel modules (all filenames `os_`-prefixed):
-  - `os_kernel.c` — lifecycle (`os_init`, `os_start`, running flag), the
-    platform clock callback (`os_clock_hz_get_cb`, see "Platform clock"),
-    the default application task (`os_main`, see "Default application
-    task"), and the self-test task (`os_test`, see "Self-test suite").
-  - `os_mem.c` — kernel heap (`os_mem_alloc`/`os_mem_free`): first-fit allocator with
-    coalescing over a static `OS_CONFIG_HEAP_SIZE` heap.
-  - `os_task.c` — static TCB pool with O(1) list-based scheduling: one FIFO
-    ready list per priority plus a ready bitmap (highest set bit = next
-    priority to run, one `CLZ` on ARMv7-M and up), round-robin by list
-    rotation, and a delay list holding only the finite-delay sleepers.
-  - `os_tick.c` — tick counter, tick handler (wakes delays, drives timers, preempts).
-  - `os_delay.c` — blocking millisecond/second delays, DWT-precise microsecond busy-wait.
-  - `os_critical.c` — PRIMASK-based nesting critical sections.
-  - `os_mutex.c`, `os_semaphore.c`, `os_queue.c`, `os_event.c` — sync/IPC primitives with
-    `timeout_ms` waits.
-  - `os_timer.c` — software timers; expiry is detected by the tick, callbacks run on the
-    kernel timer task (`tsk_timer`, highest priority).
-  - `os_work.c` — Zephyr-style deferrable work queue; items run on the kernel work task
-    (`tsk_work`, highest priority).
-  - `os_list.c` — intrusive doubly-linked list; always compiled (the scheduler
-    itself runs on it, so it cannot be configured out), also public API.
-  - `os_internal.h` — internal cross-module contract (not for applications).
-- `arch/arm/` — port layer: SysTick tick source, SVC first-task start,
-  PendSV context switch, initial stack frames, cycle counter. Shared code is
-  organized by architecture (the same split Zephyr and CMSIS-RTX use): one
-  v6m implementation, one v7m implementation, thin per-core wrapper folders
-  on top.
-  - `common/os_arch_port_v7m.c` — ARMv7-M (M3) and ARMv7E-M (M4, M7)
-    implementation. Thumb-2, FPU-aware: saves `s16-s31` and a per-task
-    `EXC_RETURN` when built with a hard/softfp float ABI.
-  - `common/os_arch_port_v8m.c` — ARMv8-M mainline (M33, M35P) and ARMv8.1-M
-    (M52, M55, M85) implementation: superset of the v7m port that always
-    saves/restores `PSPLIM` per task and programs `MSPLIM` for the handler
-    stack (when the linker script provides the stack-bottom symbol), so a
-    stack overflow raises a UsageFault instead of silently corrupting memory.
-    TrustZone (all three `OS_CONFIG_TRUSTZONE` modes) lives here.
-  - `common/os_arch_port_v6m.c` — ARMv6-M (M0, M0+) and ARMv8-M baseline
-    (M23) implementation. Thumb-1 subset, no FPU; the cycle counter is
-    synthesized from SysTick because these cores have no DWT CYCCNT.
-    Baseline does not belong in the v8m file because it cannot execute the
-    mainline Thumb-2 ISA; its TrustZone support is handled here. Non-secure
-    v8-M baseline has no `PSPLIM`, so there is no stack-limit handling.
-  - Each shared file carries a `#error` guard against being compiled for the
-    wrong architecture profile.
-  - `cortex_m0/`, `cortex_m0plus/`, `cortex_m23/` — thin wrappers over the
-    v6m port.
-  - `cortex_m3/`, `cortex_m4/`, `cortex_m7/` — thin wrappers over the v7m
-    port (M7 additionally relies on the DWT LAR unlock done in
-    `os_arch_init`).
-  - `cortex_m33/`, `cortex_m35p/`, `cortex_m52/`, `cortex_m55/`,
-    `cortex_m85/` — thin wrappers over the v8m port (on the v8.1-M cores
-    Helium/MVE state is covered by the existing s16-s31 save plus hardware
-    lazy stacking of s0-s15/FPSCR/VPR).
-    Note the folder names follow GCC's `-mcpu` spelling: `cortex_m0plus`
-    because the core is the M0"plus", but `cortex_m35p` because that core's
-    "P" means physical security, not plus (`-mcpu=cortex-m35p`).
-  - The build selects the variant from `-mcpu`, falling back to `-march`
-    (`armv8.1-m.main` maps to `cortex_m55` and so on — all folders of one
-    profile include the same shared port, so any core of the right
-    architecture is equivalent); see `ahura_kernel/CMakeLists.txt`. Override
-    with `-DOS_ARCH_VARIANT=cortex_m4`. Note: GCC learned `-mcpu=cortex-m52`
-    in GCC 14 — older toolchains build that core with
-    `-march=armv8.1-m.main+mve.fp`, which the fallback resolves automatically.
-  - `MSPLIM` guard: active when the linker script provides the bottom of the
-    main stack as `__StackLimit` (CMSIS-template scripts) or `_sstack` (stock
-    STM32CubeMX/CubeIDE scripts) — both are weak references, so either script
-    family works unmodified. When neither symbol exists the guard is skipped.
-  - TrustZone (ARMv8-M Security Extension): selected with `OS_CONFIG_TRUSTZONE`
-    — see the "TrustZone" section below.
-  - Not covered yet: PAC/BTI (`-mbranch-protection` on M85).
+  module (target `os_test`) with its own `CMakeLists.txt` — see [Self-test
+  suite](#self-test-suite).
+
+### `core/` — portable kernel modules
+
+All filenames `os_`-prefixed:
+
+- `os_kernel.c` — lifecycle (`os_init`, `os_start`, running flag), the
+  platform clock callback (`os_clock_hz_get_cb`, see [Platform
+  clock](#platform-clock)), the default application task (`os_main`, see
+  [Default application task](#default-application-task)), and the
+  self-test task (`os_test`, see [Self-test suite](#self-test-suite)).
+- `os_mem.c` — kernel heap (`os_mem_alloc`/`os_mem_free`): first-fit
+  allocator with coalescing over a static `OS_CONFIG_HEAP_SIZE` heap.
+- `os_task.c` — static TCB pool with O(1) list-based scheduling: one FIFO
+  ready list per priority plus a ready bitmap (highest set bit = next
+  priority to run, one `CLZ` on ARMv7-M and up), round-robin by list
+  rotation, and a delay list holding only the finite-delay sleepers.
+- `os_tick.c` — tick counter, tick handler (wakes delays, drives timers, preempts).
+- `os_delay.c` — blocking millisecond/second delays, DWT-precise microsecond busy-wait.
+- `os_critical.c` — PRIMASK-based nesting critical sections.
+- `os_mutex.c`, `os_semaphore.c`, `os_queue.c`, `os_event.c` — sync/IPC primitives with
+  `timeout_ms` waits.
+- `os_timer.c` — software timers; expiry is detected by the tick, callbacks run on the
+  kernel timer task (`tsk_timer`, highest priority).
+- `os_work.c` — Zephyr-style deferrable work queue; items run on the kernel work task
+  (`tsk_work`, highest priority).
+- `os_list.c` — intrusive doubly-linked list; always compiled (the scheduler
+  itself runs on it, so it cannot be configured out), also public API.
+- `os_internal.h` — internal cross-module contract (not for applications).
+
+### `arch/arm/` — port layer
+
+SysTick tick source, SVC first-task start, PendSV context switch, initial
+stack frames, cycle counter. Shared code is organized by architecture (the
+same split Zephyr and CMSIS-RTX use): one v6m implementation, one v7m
+implementation, thin per-core wrapper folders on top.
+
+- `common/os_arch_port_v7m.c` — ARMv7-M (M3) and ARMv7E-M (M4, M7)
+  implementation. Thumb-2, FPU-aware: saves `s16-s31` and a per-task
+  `EXC_RETURN` when built with a hard/softfp float ABI.
+- `common/os_arch_port_v8m.c` — ARMv8-M mainline (M33, M35P) and ARMv8.1-M
+  (M52, M55, M85) implementation: superset of the v7m port that always
+  saves/restores `PSPLIM` per task and programs `MSPLIM` for the handler
+  stack (when the linker script provides the stack-bottom symbol), so a
+  stack overflow raises a UsageFault instead of silently corrupting memory.
+  TrustZone (all three `OS_CONFIG_TRUSTZONE` modes) lives here.
+- `common/os_arch_port_v6m.c` — ARMv6-M (M0, M0+) and ARMv8-M baseline
+  (M23) implementation. Thumb-1 subset, no FPU; the cycle counter is
+  synthesized from SysTick because these cores have no DWT CYCCNT.
+  Baseline does not belong in the v8m file because it cannot execute the
+  mainline Thumb-2 ISA; its TrustZone support is handled here. Non-secure
+  v8-M baseline has no `PSPLIM`, so there is no stack-limit handling.
+- Each shared file carries a `#error` guard against being compiled for the
+  wrong architecture profile.
+- `cortex_m0/`, `cortex_m0plus/`, `cortex_m23/` — thin wrappers over the
+  v6m port.
+- `cortex_m3/`, `cortex_m4/`, `cortex_m7/` — thin wrappers over the v7m
+  port (M7 additionally relies on the DWT LAR unlock done in
+  `os_arch_init`).
+- `cortex_m33/`, `cortex_m35p/`, `cortex_m52/`, `cortex_m55/`,
+  `cortex_m85/` — thin wrappers over the v8m port (on the v8.1-M cores
+  Helium/MVE state is covered by the existing s16-s31 save plus hardware
+  lazy stacking of s0-s15/FPSCR/VPR).
+  Note the folder names follow GCC's `-mcpu` spelling: `cortex_m0plus`
+  because the core is the M0"plus", but `cortex_m35p` because that core's
+  "P" means physical security, not plus (`-mcpu=cortex-m35p`).
+- The build selects the variant from `-mcpu`, falling back to `-march`
+  (`armv8.1-m.main` maps to `cortex_m55` and so on — all folders of one
+  profile include the same shared port, so any core of the right
+  architecture is equivalent); see `ahura_kernel/CMakeLists.txt`. Override
+  with `-DOS_ARCH_VARIANT=cortex_m4`. Note: GCC learned `-mcpu=cortex-m52`
+  in GCC 14 — older toolchains build that core with
+  `-march=armv8.1-m.main+mve.fp`, which the fallback resolves automatically.
+- `MSPLIM` guard: active when the linker script provides the bottom of the
+  main stack as `__StackLimit` (CMSIS-template scripts) or `_sstack` (stock
+  STM32CubeMX/CubeIDE scripts) — both are weak references, so either script
+  family works unmodified. When neither symbol exists the guard is skipped.
+- TrustZone (ARMv8-M Security Extension): selected with `OS_CONFIG_TRUSTZONE`
+  — see [TrustZone](#trustzone) below.
+- Not covered yet: PAC/BTI (`-mbranch-protection` on M85).
 
 ## Configuration
 
@@ -140,32 +246,27 @@ build system (`target_compile_definitions`) — that would redefine them. The
 the most the 32-bit ready bitmap can ever support) — it is not one of the
 options `os_config.h` defines.
 
-## Application callbacks (os_cb.c)
+## Integration checklist
 
-All user-overridable hooks are weak `_cb` functions, so overriding is
-optional per function. For a clean starting point, copy
-`ahura_kernel/os_cb_template.c` into the application source tree as
-`os_cb.c`, add it to the **application** build (never to the kernel — the
-template is deliberately absent from the kernel CMakeLists), and adapt:
-
-- `os_clock_hz_get_cb` — CPU clock in Hz (see "Platform clock").
-- `os_tickless_pre_sleep_cb` / `os_tickless_post_sleep_cb` — sleep bracket.
-- `os_arch_tz_context_save_cb` / `os_arch_tz_context_restore_cb` — TrustZone
-  secure-context banking (non-secure kernels only).
-- `os_arch_core_id_get_cb` / `os_arch_core_ipi_request_cb` — multi-core SoC
-  glue; plus `os_arch_spinlock_acquire_cb`/`_release_cb` on ARMv6-M
-  multi-core SoCs (mandatory there).
-
-This project keeps its copy in `Core/Src/os_cb.c` with its configuration
-in `Core/Inc/os_config.h`.
+1. Route `SysTick_Handler` to `os_tick_handler()`. `SVC_Handler` and `PendSV_Handler`
+   are provided by the port — do not define them in `stm32*_it.c`.
+2. Call `os_init()` after clocks are configured (it reads the CPU clock
+   through `os_clock_hz_get_cb`, see [Platform clock](#platform-clock)).
+3. Create and start any tasks the application needs before the scheduler runs
+   (`os_init()` already created the default task, see [Default application
+   task](#default-application-task), unless this is a self-test build), then
+   call `os_start()` (never returns).
+4. Task stacks: use `OS_TASK_DEFINE(name, stack_bytes)`; the size is in bytes
+   (rounded up to an 8-byte multiple by the macro) and must be at least
+   `OS_CONFIG_MIN_STACK_SIZE`.
 
 ## Default application task
 
 Most RTOS applications create every task by hand in `main()` before calling
 `os_start()`. Ahura instead gives every application one default task for
 free: `os_init()` unconditionally creates and starts it (see `os_kernel.c`'s
-`os_main_system_init()`), except in self-test builds (see "Self-test suite"
-below), so `main()` needs nothing beyond the usual
+`os_main_system_init()`), except in self-test builds (see [Self-test
+suite](#self-test-suite) below), so `main()` needs nothing beyond the usual
 
 ```c
 os_init();
@@ -197,18 +298,245 @@ the user LED.
 
 When `OS_CONFIG_TEST_ENABLE` is `1`, `os_init()` does not create `tsk_main`
 at all — the self-test suite runs alone instead of racing the application's
-own task (see "Self-test suite" below). `os_main()` itself still compiles
-(an application's `os_main.c` links unchanged either way); it is simply
-never called in that build.
+own task (see [Self-test suite](#self-test-suite) below). `os_main()` itself
+still compiles (an application's `os_main.c` links unchanged either way); it
+is simply never called in that build.
 
-## Self-test suite (ahura_kernel/test/)
+## Application callbacks
+
+All user-overridable hooks are weak `_cb` functions, so overriding is
+optional per function. For a clean starting point, copy
+`ahura_kernel/os_cb_template.c` into the application source tree as
+`os_cb.c`, add it to the **application** build (never to the kernel — the
+template is deliberately absent from the kernel CMakeLists), and adapt:
+
+- `os_clock_hz_get_cb` — CPU clock in Hz (see [Platform clock](#platform-clock)).
+- `os_tickless_pre_sleep_cb` / `os_tickless_post_sleep_cb` — sleep bracket.
+- `os_arch_tz_context_save_cb` / `os_arch_tz_context_restore_cb` — TrustZone
+  secure-context banking (non-secure kernels only).
+- `os_arch_core_id_get_cb` / `os_arch_core_ipi_request_cb` — multi-core SoC
+  glue; plus `os_arch_spinlock_acquire_cb`/`_release_cb` on ARMv6-M
+  multi-core SoCs (mandatory there).
+
+This project keeps its copy in `Core/Src/os_cb.c` with its configuration
+in `Core/Inc/os_config.h`.
+
+## Task priorities
+
+- `0` — idle task (kernel).
+- `OS_TASK_PRIO_MAX` — kernel service tasks (`tsk_work`, `tsk_timer`), created
+  automatically by `os_init()`; they occupy two `OS_CONFIG_MAX_TASKS` slots.
+- `OS_TASK_PRIO_USER_MIN .. OS_TASK_PRIO_USER_MAX` (1 .. MAX-1) — user tasks;
+  `os_task_create` rejects anything outside this range. The default application
+  task (`tsk_main`, see [Default application task](#default-application-task))
+  and the self-test task (`tsk_test`, see [Self-test suite](#self-test-suite))
+  both live in this range too, at `OS_CONFIG_MAIN_TASK_PRIORITY` /
+  `OS_CONFIG_TEST_PRIORITY` — unlike `tsk_work`/`tsk_timer` they are not
+  priority-reserved, so pick values that fit alongside the application's own
+  tasks.
+
+## Work queue
+
+Defer a function to run later on the highest-priority kernel task (ISR-safe):
+
+```c
+static void my_handler(void *context) { /* runs on tsk_work */ }
+static os_work_t my_work;
+
+os_work_init(&my_work, my_handler, &my_data);  /* handler + user-data pointer */
+os_work_submit(&my_work, 100U);                /* run after 100 ms (0 = as soon as possible) */
+os_work_cancel(&my_work);                      /* drop it if it has not run yet */
+```
+
+Re-submitting a pending item reschedules it. Handlers and timer callbacks run in
+task context (they may use kernel APIs), but they execute at the highest priority:
+keep them short and do not block in them, or everything else is starved.
+
+## Timeout semantics
+
+Blocking APIs (`os_mutex_lock`, `os_semaphore_take`, `os_queue_send/receive`,
+`os_event_group_wait_bits`) take a `timeout_ms` argument:
+
+- `OS_WAIT_NOTHING` — try once, return `BUSY`/`EMPTY`/`FULL` immediately.
+- `1..N` ms — wait up to that long, then return `OS_STATUS_TIMEOUT`.
+- `OS_WAIT_FOREVER` — wait until available.
+
+Nonzero timeouts are honored only from task context after `os_start`; from
+interrupt context (or before the scheduler starts) the call degrades to a
+non-blocking attempt.
+
+Waits are exact: every object carries its own waiter list (queues carry two —
+senders and receivers). A blocked task consumes zero CPU until the object
+signals it (unlock/give/send/receive/set_bits wake the **highest-priority**
+waiter, FIFO among equals; event groups wake all waiters so each re-evaluates
+its bit condition) or its timeout expires (the tick removes it from both the
+delay list and the waiter list). Wakeups re-check the condition, so a faster
+third task taking the object in between is handled by re-waiting with the
+remaining timeout. Mutex priority inheritance is still future work.
+
+## Kernel heap
+
+`OS_CONFIG_ALLOC_ENABLE` (default 1) compiles in a kernel heap of
+`OS_CONFIG_HEAP_SIZE` bytes (default 4096, static array — nothing is taken
+from the linker heap):
+
+```c
+void  *memory = os_mem_alloc(size);   /* 8-byte aligned, NULL when exhausted   */
+os_mem_free(memory);                  /* NULL/foreign/double free are ignored  */
+size_t now  = os_mem_free_get();      /* current free bytes                    */
+size_t low  = os_mem_watermark_get(); /* worst-case watermark since boot       */
+```
+
+The allocator is first-fit with an address-ordered free list and coalescing
+of adjacent free blocks (comparable to FreeRTOS `heap_4`), so mixed-size
+alloc/free patterns do not fragment permanently. Calls are protected by the
+kernel critical section: usable from tasks and ISRs, though allocating in an
+ISR is discouraged — the walk over the free list runs with interrupts masked.
+
+## CPU usage
+
+With `OS_CONFIG_CPU_USAGE_ENABLE` (default 1) the tick interrupt counts how
+many ticks interrupted the idle task versus anything else, and
+
+```c
+uint32_t percent = os_cpu_usage_get();   /* 0..100 since the previous call */
+```
+
+returns the load over the window since the previous call, then restarts the
+window. Resolution is one tick, so sample at a period well above the tick
+period (e.g. once per second at a 1 kHz tick). Ticks announced after a
+tickless sleep count as idle. Cost: two counter updates per tick.
+
+## Platform clock
+
+The kernel never reads a platform global directly: every place that needs the
+CPU frequency (SysTick reload, `os_delay_us` busy-waits, tickless accounting)
+calls the weak callback
+
+```c
+uint32_t os_clock_hz_get_cb(void);   /* return the CPU clock in Hz, 0 = unknown */
+```
+
+The default implementation covers the common cases without any code:
+
+- `OS_CONFIG_CPU_CLOCK_HZ` set (> 0) — returns that fixed value; for
+  platforms with a constant clock and no CMSIS.
+- `OS_CONFIG_CPU_CLOCK_HZ` = 0 (default) — returns the CMSIS
+  `SystemCoreClock` global when the platform defines one (it is a weak
+  reference, so linking never fails without it), else 0.
+
+Any other platform convention (Zephyr-style config, a clock-driver query,
+dynamic frequency scaling) plugs in by overriding the callback in application
+code. When the callback returns 0, tick setup and busy-wait delays refuse to
+run (`OS_STATUS_ERROR`) instead of miscounting.
+
+## TrustZone
+
+`OS_CONFIG_TRUSTZONE` selects which security state the kernel runs in on
+ARMv8-M cores (M23, M33, M35P, M52, M55, M85); the build fails with a clear
+`#error` on cores without the Security Extension or when the compile flags do
+not match the chosen mode.
+
+- `OS_CONFIG_TRUSTZONE_DISABLED` (default) — the kernel ignores TrustZone.
+  Use on devices without the Security Extension or with TrustZone disabled
+  (e.g. `TZEN` cleared on STM32H5/L5/U5).
+- `OS_CONFIG_TRUSTZONE_SECURE` — the kernel and every task run in the secure
+  state. Compile the kernel (and application) with `-mcmse`. The context
+  switch itself needs nothing extra: the secure `EXC_RETURN` encoding equals
+  the TrustZone-less one, and PSPLIM/MSPLIM guards stay active.
+- `OS_CONFIG_TRUSTZONE_NON_SECURE` — the kernel and tasks run non-secure
+  beside separate secure firmware. Initial task frames use the non-secure
+  `EXC_RETURN` (`0xFFFFFFBC`), and the context switch calls two weak
+  callbacks (override them in the application, following the `_cb`
+  convention) so the secure-side glue can bank per-task secure contexts
+  (secure stack / `PSP_S`), in the same way FreeRTOS's ARM_CM33 secure
+  context management works:
+
+  ```c
+  void os_arch_tz_context_save_cb(uint32_t task_id);     /* before the switch, outgoing task */
+  void os_arch_tz_context_restore_cb(uint32_t task_id);  /* after selection, incoming task   */
+  ```
+
+  `task_id` 0 is the idle task (never owns a secure context). Tasks that
+  never call secure functions need no handling — the weak defaults do
+  nothing.
+
+## Multi-core (experimental)
+
+`OS_CONFIG_CORE_COUNT` (default 1, max 31) declares how many cores schedule
+tasks. Every scheduling core runs its own PendSV/SVC and its own idle task
+and pulls work from the shared ready lists; **core affinity** selects where
+each task may run:
+
+- `os_task_config_t.core_affinity` — bitmask of allowed cores (bit n =
+  core n); `OS_TASK_CORE_ANY` (0, the default) means any core. Change it at
+  runtime with `os_task_core_affinity_set(task, mask)`; a task executing on
+  a core the new mask excludes is asked to reschedule (locally or by IPI).
+- When a task becomes ready (wake, start), the kernel preempts locally when
+  the task's affinity allows this core, otherwise it nudges the first core
+  in the mask through `os_arch_core_ipi_request_cb` (weak default: none —
+  that core then picks the task up at its own next tick).
+- Core 0 boots the kernel as usual (`os_init`, `os_start`). Each secondary
+  core is booted by the SoC layer (vector table with the kernel's SVC/
+  PendSV/SysTick handlers), then calls `os_core_start()` — it configures
+  the banked SHPR/SysTick/DWT/MSPLIM for that core and enters the
+  scheduler; it never returns.
+- Core 0 owns the time base: delays, timers, work queues and `os_tick_get`
+  advance only from core 0's tick. Ticks on other cores drive that core's
+  preemption and round-robin. CPU usage (`os_cpu_usage_get`) samples core 0.
+- The kernel service tasks are placed with `OS_CONFIG_WORK_CORE_AFFINITY`
+  and `OS_CONFIG_TIMER_CORE_AFFINITY` (core-affinity bitmasks, 0 = any
+  core), so work handlers and timer callbacks run where the config says.
+- Critical sections are PRIMASK + a global kernel spinlock with per-core
+  nesting; the spinlock uses `LDREX/STREX` on ARMv7-M/v8-M, while ARMv6-M
+  multi-core SoCs (e.g. RP2040) must provide
+  `os_arch_spinlock_acquire_cb`/`_release_cb` backed by hardware spinlocks —
+  a missing implementation fails at link time by design.
+- The SoC layer supplies `os_arch_core_id_get_cb()` (weak default: 0), since
+  Cortex-M has no architectural core-id register.
+
+Constraints: a task currently executing on another core cannot be paused or
+deleted from this one (`OS_STATUS_BUSY`) — suspend it from its own core
+first. The SMP paths compile in the CI matrix but have not run on real
+multi-core silicon yet; treat them as experimental.
+
+## Tickless idle (experimental)
+
+Config: `OS_CONFIG_TICKLESS_ENABLE` (default 0), `OS_CONFIG_TICKLESS_MIN_IDLE`
+(shortest idle worth sleeping for), `OS_CONFIG_MAX_SUPPRESSED_TICKS`.
+
+Two weak application callbacks bracket the sleep window (prototypes in
+`ahura.h`); override them by defining the functions in application code.
+User-overridable callbacks carry the `_cb` suffix by convention:
+
+```c
+void os_tickless_pre_sleep_cb(void)   { /* select sleep mode (e.g. SLEEPDEEP), gate clocks */ }
+void os_tickless_post_sleep_cb(void)  { /* clear SLEEPDEEP, restore clocks */ }
+```
+
+Status: the flow in `os_tick.c` (`os_tickless_idle_process`) is complete in shape
+but is not yet invoked — the idle task still runs a plain `WFI` loop, so
+enabling the config flag currently changes nothing. Remaining work before it
+can be wired in:
+
+- the idle task must call `os_tickless_idle_process()`;
+- the planned idle time only considers software-timer expiries, not blocked
+  task delays (`os_delay_ms` sleepers would wake late);
+- SysTick keeps running during the sleep window (no tick suppression), which
+  would double-count time via both `os_tick_handler` and `os_tick_announce`;
+- the elapsed-time measurement uses DWT `CYCCNT`, which halts in sleep mode on
+  most implementations — the wake source must provide the duration instead
+  (suppressed-SysTick arithmetic, or LPTIM: `OS_CONFIG_LPTIM_CLOCK_HZ` is
+  reserved for that but unused so far).
+
+## Self-test suite
 
 Unlike the `_template` files above, the self-test suite is not copied into
 the application — it is a normal buildable module with its own
 `CMakeLists.txt` (`ahura_kernel/test/CMakeLists.txt`), producing a static
 library `os_test` that links against `ahura_kernel` and supplies the strong
 override of the weak `os_test()` (prototype in `ahura.h`, empty default in
-`os_kernel.c`; not a `_cb` function - see "Layout"). Any project that
+`os_kernel.c`; not a `_cb` function - see [Layout](#layout)). Any project that
 already builds the kernel can add it:
 
 ```cmake
@@ -249,9 +577,9 @@ os_start();
 
 `tsk_main` is **not** created alongside `tsk_test` - the self-test suite
 takes priority and runs alone, rather than the application's own task
-racing it for CPU time and task-table slots (see "Default application task"
-above). Set `OS_CONFIG_TEST_ENABLE` back to `0` to get `tsk_main` running
-normally again.
+racing it for CPU time and task-table slots (see [Default application
+task](#default-application-task) above). Set `OS_CONFIG_TEST_ENABLE` back to
+`0` to get `tsk_main` running normally again.
 
 The task runs `os_test()` once: exercises whichever
 `OS_CONFIG_<FEATURE>_ENABLE` switches are on (tasks, delays, critical
@@ -267,243 +595,32 @@ firmware as the application (see the top-level `CMakeLists.txt`) with
 `OS_CONFIG_TEST_ENABLE` set to 1, so flashing the normal build also runs the
 test on the device.
 
-## CPU usage
+## Examples
 
-With `OS_CONFIG_CPU_USAGE_ENABLE` (default 1) the tick interrupt counts how
-many ticks interrupted the idle task versus anything else, and
+[`ahura_examples/kernel/`](../ahura_examples/kernel/) has one small,
+focused, copy-over-`os_main.c` example per kernel feature. Same rule as the
+self-test suite: depends on nothing but `ahura.h`, no board/HAL headers.
 
-```c
-uint32_t percent = os_cpu_usage_get();   /* 0..100 since the previous call */
-```
+| Example | Demonstrates |
+|---|---|
+| `os_main_hello.c` | The minimal application: `os_main()`, `os_delay_ms`, `printf` |
+| `os_main_task.c` | Task lifecycle: create / start / pause / resume / delete |
+| `os_main_delay.c` | `os_delay_ms` / `os_delay_us` / `os_delay_s` |
+| `os_main_critical.c` | Critical sections protecting a shared counter |
+| `os_main_mutex.c` | Mutual exclusion (`os_mutex_*`) |
+| `os_main_semaphore.c` | Counting semaphore, producer/consumer |
+| `os_main_queue.c` | Message queue, producer/consumer |
+| `os_main_event.c` | Event group, waiting on multiple bits |
+| `os_main_timer.c` | One-shot and periodic software timers |
+| `os_main_work.c` | Deferrable work queue |
+| `os_main_mem.c` | Kernel heap (`os_mem_alloc` / `os_mem_free`) |
+| `os_main_stack_watermark.c` | Worst-case stack headroom |
+| `os_main_cpu_usage.c` | CPU load sampling |
+| `os_main_list.c` | The intrusive list utility |
 
-returns the load over the window since the previous call, then restarts the
-window. Resolution is one tick, so sample at a period well above the tick
-period (e.g. once per second at a 1 kHz tick). Ticks announced after a
-tickless sleep count as idle. Cost: two counter updates per tick.
-
-## Architecture profiles at a glance
-
-| Architecture profile | Cortex-M cores | Ahura port | TrustZone support |
-|----------------------|----------------|------------|-------------------|
-| ARMv6-M | M0, M0+ | `v6m` | No (Security Extension absent) — `OS_CONFIG_TRUSTZONE_DISABLED` only |
-| ARMv7-M / ARMv7E-M | M3 / M4, M7 | `v7m` | No — `OS_CONFIG_TRUSTZONE_DISABLED` only |
-| ARMv8-M baseline | M23 | `v6m` | Yes, optional per device — all three `OS_CONFIG_TRUSTZONE` modes |
-| ARMv8-M mainline | M33, M35P | `v8m` | Yes, optional per device — all three modes |
-| ARMv8.1-M | M52, M55, M85 | `v8m` | Yes, optional per device — all three modes |
-
-Notes: M4/M7 are ARMv7E-M (DSP extension) but port-identical to M3 here; M23 is
-baseline (Thumb-1 subset), which is why it shares the `v6m` port rather than the
-mainline one; Cortex-M1 (ARMv6-M, FPGA) is deliberately not supported. "Optional
-per device" means the Security Extension is a silicon-vendor choice and may also
-be disabled in option bytes (e.g. `TZEN` on STM32H5) — that case uses
-`OS_CONFIG_TRUSTZONE_DISABLED`.
-
-## Integration checklist
-
-1. Route `SysTick_Handler` to `os_tick_handler()`. `SVC_Handler` and `PendSV_Handler`
-   are provided by the port — do not define them in `stm32*_it.c`.
-2. Call `os_init()` after clocks are configured (it reads the CPU clock
-   through `os_clock_hz_get_cb`, see "Platform clock").
-3. Create and start any tasks the application needs before the scheduler runs
-   (`os_init()` already created the default task, see "Default application
-   task", unless this is a self-test build), then call `os_start()`
-   (never returns).
-4. Task stacks: use `OS_TASK_DEFINE(name, stack_bytes)`; the size is in bytes
-   (rounded up to an 8-byte multiple by the macro) and must be at least
-   `OS_CONFIG_MIN_STACK_SIZE`.
-
-## Task priorities
-
-- `0` — idle task (kernel).
-- `OS_TASK_PRIO_MAX` — kernel service tasks (`tsk_work`, `tsk_timer`), created
-  automatically by `os_init()`; they occupy two `OS_CONFIG_MAX_TASKS` slots.
-- `OS_TASK_PRIO_USER_MIN .. OS_TASK_PRIO_USER_MAX` (1 .. MAX-1) — user tasks;
-  `os_task_create` rejects anything outside this range. The default application
-  task (`tsk_main`, see "Default application task") and the self-test task
-  (`tsk_test`, see "Self-test suite") both live in this range too, at
-  `OS_CONFIG_MAIN_TASK_PRIORITY` / `OS_CONFIG_TEST_PRIORITY` — unlike
-  `tsk_work`/`tsk_timer` they are not priority-reserved, so pick values that
-  fit alongside the application's own tasks.
-
-## Work queue
-
-Defer a function to run later on the highest-priority kernel task (ISR-safe):
-
-```c
-static void my_handler(void *context) { /* runs on tsk_work */ }
-static os_work_t my_work;
-
-os_work_init(&my_work, my_handler, &my_data);  /* handler + user-data pointer */
-os_work_submit(&my_work, 100U);                /* run after 100 ms (0 = as soon as possible) */
-os_work_cancel(&my_work);                      /* drop it if it has not run yet */
-```
-
-Re-submitting a pending item reschedules it. Handlers and timer callbacks run in
-task context (they may use kernel APIs), but they execute at the highest priority:
-keep them short and do not block in them, or everything else is starved.
-
-## Platform clock
-
-The kernel never reads a platform global directly: every place that needs the
-CPU frequency (SysTick reload, `os_delay_us` busy-waits, tickless accounting)
-calls the weak callback
-
-```c
-uint32_t os_clock_hz_get_cb(void);   /* return the CPU clock in Hz, 0 = unknown */
-```
-
-The default implementation covers the common cases without any code:
-
-- `OS_CONFIG_CPU_CLOCK_HZ` set (> 0) — returns that fixed value; for
-  platforms with a constant clock and no CMSIS.
-- `OS_CONFIG_CPU_CLOCK_HZ` = 0 (default) — returns the CMSIS
-  `SystemCoreClock` global when the platform defines one (it is a weak
-  reference, so linking never fails without it), else 0.
-
-Any other platform convention (Zephyr-style config, a clock-driver query,
-dynamic frequency scaling) plugs in by overriding the callback in application
-code. When the callback returns 0, tick setup and busy-wait delays refuse to
-run (`OS_STATUS_ERROR`) instead of miscounting.
-
-## Kernel heap (os_mem_alloc / os_mem_free)
-
-`OS_CONFIG_ALLOC_ENABLE` (default 1) compiles in a kernel heap of
-`OS_CONFIG_HEAP_SIZE` bytes (default 4096, static array — nothing is taken
-from the linker heap):
-
-```c
-void  *memory = os_mem_alloc(size);   /* 8-byte aligned, NULL when exhausted   */
-os_mem_free(memory);                  /* NULL/foreign/double free are ignored  */
-size_t now  = os_mem_free_get();      /* current free bytes                    */
-size_t low  = os_mem_watermark_get(); /* worst-case watermark since boot       */
-```
-
-The allocator is first-fit with an address-ordered free list and coalescing
-of adjacent free blocks (comparable to FreeRTOS `heap_4`), so mixed-size
-alloc/free patterns do not fragment permanently. Calls are protected by the
-kernel critical section: usable from tasks and ISRs, though allocating in an
-ISR is discouraged — the walk over the free list runs with interrupts masked.
-
-## Timeout semantics
-
-Blocking APIs (`os_mutex_lock`, `os_semaphore_take`, `os_queue_send/receive`,
-`os_event_group_wait_bits`) take a `timeout_ms` argument:
-
-- `OS_WAIT_NOTHING` — try once, return `BUSY`/`EMPTY`/`FULL` immediately.
-- `1..N` ms — wait up to that long, then return `OS_STATUS_TIMEOUT`.
-- `OS_WAIT_FOREVER` — wait until available.
-
-Nonzero timeouts are honored only from task context after `os_start`; from
-interrupt context (or before the scheduler starts) the call degrades to a
-non-blocking attempt.
-
-Waits are exact: every object carries its own waiter list (queues carry two —
-senders and receivers). A blocked task consumes zero CPU until the object
-signals it (unlock/give/send/receive/set_bits wake the **highest-priority**
-waiter, FIFO among equals; event groups wake all waiters so each re-evaluates
-its bit condition) or its timeout expires (the tick removes it from both the
-delay list and the waiter list). Wakeups re-check the condition, so a faster
-third task taking the object in between is handled by re-waiting with the
-remaining timeout. Mutex priority inheritance is still future work.
-
-## TrustZone (ARMv8-M security states)
-
-`OS_CONFIG_TRUSTZONE` selects which security state the kernel runs in on
-ARMv8-M cores (M23, M33, M35P, M52, M55, M85); the build fails with a clear
-`#error` on cores without the Security Extension or when the compile flags do
-not match the chosen mode.
-
-- `OS_CONFIG_TRUSTZONE_DISABLED` (default) — the kernel ignores TrustZone.
-  Use on devices without the Security Extension or with TrustZone disabled
-  (e.g. `TZEN` cleared on STM32H5/L5/U5).
-- `OS_CONFIG_TRUSTZONE_SECURE` — the kernel and every task run in the secure
-  state. Compile the kernel (and application) with `-mcmse`. The context
-  switch itself needs nothing extra: the secure `EXC_RETURN` encoding equals
-  the TrustZone-less one, and PSPLIM/MSPLIM guards stay active.
-- `OS_CONFIG_TRUSTZONE_NON_SECURE` — the kernel and tasks run non-secure
-  beside separate secure firmware. Initial task frames use the non-secure
-  `EXC_RETURN` (`0xFFFFFFBC`), and the context switch calls two weak
-  callbacks (override them in the application, following the `_cb`
-  convention) so the secure-side glue can bank per-task secure contexts
-  (secure stack / `PSP_S`), in the same way FreeRTOS's ARM_CM33 secure
-  context management works:
-
-  ```c
-  void os_arch_tz_context_save_cb(uint32_t task_id);     /* before the switch, outgoing task */
-  void os_arch_tz_context_restore_cb(uint32_t task_id);  /* after selection, incoming task   */
-  ```
-
-  `task_id` 0 is the idle task (never owns a secure context). Tasks that
-  never call secure functions need no handling — the weak defaults do
-  nothing.
-
-## Multi-core (experimental, untested on hardware)
-
-`OS_CONFIG_CORE_COUNT` (default 1, max 31) declares how many cores schedule
-tasks. Every scheduling core runs its own PendSV/SVC and its own idle task
-and pulls work from the shared ready lists; **core affinity** selects where
-each task may run:
-
-- `os_task_config_t.core_affinity` — bitmask of allowed cores (bit n =
-  core n); `OS_TASK_CORE_ANY` (0, the default) means any core. Change it at
-  runtime with `os_task_core_affinity_set(task, mask)`; a task executing on
-  a core the new mask excludes is asked to reschedule (locally or by IPI).
-- When a task becomes ready (wake, start), the kernel preempts locally when
-  the task's affinity allows this core, otherwise it nudges the first core
-  in the mask through `os_arch_core_ipi_request_cb` (weak default: none —
-  that core then picks the task up at its own next tick).
-- Core 0 boots the kernel as usual (`os_init`, `os_start`). Each secondary
-  core is booted by the SoC layer (vector table with the kernel's SVC/
-  PendSV/SysTick handlers), then calls `os_core_start()` — it configures
-  the banked SHPR/SysTick/DWT/MSPLIM for that core and enters the
-  scheduler; it never returns.
-- Core 0 owns the time base: delays, timers, work queues and `os_tick_get`
-  advance only from core 0's tick. Ticks on other cores drive that core's
-  preemption and round-robin. CPU usage (`os_cpu_usage_get`) samples core 0.
-- The kernel service tasks are placed with `OS_CONFIG_WORK_CORE_AFFINITY`
-  and `OS_CONFIG_TIMER_CORE_AFFINITY` (core-affinity bitmasks, 0 = any
-  core), so work handlers and timer callbacks run where the config says.
-- Critical sections are PRIMASK + a global kernel spinlock with per-core
-  nesting; the spinlock uses `LDREX/STREX` on ARMv7-M/v8-M, while ARMv6-M
-  multi-core SoCs (e.g. RP2040) must provide
-  `os_arch_spinlock_acquire_cb`/`_release_cb` backed by hardware spinlocks —
-  a missing implementation fails at link time by design.
-- The SoC layer supplies `os_arch_core_id_get_cb()` (weak default: 0), since
-  Cortex-M has no architectural core-id register.
-
-Constraints: a task currently executing on another core cannot be paused or
-deleted from this one (`OS_STATUS_BUSY`) — suspend it from its own core
-first. The SMP paths compile in the CI matrix but have not run on real
-multi-core silicon yet; treat them as experimental.
-
-## Tickless idle (experimental, not functional yet)
-
-Config: `OS_CONFIG_TICKLESS_ENABLE` (default 0), `OS_CONFIG_TICKLESS_MIN_IDLE`
-(shortest idle worth sleeping for), `OS_CONFIG_MAX_SUPPRESSED_TICKS`.
-
-Two weak application callbacks bracket the sleep window (prototypes in
-`ahura.h`); override them by defining the functions in application code.
-User-overridable callbacks carry the `_cb` suffix by convention:
-
-```c
-void os_tickless_pre_sleep_cb(void)   { /* select sleep mode (e.g. SLEEPDEEP), gate clocks */ }
-void os_tickless_post_sleep_cb(void)  { /* clear SLEEPDEEP, restore clocks */ }
-```
-
-Status: the flow in `os_tick.c` (`os_tickless_idle_process`) is complete in shape
-but is not yet invoked — the idle task still runs a plain `WFI` loop, so
-enabling the config flag currently changes nothing. Remaining work before it
-can be wired in:
-
-- the idle task must call `os_tickless_idle_process()`;
-- the planned idle time only considers software-timer expiries, not blocked
-  task delays (`os_delay_ms` sleepers would wake late);
-- SysTick keeps running during the sleep window (no tick suppression), which
-  would double-count time via both `os_tick_handler` and `os_tick_announce`;
-- the elapsed-time measurement uses DWT `CYCCNT`, which halts in sleep mode on
-  most implementations — the wake source must provide the duration instead
-  (suppressed-SysTick arithmetic, or LPTIM: `OS_CONFIG_LPTIM_CLOCK_HZ` is
-  reserved for that but unused so far).
+Each file needs its matching `OS_CONFIG_<FEATURE>_ENABLE` on (a compile-time
+`#error` says so if it is not) and is a complete, standalone `os_main()` —
+copy any one of them over the project's `os_main.c` to see it run.
 
 ## Notes and constraints
 
