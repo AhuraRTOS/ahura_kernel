@@ -147,6 +147,7 @@ typedef struct
     bool      locked;   /**< True while held.                                  */
     uint32_t  owner_id; /**< Task id of the holder, 0 when free/unknown owner. */
     os_list_t waiters;  /**< Tasks blocked waiting for the mutex.              */
+    os_list_node_t owner_node; /**< Links into the owner's owned-mutex list (priority inheritance). */
 
 } os_mutex_t;
 #endif /* OS_CONFIG_MUTEX_ENABLE */
@@ -268,6 +269,7 @@ typedef struct
 typedef enum
 {
     OS_TASK_PRIO_1_LOWEST   = 1U,
+    OS_TASK_PRIO_1          = 1U,
     OS_TASK_PRIO_2          = 2U,
     OS_TASK_PRIO_3          = 3U,
     OS_TASK_PRIO_4          = 4U,
@@ -296,6 +298,7 @@ typedef enum
     OS_TASK_PRIO_27         = 27U,
     OS_TASK_PRIO_28         = 28U,
     OS_TASK_PRIO_29         = 29U,
+    OS_TASK_PRIO_30         = 30U,
     OS_TASK_PRIO_30_HIGHEST = 30U
 
 } os_task_priority_t;
@@ -454,6 +457,31 @@ os_task_state_t os_task_state_get(const os_task_t *task);
  */
 os_status os_task_stack_watermark_get(const os_task_t *task, size_t *min_free_bytes);
 #endif /* OS_CONFIG_STACK_WATERMARK_ENABLE */
+
+#if (OS_CONFIG_TASK_NOTIFY_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Deliver a value to a task's notification mailbox (overwrite: last write wins), waking
+ *        it if it is currently blocked in os_task_notify_wait; ISR-safe.
+ *
+ * @param[in] task   Target task (must have been created via os_task_create).
+ * @param[in] value  Value to store; delivered to the task's next os_task_notify_wait.
+ * @return os_status  OK, or INVALID_ARG for a NULL/stale task handle.
+ */
+os_status os_task_notify_give(os_task_t *task, uint32_t value);
+
+/******************************************************************************************************/
+/**
+ * @brief Wait for this task's notification mailbox, up to timeout_ms. Task-only (like
+ *        os_mutex_lock, an ISR has no task identity of its own to wait as).
+ *
+ * @param[in]  timeout_ms  OS_WAIT_NOTHING, a duration in ms, or OS_WAIT_FOREVER.
+ * @param[out] value_out   Set to the delivered value on OS_STATUS_OK.
+ * @return os_status  OK on delivery, EMPTY when unavailable without waiting, TIMEOUT when the
+ *                     wait elapsed, INVALID_ARG from an ISR.
+ */
+os_status os_task_notify_wait(uint32_t timeout_ms, uint32_t *value_out);
+#endif /* OS_CONFIG_TASK_NOTIFY_ENABLE */
 
 /******************************************************************************************************/
 /**

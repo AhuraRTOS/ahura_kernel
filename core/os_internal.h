@@ -142,6 +142,31 @@ void os_task_waiters_wake_all(os_list_t *waiters);
  */
 uint32_t os_task_current_id_get(void);
 
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Link a just-acquired mutex into the calling task's owned-mutex list (os_task.c,
+ *        call inside the same critical section as the successful lock).
+ */
+void os_task_mutex_owner_link(os_list_node_t *owner_node);
+
+/******************************************************************************************************/
+/**
+ * @brief Boost owner_task_id's effective priority to the calling (waiting) task's effective
+ *        priority if that is higher; single-level only, not transitive (os_task.c, call inside
+ *        a critical section, right before joining the mutex's waiter list).
+ */
+void os_task_mutex_priority_inherit(uint32_t owner_task_id);
+
+/******************************************************************************************************/
+/**
+ * @brief Unlink a released mutex from its owner's owned-mutex list and recompute the owner's
+ *        effective priority as max(base_priority, highest waiter still queued on any mutex it
+ *        still holds) (os_task.c, call inside a critical section, right after releasing).
+ */
+void os_task_mutex_owner_unlink_and_reprioritize(os_list_node_t *owner_node);
+#endif /* OS_CONFIG_MUTEX_ENABLE */
+
 /******************************************************************************************************/
 /**
  * @brief Check whether the idle task is currently running (os_task.c, ISR-safe).

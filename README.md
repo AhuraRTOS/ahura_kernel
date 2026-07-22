@@ -9,8 +9,9 @@ M85, TrustZone-aware, with zero mandatory HAL/CMSIS dependencies.
 
 - **Preemptive priority scheduler** — 31 priority levels, O(1) list-based
   ready queues, round-robin among tasks of equal priority.
-- **Full sync/IPC set** — mutexes, counting semaphores, queues, and event
-  groups, all with millisecond timeouts.
+- **Full sync/IPC set** — mutexes (always with single-level priority
+  inheritance), counting semaphores, queues, event groups, and lightweight
+  per-task notifications, all with millisecond timeouts.
 - **Software timers & a deferrable work queue** — one-shot/periodic timers
   and a Zephyr-style work queue, each on its own kernel service task.
 - **Optional kernel heap** — first-fit allocator with coalescing (comparable
@@ -38,6 +39,7 @@ M85, TrustZone-aware, with zero mandatory HAL/CMSIS dependencies.
 - [Application callbacks](#application-callbacks)
 - [Task priorities](#task-priorities)
 - [Work queue](#work-queue)
+- [Task notifications](#task-notifications)
 - [Timeout semantics](#timeout-semantics)
 - [Kernel heap](#kernel-heap)
 - [CPU usage](#cpu-usage)
@@ -114,10 +116,11 @@ be disabled in option bytes (e.g. `TZEN` on STM32H5) — that case uses
 - `os_config_template.h` — template for the application's `os_config.h`:
   every build-time option, active at its default value (tick rate, task/timer
   limits, stack sizes, heap size, TrustZone mode, core count, and the
-  per-feature switches `OS_CONFIG_<FEATURE>_ENABLE` for mutex, semaphore,
-  queue, event, timer, work, alloc, stack watermark, CPU usage,
-  the default application task, the self-test task; the intrusive list module
-  has no switch — the scheduler runs on it). Never included by the kernel:
+  per-feature switches `OS_CONFIG_<FEATURE>_ENABLE` for mutex (always with
+  single-level priority inheritance, like FreeRTOS/Zephyr), semaphore,
+  queue, event, timer, work, task notifications, alloc, stack watermark,
+  CPU usage, the default application task, the self-test task; the intrusive
+  list module has no switch — the scheduler runs on it). Never included by the kernel:
   copy it into the project — see [Configuration](#configuration). Disabling
   a feature compiles out its code and API; disabling timer/work/the default
   task/the self-test task also removes the corresponding kernel service
@@ -146,7 +149,10 @@ All filenames `os_`-prefixed:
 - `os_task.c` — static TCB pool with O(1) list-based scheduling: one FIFO
   ready list per priority plus a ready bitmap (highest set bit = next
   priority to run, one `CLZ` on ARMv7-M and up), round-robin by list
-  rotation, and a delay list holding only the finite-delay sleepers.
+  rotation, and a delay list holding only the finite-delay sleepers. Also
+  where mutex priority inheritance's effective-priority changes and task
+  notifications (`os_task_notify_give`/`os_task_notify_wait`) live — both are
+  entirely about the TCB, not separate kernel objects.
 - `os_tick.c` — tick counter, tick handler (wakes delays, drives timers, preempts).
 - `os_delay.c` — blocking millisecond/second delays, DWT-precise microsecond busy-wait.
 - `os_critical.c` — PRIMASK-based nesting critical sections.
@@ -335,6 +341,10 @@ in `Core/Inc/os_config.h`.
   priority-reserved, so pick values that fit alongside the application's own
   tasks.
 
+Because mutexes always do priority inheritance, a task's effective priority
+can be temporarily boosted above its configured value while it holds a
+contended mutex — see [Timeout semantics](#timeout-semantics).
+
 ## Work queue
 
 Defer a function to run later on the highest-priority kernel task (ISR-safe):
@@ -352,10 +362,29 @@ Re-submitting a pending item reschedules it. Handlers and timer callbacks run in
 task context (they may use kernel APIs), but they execute at the highest priority:
 keep them short and do not block in them, or everything else is starved.
 
+## Task notifications
+
+A lightweight, single-value "mailbox" built directly into every task's own
+control block (`OS_CONFIG_TASK_NOTIFY_ENABLE`) — signal one specific task
+without allocating a separate semaphore/queue object:
+
+```c
+os_task_notify_give(&some_task, 42U);        /* ISR-safe; overwrite: last write wins  */
+os_task_notify_wait(OS_WAIT_FOREVER, &value); /* called by that task about itself      */
+```
+
+`os_task_notify_give` latches the value and, if the target is currently
+blocked in `os_task_notify_wait`, wakes it immediately; a task blocked for
+any other reason (delay, mutex/queue/semaphore/event wait) is left running as
+normal — the value just waits to be picked up on its next
+`os_task_notify_wait` call, so nothing is lost. `os_task_notify_wait` is
+task-only (like `os_mutex_lock`, an ISR has no task identity to wait as) and
+shares the same `timeout_ms` convention described next.
+
 ## Timeout semantics
 
 Blocking APIs (`os_mutex_lock`, `os_semaphore_take`, `os_queue_send/receive`,
-`os_event_group_wait_bits`) take a `timeout_ms` argument:
+`os_event_group_wait_bits`, `os_task_notify_wait`) take a `timeout_ms` argument:
 
 - `OS_WAIT_NOTHING` — try once, return `BUSY`/`EMPTY`/`FULL` immediately.
 - `1..N` ms — wait up to that long, then return `OS_STATUS_TIMEOUT`.
@@ -372,7 +401,21 @@ waiter, FIFO among equals; event groups wake all waiters so each re-evaluates
 its bit condition) or its timeout expires (the tick removes it from both the
 delay list and the waiter list). Wakeups re-check the condition, so a faster
 third task taking the object in between is handled by re-waiting with the
-remaining timeout. Mutex priority inheritance is still future work.
+remaining timeout.
+
+Mutexes always do priority inheritance (like FreeRTOS/Zephyr — there is no
+switch to opt out while still calling it a mutex): `os_mutex_lock` boosts a
+lower-priority owner to the blocking waiter's (effective) priority for as
+long as it holds the mutex,
+restoring it on `os_mutex_unlock` — correctly, even when the task holds
+several mutexes at once (it recomputes against every mutex it still holds,
+not just the one just released). Two limitations are accepted rather than
+implemented: it is **single-level only** (an owner itself blocked on a
+*second* mutex held by a third, lower-priority task does not propagate the
+boost through that chain), and a boost already in effect is not eagerly
+repositioned within some *other* object's wait queue, nor eagerly lowered
+when a waiter times out early — both recompute lazily, at the owner's next
+`os_mutex_lock`/`os_mutex_unlock`.
 
 ## Kernel heap
 
@@ -611,6 +654,7 @@ self-test suite: depends on nothing but `ahura.h`, no board/HAL headers.
 | `os_main_semaphore.c` | Counting semaphore, producer/consumer |
 | `os_main_queue.c` | Message queue, producer/consumer |
 | `os_main_event.c` | Event group, waiting on multiple bits |
+| `os_main_notify.c` | Task notifications (`os_task_notify_*`) |
 | `os_main_timer.c` | One-shot and periodic software timers |
 | `os_main_work.c` | Deferrable work queue |
 | `os_main_mem.c` | Kernel heap (`os_mem_alloc` / `os_mem_free`) |

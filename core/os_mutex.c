@@ -53,6 +53,8 @@ os_status os_mutex_init(os_mutex_t *mutex)
     mutex->locked   = false;
     mutex->owner_id = 0U;
     os_list_init(&mutex->waiters);
+    mutex->owner_node.next = NULL;
+    mutex->owner_node.prev = NULL;
 
     os_critical_exit();
     return OS_STATUS_OK;
@@ -100,6 +102,7 @@ os_status os_mutex_lock(os_mutex_t *mutex, uint32_t timeout_ms)
         {
             mutex->locked   = true;
             mutex->owner_id = self_id;
+            os_task_mutex_owner_link(&mutex->owner_node);
             os_critical_exit();
             return OS_STATUS_OK;
         }
@@ -118,6 +121,10 @@ os_status os_mutex_lock(os_mutex_t *mutex, uint32_t timeout_ms)
             os_critical_exit();
             return OS_STATUS_TIMEOUT;
         }
+
+        /* Boost the owner before blocking: closes the priority-inversion
+         * window instead of leaving it open until the owner's next unlock. */
+        os_task_mutex_priority_inherit(mutex->owner_id);
 
         /* Join the waiter list inside the same critical section that saw the
          * mutex locked (no lost-wakeup window); the switch happens on exit. */
@@ -184,6 +191,10 @@ os_status os_mutex_unlock(os_mutex_t *mutex)
 
     mutex->locked   = false;
     mutex->owner_id = 0U;
+
+    /* Drop any boost owed to this mutex before waking the next waiter, so
+     * the wake's own preempt check compares against the correct priority. */
+    os_task_mutex_owner_unlink_and_reprioritize(&mutex->owner_node);
 
     /* Hand the release to the highest-priority waiter (it re-takes in its
      * own context; no ownership transfer inside the unlock). */

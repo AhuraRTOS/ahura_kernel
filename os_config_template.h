@@ -33,12 +33,23 @@
  * kernel service task and stack.
 */
 
+/* Mutexes always do single-level priority inheritance (like FreeRTOS/Zephyr): os_mutex_lock
+ * boosts a lower-priority owner to the blocking waiter's (effective) priority for as long as it
+ * holds the mutex, restoring it on os_mutex_unlock (accounting for other mutexes the task still
+ * holds). Transitive/chained inheritance across multiple mutexes is NOT implemented - see
+ * README "Timeout semantics". */
 #define OS_CONFIG_MUTEX_ENABLE            1U
+
 #define OS_CONFIG_SEMAPHORE_ENABLE        1U
 #define OS_CONFIG_QUEUE_ENABLE            1U
 #define OS_CONFIG_EVENT_ENABLE            1U
 #define OS_CONFIG_TIMER_ENABLE            1U
 #define OS_CONFIG_WORK_ENABLE             1U
+
+/* Task notifications: a single overwrite uint32_t "mailbox" built into every task's own
+ * control block (os_task_notify_give / os_task_notify_wait) - lets one task or an ISR signal
+ * a specific task directly without allocating a separate semaphore/queue object. */
+#define OS_CONFIG_TASK_NOTIFY_ENABLE      1U
 
 /* Kernel heap (os_mem_alloc/os_mem_free): first-fit allocator with coalescing over a
  * static heap of OS_CONFIG_HEAP_SIZE bytes. */

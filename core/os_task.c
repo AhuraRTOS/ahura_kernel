@@ -24,11 +24,15 @@
 */
 
 #define OS_TASK_PRIO_IDLE            0U
-#define OS_TASK_STACK_FILL_BYTE          0xA5U
+#define OS_TASK_STACK_FILL_BYTE      0xA5U
 
 /* TCB back-references from the embedded intrusive list nodes. */
 #define OS_TASK_TCB_FROM_NODE(node)      ((os_task_tcb_t *)(void *)((uint8_t *)(node) - offsetof(os_task_tcb_t, state_node)))
 #define OS_TASK_TCB_FROM_WAIT_NODE(node) ((os_task_tcb_t *)(void *)((uint8_t *)(node) - offsetof(os_task_tcb_t, wait_node)))
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+/* Mutex back-reference from its embedded owner_node (priority inheritance). */
+#define OS_MUTEX_FROM_OWNER_NODE(node)   ((const os_mutex_t *)(const void *)((const uint8_t *)(node) - offsetof(os_mutex_t, owner_node)))
+#endif
 
 /*
  * ***********************************************************************************************************
@@ -59,6 +63,15 @@ typedef struct
     uint32_t        wait_data[2];  /* per-wait condition data read by match wakers */
     uint32_t        wait_result;   /* delivery stored by a match waker, else 0     */
     os_list_t       *woken_from;   /* waiter list a pending wake came from, until consumed */
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+    uint32_t        base_priority; /* configured priority, restored once no held mutex needs a boost */
+    os_list_t       owned_mutexes; /* mutexes currently locked by this task (priority inheritance) */
+#endif
+#if (OS_CONFIG_TASK_NOTIFY_ENABLE == 1U)
+    bool            notify_pending; /* a value is latched, waiting to be consumed by notify_wait  */
+    uint32_t        notify_value;   /* latched value (overwrite: last os_task_notify_give wins)    */
+    bool            notify_waiting; /* true only while blocked inside os_task_notify_wait           */
+#endif
 
 } os_task_tcb_t;
 
@@ -112,6 +125,12 @@ static void           os_task_preempt_request(const os_task_tcb_t *tcb);
 static uint32_t       os_task_running_core(const os_task_tcb_t *tcb);
 static void           os_task_wake_compensate(os_task_tcb_t *tcb);
 static void           os_task_wake_locked(os_task_tcb_t *tcb);
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+static void           os_task_effective_priority_set(os_task_tcb_t *tcb, uint32_t new_priority);
+#endif
+#if (OS_CONFIG_TASK_NOTIFY_ENABLE == 1U)
+static void           os_task_notify_block(os_task_tcb_t *current, uint32_t ticks);
+#endif
 
 /*
  * ***********************************************************************************************************
@@ -488,6 +507,129 @@ os_status os_task_stack_watermark_get(const os_task_t *task, size_t *min_free_by
     return OS_STATUS_OK;
 }
 #endif /* OS_CONFIG_STACK_WATERMARK_ENABLE */
+
+#if (OS_CONFIG_TASK_NOTIFY_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Deliver a value to a task's notification mailbox (overwrite: last write wins),
+ *        waking it if it is currently blocked in os_task_notify_wait; ISR-safe.
+ *
+ * A task blocked for any other reason (delay, mutex/queue/semaphore/event wait) is left
+ * alone - the value is only latched for it to pick up on its next os_task_notify_wait.
+ *
+ * @param[in,out] task   Target task.
+ * @param[in]     value  Value to store.
+ * @return os_status  OK, or INVALID_ARG for a NULL/stale task handle.
+ */
+os_status os_task_notify_give(os_task_t *task, uint32_t value)
+{
+    os_task_tcb_t *tcb;
+
+    if ((task == NULL) || (task->id == 0U))
+    {
+        return OS_STATUS_INVALID_ARG;
+    }
+
+    os_critical_enter();
+
+    tcb = os_task_find_by_id(task->id);
+    if (tcb == NULL)
+    {
+        os_critical_exit();
+        return OS_STATUS_INVALID_ARG;
+    }
+
+    tcb->notify_value   = value;
+    tcb->notify_pending = true;
+
+    if ((tcb->state == OS_TASK_STATE_BLOCKED) && tcb->notify_waiting)
+    {
+        tcb->notify_waiting = false;
+        os_task_wake_locked(tcb);
+    }
+
+    os_critical_exit();
+    return OS_STATUS_OK;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Wait for this task's own notification mailbox, up to timeout_ms.
+ *
+ * Task-only, like os_mutex_lock: an ISR has no task identity of its own to wait as.
+ *
+ * @param[in]  timeout_ms  OS_WAIT_NOTHING, a duration in ms, or OS_WAIT_FOREVER.
+ * @param[out] value_out   Set to the delivered value on OS_STATUS_OK.
+ * @return os_status  OK on delivery, EMPTY when unavailable without waiting, TIMEOUT when the
+ *                     wait elapsed, INVALID_ARG from an ISR or before a real task exists.
+ */
+os_status os_task_notify_wait(uint32_t timeout_ms, uint32_t *value_out)
+{
+    uint32_t budget_ticks;
+    uint32_t start_tick;
+    uint32_t remaining_ticks;
+
+    if ((value_out == NULL) || os_arch_in_isr())
+    {
+        return OS_STATUS_INVALID_ARG;
+    }
+
+    budget_ticks    = os_internal_timeout_to_ticks(timeout_ms);
+    start_tick      = os_tick_get();
+    remaining_ticks = budget_ticks;
+
+    for (;;)
+    {
+        uint32_t      core;
+        os_task_tcb_t *current;
+
+        os_critical_enter();
+
+        core    = os_arch_core_id_get();
+        current = os_task_current[core];
+
+        if ((current == NULL) || (current == &os_task_idle_tcb[core]))
+        {
+            os_critical_exit();
+            return OS_STATUS_INVALID_ARG;
+        }
+
+        /* Cleared every iteration: only true while genuinely blocked below,
+         * so a give() arriving any other time correctly just latches. */
+        current->notify_waiting = false;
+
+        if (current->notify_pending)
+        {
+            current->notify_pending = false;
+            *value_out             = current->notify_value;
+            current->notify_value  = 0U;
+            os_critical_exit();
+            return OS_STATUS_OK;
+        }
+
+        if ((timeout_ms == OS_WAIT_NOTHING) || !os_internal_can_block())
+        {
+            os_critical_exit();
+            return OS_STATUS_EMPTY;
+        }
+
+        if (remaining_ticks == 0U)
+        {
+            os_critical_exit();
+            return OS_STATUS_TIMEOUT;
+        }
+
+        current->notify_waiting = true;
+        os_task_notify_block(current, remaining_ticks);
+        os_critical_exit();
+
+        /* Resumed: either give() latched a value (checked at the top of the next
+         * iteration) or the wait timed out - the budget recomputed against the wall
+         * clock decides which, exactly as every other blocking primitive here does. */
+        remaining_ticks = os_internal_wait_remaining(budget_ticks, start_tick);
+    }
+}
+#endif /* OS_CONFIG_TASK_NOTIFY_ENABLE */
 
 /******************************************************************************************************/
 /**
@@ -895,6 +1037,88 @@ uint32_t os_task_current_id_get(void)
     return (tcb == NULL) ? 0U : tcb->id;
 }
 
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Link a just-acquired mutex into the calling task's owned-mutex list.
+ *
+ * @param[in,out] owner_node  The mutex's own owner_node link.
+ * @return None.
+ */
+void os_task_mutex_owner_link(os_list_node_t *owner_node)
+{
+    os_task_tcb_t *current = os_task_current[os_arch_core_id_get()];
+
+    if (current != NULL)
+    {
+        os_list_push_back(&current->owned_mutexes, owner_node);
+    }
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Boost owner_task_id's effective priority to the calling (waiting) task's effective
+ *        priority when that is higher. Single-level only: does not chase what the owner may
+ *        itself be blocked on.
+ *
+ * @param[in] owner_task_id  Id of the mutex's current owner.
+ * @return None.
+ */
+void os_task_mutex_priority_inherit(uint32_t owner_task_id)
+{
+    os_task_tcb_t *current = os_task_current[os_arch_core_id_get()];
+    os_task_tcb_t *owner    = os_task_find_by_id(owner_task_id);
+
+    if ((current != NULL) && (owner != NULL) && (current->priority > owner->priority))
+    {
+        os_task_effective_priority_set(owner, current->priority);
+    }
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Unlink a released mutex from its owner's owned-mutex list and recompute the owner's
+ *        effective priority as max(base_priority, highest waiter still queued on any mutex it
+ *        still holds) - correct even when the task holds several mutexes at once.
+ *
+ * @param[in,out] owner_node  The mutex's own owner_node link (already unlocked by the caller).
+ * @return None.
+ */
+void os_task_mutex_owner_unlink_and_reprioritize(os_list_node_t *owner_node)
+{
+    os_task_tcb_t  *current = os_task_current[os_arch_core_id_get()];
+    os_list_node_t *node;
+    uint32_t       new_priority;
+
+    if (current == NULL)
+    {
+        return;
+    }
+
+    os_list_remove(&current->owned_mutexes, owner_node);
+
+    new_priority = current->base_priority;
+
+    for (node = current->owned_mutexes.head; node != NULL; node = node->next)
+    {
+        const os_mutex_t      *held       = OS_MUTEX_FROM_OWNER_NODE(node);
+        const os_list_node_t  *top_waiter = held->waiters.head;
+
+        if (top_waiter != NULL)
+        {
+            uint32_t waiter_priority = OS_TASK_TCB_FROM_WAIT_NODE(top_waiter)->priority;
+
+            if (waiter_priority > new_priority)
+            {
+                new_priority = waiter_priority;
+            }
+        }
+    }
+
+    os_task_effective_priority_set(current, new_priority);
+}
+#endif /* OS_CONFIG_MUTEX_ENABLE */
+
 /******************************************************************************************************/
 /**
  * @brief Check whether the calling core's idle task is currently running (ISR-safe).
@@ -1058,6 +1282,9 @@ os_status os_task_idle_create(void)
         tcb->stack_ptr     = stack_ptr;
         tcb->stack_bytes   = sizeof(os_task_idle_stack[core]);
         tcb->priority      = OS_TASK_PRIO_IDLE;
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+        tcb->base_priority = OS_TASK_PRIO_IDLE;
+#endif
         tcb->entry         = os_task_idle_entry;
         tcb->context       = NULL;
         tcb->id            = 0U;
@@ -1335,6 +1562,9 @@ static os_status os_task_create_any(os_task_t *task, const os_task_config_t *con
             tcb->stack_ptr        = stack_ptr;
             tcb->stack_bytes      = config->stack_bytes;
             tcb->priority         = config->priority;
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+            tcb->base_priority    = config->priority;
+#endif
             tcb->entry            = config->entry;
             tcb->context          = config->context;
             tcb->id               = os_task_next_id;
@@ -1423,6 +1653,23 @@ static void os_task_tcb_clear(os_task_tcb_t *tcb)
     tcb->wait_data[1]  = 0U;
     tcb->wait_result   = 0U;
     tcb->woken_from    = NULL;
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+    tcb->base_priority = 0U;
+
+    /* Detach every mutex this task still owned before the slot is recycled:
+     * otherwise the next task placed here would inherit dangling links into
+     * an owned_mutexes list that no longer represents it. This only prevents
+     * corruption - the mutex itself stays locked forever, same as today. */
+    while (!os_list_is_empty(&tcb->owned_mutexes))
+    {
+        (void)os_list_pop_front(&tcb->owned_mutexes);
+    }
+#endif
+#if (OS_CONFIG_TASK_NOTIFY_ENABLE == 1U)
+    tcb->notify_pending = false;
+    tcb->notify_value   = 0U;
+    tcb->notify_waiting = false;
+#endif
 
     tcb->state_node.next = NULL;
     tcb->state_node.prev = NULL;
@@ -1680,3 +1927,101 @@ static uint32_t os_task_running_core(const os_task_tcb_t *tcb)
 
     return OS_CONFIG_CORE_COUNT;
 }
+
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Change a task's effective (scheduled) priority, moving it between ready-list buckets
+ *        and requesting a reschedule wherever needed - the only correct way to mutate
+ *        tcb->priority once a task may already be READY/RUNNING. Caller holds a critical
+ *        section (mutex lock/unlock's own).
+ *
+ * @param[in,out] tcb           Task to reprioritize.
+ * @param[in]     new_priority  New effective priority.
+ * @return None.
+ */
+static void os_task_effective_priority_set(os_task_tcb_t *tcb, uint32_t new_priority)
+{
+    if (new_priority == tcb->priority)
+    {
+        return;
+    }
+
+    if (tcb->state == OS_TASK_STATE_READY)
+    {
+        bool increasing = (new_priority > tcb->priority);
+
+        os_task_unlink(tcb);   /* leaves the OLD priority's bucket */
+        tcb->priority = new_priority;
+        os_task_make_ready(tcb); /* rejoins at the NEW priority's bucket */
+
+        if (increasing && os_kernel_is_running())
+        {
+            os_task_preempt_request(tcb);
+        }
+        return;
+    }
+
+    if ((tcb->state == OS_TASK_STATE_RUNNING) && (new_priority < tcb->priority) && os_kernel_is_running())
+    {
+        /* Lowering the priority of a task that is currently executing may
+         * unmask a ready task that now outranks it - nothing else triggers
+         * this check (unlike the READY/boost case, no os_task_preempt_request
+         * call is naturally in the caller's path). */
+        uint32_t core = os_task_running_core(tcb);
+
+        tcb->priority = new_priority;
+
+        if ((core < OS_CONFIG_CORE_COUNT) && (new_priority < OS_TASK_PRIO_MAX))
+        {
+            uint32_t above_mask = ~((1UL << (new_priority + 1U)) - 1U);
+
+            if ((os_task_ready_bitmap & above_mask) != 0U)
+            {
+#if (OS_CONFIG_CORE_COUNT > 1U)
+                if (core == os_arch_core_id_get())
+                {
+                    OS_ARCH_CONTEXT_SWITCH_REQUEST();
+                }
+                else
+                {
+                    os_arch_core_ipi_request_cb(core);
+                }
+#else
+                OS_ARCH_CONTEXT_SWITCH_REQUEST();
+#endif
+            }
+        }
+        return;
+    }
+
+    /* BLOCKED/SUSPENDED, or RUNNING with an unchanged-relevance change: no
+     * list to move and no reschedule to request yet - takes effect the next
+     * time this task is made ready. */
+    tcb->priority = new_priority;
+}
+#endif /* OS_CONFIG_MUTEX_ENABLE */
+
+#if (OS_CONFIG_TASK_NOTIFY_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Block the calling task for a notification (or its timeout), without joining any
+ *        object's waiter list - os_task_notify_give addresses this task directly by id.
+ *
+ * @param[in,out] current  The calling task (already validated by the caller).
+ * @param[in]     ticks     Wait budget in ticks; OS_WAIT_FOREVER waits indefinitely.
+ * @return None.
+ */
+static void os_task_notify_block(os_task_tcb_t *current, uint32_t ticks)
+{
+    current->delay_ticks = ticks;
+    current->state       = OS_TASK_STATE_BLOCKED;
+
+    if (ticks != OS_WAIT_FOREVER)
+    {
+        os_list_push_back(&os_task_delay_list, &current->state_node);
+    }
+
+    OS_ARCH_CONTEXT_SWITCH_REQUEST();
+}
+#endif /* OS_CONFIG_TASK_NOTIFY_ENABLE */

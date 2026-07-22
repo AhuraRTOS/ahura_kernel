@@ -100,6 +100,13 @@ static volatile bool     g_work_ran       = false;
 static volatile uint32_t g_work_run_count = 0U;
 #endif
 
+#if (OS_CONFIG_TASK_NOTIFY_ENABLE == 1U)
+static volatile os_status g_notify_wait_status;
+static volatile uint32_t  g_notify_wait_value;
+static volatile uint32_t  g_notify_wait_ticks;
+static uint32_t           g_notify_wait_timeout_ms; /* set by the test before starting the waiter */
+#endif
+
 typedef enum
 {
     HELPER_NONE = 0,
@@ -160,6 +167,12 @@ static test_prio_ctx_t   g_prio_ctx[3];
 static os_mutex_t        g_prio_mutex;
 static volatile uint32_t g_prio_order[3];
 static volatile uint32_t g_prio_order_count;
+#endif
+
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+static os_mutex_t        g_inherit_mutex;
+static volatile bool     g_inherit_high_done;
+static volatile uint32_t g_inherit_medium_counter;
 #endif
 
 #if (OS_CONFIG_QUEUE_ENABLE == 1U) && (OS_CONFIG_EVENT_ENABLE == 1U)
@@ -248,6 +261,11 @@ static void test_timer(void);
 #if (OS_CONFIG_WORK_ENABLE == 1U)
 static void test_work(void);
 #endif
+#if (OS_CONFIG_TASK_NOTIFY_ENABLE == 1U)
+static void test_notify_wait_entry(void *context);
+static void test_notify_unrelated_block_entry(void *context);
+static void test_task_notify(void);
+#endif
 #if (OS_CONFIG_ALLOC_ENABLE == 1U)
 static void test_alloc(void);
 #endif
@@ -270,6 +288,11 @@ static void test_pipeline(void);
 #if (OS_CONFIG_MUTEX_ENABLE == 1U)
 static void test_prio_waiter_entry(void *context);
 static void test_mutex_priority_ordering(void);
+#endif
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+static void test_inherit_high_entry(void *context);
+static void test_inherit_medium_entry(void *context);
+static void test_mutex_priority_inheritance(void);
 #endif
 #if (OS_CONFIG_QUEUE_ENABLE == 1U) && (OS_CONFIG_EVENT_ENABLE == 1U)
 static void test_fanin_worker_entry(void *context);
@@ -1023,6 +1046,137 @@ static void test_work(void)
 
 /*
  * ***********************************************************************************************************
+ * Task notifications
+ * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_TASK_NOTIFY_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Calls os_task_notify_wait(g_notify_wait_timeout_ms, ...) and records the result, the
+ *        delivered value, and the elapsed ticks - shared body for the give-before-wait,
+ *        wait-then-give, and timeout cases below (each just sets the timeout and interleaves
+ *        os_task_notify_give differently around starting this task).
+ */
+static void test_notify_wait_entry(void *context)
+{
+    uint32_t  start = os_tick_get();
+    uint32_t  value = 0U;
+    os_status status;
+
+    (void)context;
+
+    status = os_task_notify_wait(g_notify_wait_timeout_ms, &value);
+
+    g_notify_wait_status = status;
+    g_notify_wait_value  = value;
+    g_notify_wait_ticks  = os_tick_get() - start;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Blocks in an unrelated os_delay_ms (not a notification wait), then does a
+ *        non-blocking os_task_notify_wait - proves a give() that arrives during the delay
+ *        neither cuts it short nor is lost.
+ */
+static void test_notify_unrelated_block_entry(void *context)
+{
+    uint32_t  value = 0U;
+    os_status status;
+
+    (void)context;
+
+    (void)os_delay_ms(80U);
+    status = os_task_notify_wait(OS_WAIT_NOTHING, &value);
+
+    g_notify_wait_status = status;
+    g_notify_wait_value  = value;
+}
+
+/******************************************************************************************************/
+static void test_task_notify(void)
+{
+    os_status status;
+    os_task_t stale_task;
+    uint32_t  t0;
+    uint32_t  t1;
+
+    test_print_section("Task Notifications");
+
+    AHURA_TEST_CHECK(os_task_notify_give(NULL, 1U) == OS_STATUS_INVALID_ARG,
+                      "os_task_notify_give(NULL) is rejected");
+
+    stale_task.id = 0xFFFFFFF0U;
+    AHURA_TEST_CHECK(os_task_notify_give(&stale_task, 1U) == OS_STATUS_INVALID_ARG,
+                      "os_task_notify_give() to a stale/unknown task id is rejected");
+
+    /* Give-before-wait: the latched value must be delivered without blocking. */
+    g_notify_wait_timeout_ms = 500U;
+    status = os_task_create(&helper, OS_TASK_CONFIG(helper, test_notify_wait_entry, NULL, 3U));
+    AHURA_TEST_CHECK(status == OS_STATUS_OK, "give-before-wait helper created");
+    AHURA_TEST_CHECK(os_task_notify_give(&helper, 111U) == OS_STATUS_OK,
+                      "os_task_notify_give() to a created-but-not-started task succeeds");
+    t0 = os_tick_get();
+    AHURA_TEST_CHECK(os_task_start(&helper) == OS_STATUS_OK, "give-before-wait helper started");
+    AHURA_TEST_CHECK(test_wait_inactive(&helper, 200U), "give-before-wait helper finished");
+    t1 = os_tick_get();
+    AHURA_TEST_CHECK(g_notify_wait_status == OS_STATUS_OK, "the latched value was delivered without blocking");
+    AHURA_TEST_CHECK(g_notify_wait_value == 111U, "the delivered value matches (got %lu)",
+                      (unsigned long)g_notify_wait_value);
+    AHURA_TEST_CHECK((t1 - t0) < OS_TICKS_FROM_MS(100U), "delivery was immediate (elapsed=%lu ticks)",
+                      (unsigned long)(t1 - t0));
+
+    /* Wait-then-give: blocks, then wakes promptly once given. */
+    g_notify_wait_timeout_ms = 500U;
+    status = os_task_create(&worker, OS_TASK_CONFIG(worker, test_notify_wait_entry, NULL, 3U));
+    AHURA_TEST_CHECK(status == OS_STATUS_OK, "wait-then-give helper created");
+    AHURA_TEST_CHECK(os_task_start(&worker) == OS_STATUS_OK, "wait-then-give helper started");
+    (void)os_delay_ms(20U);
+    AHURA_TEST_CHECK(os_task_state_get(&worker) == OS_TASK_STATE_BLOCKED,
+                      "wait-then-give helper is blocked in os_task_notify_wait");
+    AHURA_TEST_CHECK(os_task_notify_give(&worker, 222U) == OS_STATUS_OK, "os_task_notify_give() wakes it");
+    AHURA_TEST_CHECK(test_wait_inactive(&worker, 200U), "wait-then-give helper finished");
+    AHURA_TEST_CHECK(g_notify_wait_status == OS_STATUS_OK, "the wait reports delivery, not timeout");
+    AHURA_TEST_CHECK(g_notify_wait_value == 222U, "the delivered value matches (got %lu)",
+                      (unsigned long)g_notify_wait_value);
+    AHURA_TEST_CHECK(g_notify_wait_ticks < OS_TICKS_FROM_MS(200U),
+                      "the wake was prompt, well under the 500ms budget (elapsed=%lu ticks)",
+                      (unsigned long)g_notify_wait_ticks);
+
+    /* Timeout: nobody gives. */
+    g_notify_wait_timeout_ms = 200U;
+    status = os_task_create(&helper, OS_TASK_CONFIG(helper, test_notify_wait_entry, NULL, 3U));
+    AHURA_TEST_CHECK(status == OS_STATUS_OK, "timeout-case helper created");
+    AHURA_TEST_CHECK(os_task_start(&helper) == OS_STATUS_OK, "timeout-case helper started");
+    AHURA_TEST_CHECK(test_wait_inactive(&helper, 400U), "timeout-case helper finished");
+    AHURA_TEST_CHECK(g_notify_wait_status == OS_STATUS_TIMEOUT,
+                      "os_task_notify_wait() times out when nobody gives");
+    AHURA_TEST_CHECK(g_notify_wait_ticks >= OS_TICKS_FROM_MS(200U),
+                      "the timeout waited its full budget (elapsed=%lu ticks)",
+                      (unsigned long)g_notify_wait_ticks);
+
+    /* give() during an unrelated block must not cut it short, and must not be lost. */
+    status = os_task_create(&worker, OS_TASK_CONFIG(worker, test_notify_unrelated_block_entry, NULL, 3U));
+    AHURA_TEST_CHECK(status == OS_STATUS_OK, "unrelated-block helper created");
+    t0 = os_tick_get();
+    AHURA_TEST_CHECK(os_task_start(&worker) == OS_STATUS_OK, "unrelated-block helper started (delaying 80ms)");
+    (void)os_delay_ms(20U);
+    AHURA_TEST_CHECK(os_task_notify_give(&worker, 333U) == OS_STATUS_OK,
+                      "os_task_notify_give() during the unrelated delay succeeds");
+    AHURA_TEST_CHECK(test_wait_inactive(&worker, 300U), "unrelated-block helper finished");
+    t1 = os_tick_get();
+    AHURA_TEST_CHECK((t1 - t0) >= OS_TICKS_FROM_MS(75U),
+                      "the unrelated delay was not cut short by the give() (elapsed=%lu ticks)",
+                      (unsigned long)(t1 - t0));
+    AHURA_TEST_CHECK(g_notify_wait_status == OS_STATUS_OK,
+                      "the latched value was not lost - picked up by the later non-blocking wait");
+    AHURA_TEST_CHECK(g_notify_wait_value == 333U, "the delivered value matches (got %lu)",
+                      (unsigned long)g_notify_wait_value);
+}
+#endif /* OS_CONFIG_TASK_NOTIFY_ENABLE */
+
+/*
+ * ***********************************************************************************************************
  * Kernel heap (os_mem_alloc / os_mem_free)
  * ***********************************************************************************************************
 */
@@ -1337,6 +1491,97 @@ static void test_mutex_priority_ordering(void)
                       "mutex was granted highest-priority-first, not arrival order (got %lu,%lu,%lu)",
                       (unsigned long)g_prio_order[0], (unsigned long)g_prio_order[1],
                       (unsigned long)g_prio_order[2]);
+}
+#endif /* OS_CONFIG_MUTEX_ENABLE */
+
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Blocks on g_inherit_mutex (held by the test task), which boosts the test task's
+ *        effective priority; once granted, records completion and releases it.
+ */
+static void test_inherit_high_entry(void *context)
+{
+    (void)context;
+
+    (void)os_mutex_lock(&g_inherit_mutex, OS_WAIT_FOREVER);
+    g_inherit_high_done = true;
+    (void)os_mutex_unlock(&g_inherit_mutex);
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Burns a fixed number of cycles incrementing g_inherit_medium_counter then returns -
+ *        same shape as test_burst_spin_entry, but exposes its progress through a shared counter
+ *        so test_mutex_priority_inheritance() can prove it got zero CPU time while boosted.
+ */
+static void test_inherit_medium_entry(void *context)
+{
+    volatile uint32_t i;
+
+    (void)context;
+
+    for (i = 0U; i < TEST_BURST_ITERATIONS; i++)
+    {
+        g_inherit_medium_counter++;
+    }
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Proves single-level mutex priority inheritance closes the classic priority-inversion
+ *        window: while this test task - boosted to the blocked high-priority waiter's priority -
+ *        holds the mutex, an unrelated medium-priority task must get zero CPU time, and only
+ *        runs once the mutex is released and the boost drops back to base priority.
+ */
+static void test_mutex_priority_inheritance(void)
+{
+    os_status status;
+
+    test_print_section("Combined: Mutex Priority Inheritance");
+
+    AHURA_TEST_CHECK(os_mutex_init(&g_inherit_mutex) == OS_STATUS_OK, "priority-inheritance mutex initialized");
+    AHURA_TEST_CHECK(os_mutex_lock(&g_inherit_mutex, OS_WAIT_NOTHING) == OS_STATUS_OK,
+                      "test task takes the mutex first (at its own priority %u)",
+                      (unsigned)OS_CONFIG_TEST_PRIORITY);
+
+    g_inherit_high_done      = false;
+    g_inherit_medium_counter = 0U;
+
+    /* Higher priority than this test task: preempts immediately, finds the mutex locked, and
+     * boosts this test task's effective priority before blocking - synchronously, inside this
+     * os_task_start() call, so the test task resumes already boosted. */
+    status = os_task_create(&helper, OS_TASK_CONFIG(helper, test_inherit_high_entry, NULL,
+                                                            OS_CONFIG_TEST_PRIORITY + 2U));
+    AHURA_TEST_CHECK(status == OS_STATUS_OK, "high-priority waiter created (priority %u)",
+                      (unsigned)(OS_CONFIG_TEST_PRIORITY + 2U));
+    AHURA_TEST_CHECK(os_task_start(&helper) == OS_STATUS_OK, "high-priority waiter started");
+
+    AHURA_TEST_CHECK(!g_inherit_high_done,
+                      "the high-priority waiter blocked on the held mutex instead of finishing");
+
+    /* A medium-priority task, created and started while this test task is (boosted) running: it
+     * must not get any CPU time yet - proving the boost, not just "it'll run eventually". */
+    status = os_task_create(&worker, OS_TASK_CONFIG(worker, test_inherit_medium_entry, NULL,
+                                                             OS_CONFIG_TEST_PRIORITY + 1U));
+    AHURA_TEST_CHECK(status == OS_STATUS_OK, "medium-priority task created (priority %u)",
+                      (unsigned)(OS_CONFIG_TEST_PRIORITY + 1U));
+    AHURA_TEST_CHECK(os_task_start(&worker) == OS_STATUS_OK, "medium-priority task started");
+
+    AHURA_TEST_CHECK(g_inherit_medium_counter == 0U,
+                      "medium-priority task got zero CPU time while the boosted owner held the mutex (count=%lu)",
+                      (unsigned long)g_inherit_medium_counter);
+
+    AHURA_TEST_CHECK(os_mutex_unlock(&g_inherit_mutex) == OS_STATUS_OK,
+                      "test task releases the mutex, dropping its boost back to base priority");
+
+    AHURA_TEST_CHECK(test_wait_inactive(&helper, 300U), "high-priority waiter finished");
+    AHURA_TEST_CHECK(g_inherit_high_done, "high-priority waiter actually acquired the mutex");
+
+    AHURA_TEST_CHECK(test_wait_inactive(&worker, 300U), "medium-priority task finished");
+    AHURA_TEST_CHECK(g_inherit_medium_counter == TEST_BURST_ITERATIONS,
+                      "medium-priority task ran to completion once nothing outranked it any more (count=%lu)",
+                      (unsigned long)g_inherit_medium_counter);
 }
 #endif /* OS_CONFIG_MUTEX_ENABLE */
 
@@ -2138,6 +2383,9 @@ void os_test(void)
 #if (OS_CONFIG_WORK_ENABLE == 1U)
     test_work();
 #endif
+#if (OS_CONFIG_TASK_NOTIFY_ENABLE == 1U)
+    test_task_notify();
+#endif
 #if (OS_CONFIG_ALLOC_ENABLE == 1U)
     test_alloc();
 #endif
@@ -2153,6 +2401,9 @@ void os_test(void)
 #endif
 #if (OS_CONFIG_MUTEX_ENABLE == 1U)
     test_mutex_priority_ordering();
+#endif
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+    test_mutex_priority_inheritance();
 #endif
 #if (OS_CONFIG_QUEUE_ENABLE == 1U) && (OS_CONFIG_EVENT_ENABLE == 1U)
     test_event_queue_fanin();
