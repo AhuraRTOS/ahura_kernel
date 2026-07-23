@@ -557,20 +557,38 @@ void os_tickless_pre_sleep_cb(void)   { /* select sleep mode (e.g. SLEEPDEEP), g
 void os_tickless_post_sleep_cb(void)  { /* clear SLEEPDEEP, restore clocks */ }
 ```
 
-Status: the flow in `os_tick.c` (`os_tickless_idle_process`) is complete in shape
-but is not yet invoked — the idle task still runs a plain `WFI` loop, so
-enabling the config flag currently changes nothing. Remaining work before it
-can be wired in:
+**Suspend every other periodic interrupt source here too, not just SysTick.**
+WFI wakes on any pending interrupt regardless of masking, so anything else
+firing more often than the planned sleep — a HAL library's own tick
+redirected to a spare timer (a common pattern precisely so the RTOS can have
+SysTick to itself; STM32 HAL's `HAL_SuspendTick()`/`HAL_ResumeTick()` are the
+standard hook for this), a periodic ADC/comms timer, etc. — will cut every
+suppressed sleep short at its own period, no matter how long SysTick itself
+was reprogrammed for. `os_tickless_pre_sleep_cb`/`post_sleep_cb` are exactly
+where to pause and resume those sources.
 
-- the idle task must call `os_tickless_idle_process()`;
-- the planned idle time only considers software-timer expiries, not blocked
-  task delays (`os_delay_ms` sleepers would wake late);
-- SysTick keeps running during the sleep window (no tick suppression), which
-  would double-count time via both `os_tick_handler` and `os_tick_announce`;
-- the elapsed-time measurement uses DWT `CYCCNT`, which halts in sleep mode on
-  most implementations — the wake source must provide the duration instead
-  (suppressed-SysTick arithmetic, or LPTIM: `OS_CONFIG_LPTIM_CLOCK_HZ` is
-  reserved for that but unused so far).
+Status: `os_tickless_expected_idle_ticks_get()` already bounds the planned
+sleep by the earliest of the next software-timer expiry, the next ready work
+item, and the next finite-delay task sleeper (`os_delay_ms` waiters are
+covered, not just timers). On the ARMv8-M mainline port (`os_arch_port_v8m.c`
+— Cortex-M33/M35P/M52/M55/M85), `os_arch_sleep_prepare`/`os_arch_elapsed_ticks_get`
+now really suppress SysTick for the sleep window (reprogramming its reload
+one tick short of the plan, so the real final tick still fires normally and
+supplies the last tick's accounting through the ordinary `os_tick_handler`
+path — the same technique FreeRTOS's tickless idle uses) and measure the
+real elapsed time from SysTick itself rather than the DWT cycle counter
+(which is not reliable across an actual sleep on most implementations).
+
+Remaining work:
+
+- the ARMv6-M and ARMv7-M/E-M ports (`os_arch_port_v6m.c`, `os_arch_port_v7m.c`)
+  still need the identical fix — same register layout, not yet ported over;
+- the idle task still runs a plain `WFI` loop and does not yet call
+  `os_tickless_idle_process()` — exposed in `ahura.h` and exercised directly
+  by the self-test suite (`test_tickless_sleep()`) ahead of that wiring;
+- a deeper-sleep path (STOP mode or similar, where SysTick itself stops) would
+  need an always-running wake/measurement source instead — `OS_CONFIG_LPTIM_CLOCK_HZ`
+  is reserved for that but unused so far.
 
 ## Self-test suite
 

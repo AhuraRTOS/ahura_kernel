@@ -420,6 +420,23 @@ void os_arch_sleep_prepare(uint32_t planned_ticks)
     os_arch_sleep_entry_cycles = os_arch_cycle_count_get();
 }
 
+/******************************************************************************************************/
+/**
+ * @brief Maximum ticks this port can suppress in a single tickless window (see
+ *        os_arch_port_common.h for the full contract).
+ *
+ * This port does not yet reprogram SysTick's reload for real suppression (see os_arch_port_v8m.c,
+ * which does) - os_arch_sleep_prepare/os_arch_elapsed_ticks_get above still measure via the DWT
+ * cycle counter around a plain WFI, so there is no register-width-limited window to report here.
+ * 0 tells callers (os_tick.c, tests) not to expect a real suppressed sleep on this port yet.
+ *
+ * @return uint32_t  Always 0 until this port gets the same fix as os_arch_port_v8m.c.
+ */
+uint32_t os_arch_max_suppressed_ticks_get(void)
+{
+    return 0U;
+}
+
 /*
  * ***********************************************************************************************************
  * Multi-core weak callback defaults

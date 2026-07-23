@@ -238,6 +238,25 @@ uint32_t os_tickless_expected_idle_ticks_get(void)
 
 /******************************************************************************************************/
 /**
+ * @brief Maximum ticks the active arch port can suppress in a single tickless window right now,
+ *        given the platform clock and OS_CONFIG_TICK_HZ (register-width limited - e.g. SysTick's
+ *        24-bit reload - and therefore platform- and clock-speed-dependent, not a fixed constant).
+ *        0 when OS_CONFIG_TICKLESS_ENABLE is 0, or the active port does not yet suppress ticking
+ *        for real (see the kernel README "Tickless idle" for which ports currently do).
+ *
+ * @return uint32_t  Maximum suppressible ticks.
+ */
+uint32_t os_tickless_max_suppressed_ticks_get(void)
+{
+#if (OS_CONFIG_TICKLESS_ENABLE == 1U)
+    return os_arch_max_suppressed_ticks_get();
+#else
+    return 0U;
+#endif
+}
+
+/******************************************************************************************************/
+/**
  * @brief Execute tickless idle flow.
  *
  * @return None.
@@ -257,11 +276,6 @@ void os_tickless_idle_process(void)
 
     OS_ARCH_SLEEP(planned_idle_ticks);
     elapsed_ticks = os_arch_elapsed_ticks_get();
-
-    if (elapsed_ticks == 0U)
-    {
-        elapsed_ticks = planned_idle_ticks;
-    }
 
     os_tickless_post_sleep_cb();
     os_tick_announce(elapsed_ticks);

@@ -599,6 +599,17 @@ uint32_t os_arch_elapsed_ticks_get(void);
  */
 void os_arch_sleep_prepare(uint32_t planned_ticks);
 
+/******************************************************************************************************/
+/**
+ * @brief Maximum ticks this port can suppress in a single tickless window, given the current
+ *        tick rate and CPU clock (register-width limited - e.g. SysTick's 24-bit reload). 0 if
+ *        this port does not yet suppress ticking for real (falls back to a plain WFI - see the
+ *        kernel README "Tickless idle" for which ports currently do) or the clock/tick source
+ *        isn't ready. Portable callers (os_tick.c, tests) use this instead of assuming any fixed
+ *        tick count, since it varies with both the platform clock and OS_CONFIG_TICK_HZ.
+ */
+uint32_t os_arch_max_suppressed_ticks_get(void);
+
 #ifdef __cplusplus
 }
 #endif

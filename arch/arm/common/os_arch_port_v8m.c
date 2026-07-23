@@ -61,6 +61,7 @@
 #define OS_ARCH_SYST_CSR_ENABLE_MSK          (1UL << 0)
 #define OS_ARCH_SYST_CSR_TICKINT_MSK         (1UL << 1)
 #define OS_ARCH_SYST_CSR_CLKSOURCE_MSK       (1UL << 2)
+#define OS_ARCH_SYST_CSR_COUNTFLAG_MSK       (1UL << 16)
 #define OS_ARCH_SYST_RVR_RELOAD_MSK          0x00FFFFFFUL
 
 #define OS_ARCH_SHPR2_SVC_PRI_POS            24U
@@ -92,8 +93,17 @@
  * ***********************************************************************************************************
 */
 
-static uint32_t os_arch_sleep_entry_cycles = 0U;
-static uint32_t os_arch_planned_idle_ticks = 0U;
+/* Tickless idle (SysTick suppression): os_arch_tick_reload_cycles is the normal
+ * 1-tick reload, cached once by os_arch_tick_init(); os_arch_planned_idle_ticks
+ * is the effective (possibly 24-bit-capped) request, 0 = not currently armed;
+ * os_arch_suppressed_reload_cycles is the cycle count actually programmed for
+ * (planned - 1) ticks (see os_arch_sleep_prepare); os_arch_sleep_mask_state is
+ * the os_arch_kernel_mask_save() token, acquired in os_arch_sleep_prepare and
+ * released in os_arch_elapsed_ticks_get. */
+static uint32_t os_arch_tick_reload_cycles      = 0U;
+static uint32_t os_arch_planned_idle_ticks      = 0U;
+static uint32_t os_arch_suppressed_reload_cycles = 0U;
+static uint32_t os_arch_sleep_mask_state        = 0U;
 
 /*
  * ***********************************************************************************************************
@@ -280,7 +290,6 @@ void os_arch_init(void)
     OS_ARCH_REG_DWT_CYCCNT = 0U;
     OS_ARCH_REG_DWT_CTRL   |= OS_ARCH_DWT_CTRL_CYCCNTENA_MSK;
 
-    os_arch_sleep_entry_cycles = OS_ARCH_REG_DWT_CYCCNT;
     os_arch_planned_idle_ticks = 0U;
 
     /* Guard the handler stack: an MSP push below the stack bottom raises a
@@ -360,6 +369,10 @@ void os_arch_tick_init(void)
         return;
     }
 
+    /* Cached for tickless idle: os_arch_elapsed_ticks_get() restores exactly
+     * this cadence after a suppressed sleep. */
+    os_arch_tick_reload_cycles = reload_value;
+
     OS_ARCH_REG_SYST_CSR = 0U;
     OS_ARCH_REG_SYST_RVR = reload_value - 1UL;
     OS_ARCH_REG_SYST_CVR = 0U;
@@ -431,15 +444,21 @@ uint32_t os_arch_cycle_count_get(void)
 
 /******************************************************************************************************/
 /**
- * @brief Return elapsed ticks while in low-power mode.
+ * @brief Return elapsed ticks while in low-power mode, restoring SysTick's normal cadence.
  *
- * @return uint32_t  Elapsed ticks since sleep entry.
+ * Detects whether the suppressed (planned-1)-tick window fully elapsed (a real SysTick
+ * exception is then already pending, and supplies the final +1 through the ordinary
+ * os_tick_handler() path once the mask this function releases lets it fire) or whether
+ * some other interrupt woke the core early (elapsed cycles reconstructed from CVR).
+ *
+ * @return uint32_t  Elapsed ticks since os_arch_sleep_prepare(), 0 if it never armed a window.
  */
 uint32_t os_arch_elapsed_ticks_get(void)
 {
-    uint32_t clock_hz = os_clock_hz_get_cb();
-    uint32_t now_cycles;
-    uint32_t delta_cycles;
+    uint32_t csr;
+    uint32_t cvr;
+    uint32_t clock_hz;
+    uint32_t elapsed_cycles;
     uint32_t elapsed_ticks;
 
     if (os_arch_planned_idle_ticks == 0U)
@@ -447,42 +466,163 @@ uint32_t os_arch_elapsed_ticks_get(void)
         return 0U;
     }
 
-    now_cycles   = os_arch_cycle_count_get();
-    delta_cycles = now_cycles - os_arch_sleep_entry_cycles;
+    /* Single CSR read: it clears COUNTFLAG as a side effect, so it must be sampled once. */
+    csr = OS_ARCH_REG_SYST_CSR;
 
-    if (clock_hz == 0U)
+    if ((csr & OS_ARCH_SYST_CSR_COUNTFLAG_MSK) != 0U)
     {
-        elapsed_ticks = os_arch_planned_idle_ticks;
+        /* Full window elapsed: a real SysTick exception is already pending in the
+         * NVIC (latched the instant the down-counter hit zero, independent of the
+         * interrupt mask still held here) - it supplies the final +1 once the mask
+         * below is released, through the unmodified os_tick_handler() ISR. */
+        elapsed_ticks = os_arch_planned_idle_ticks - 1U;
     }
     else
     {
-        uint64_t scaled_ticks = ((uint64_t)delta_cycles * (uint64_t)OS_CONFIG_TICK_HZ);
+        /* Woke early: reconstruct how far CVR counted down from the reload
+         * actually programmed for this window. */
+        cvr            = OS_ARCH_REG_SYST_CVR & OS_ARCH_SYST_RVR_RELOAD_MSK;
+        elapsed_cycles = (os_arch_suppressed_reload_cycles - 1U) - cvr;
+        clock_hz       = os_clock_hz_get_cb();
 
-        scaled_ticks /= (uint64_t)clock_hz;
-        elapsed_ticks = (uint32_t)scaled_ticks;
+        if (clock_hz == 0U)
+        {
+            elapsed_ticks = os_arch_planned_idle_ticks - 1U; /* clock vanished mid-sleep: degrade conservatively */
+        }
+        else
+        {
+            uint64_t scaled_ticks = (uint64_t)elapsed_cycles * (uint64_t)OS_CONFIG_TICK_HZ;
+
+            scaled_ticks /= (uint64_t)clock_hz;
+            elapsed_ticks = (uint32_t)scaled_ticks;
+        }
+
+        if (elapsed_ticks > (os_arch_planned_idle_ticks - 1U))
+        {
+            elapsed_ticks = os_arch_planned_idle_ticks - 1U;
+        }
     }
 
-    if (elapsed_ticks > os_arch_planned_idle_ticks)
-    {
-        elapsed_ticks = os_arch_planned_idle_ticks;
-    }
+    /* Restore SysTick to its normal single-tick cadence (identical values
+     * os_arch_tick_init programs). Writing CVR clears COUNTFLAG and forces an
+     * immediate reload from the now-normal RVR on the next clock; it does not
+     * affect an already-latched pending exception in the NVIC, which is exactly
+     * the point of the COUNTFLAG branch above. */
+    OS_ARCH_REG_SYST_CSR = 0U;
+    OS_ARCH_REG_SYST_RVR = os_arch_tick_reload_cycles - 1UL;
+    OS_ARCH_REG_SYST_CVR = 0U;
+    OS_ARCH_REG_SYST_CSR = OS_ARCH_SYST_CSR_CLKSOURCE_MSK |
+                           OS_ARCH_SYST_CSR_TICKINT_MSK |
+                           OS_ARCH_SYST_CSR_ENABLE_MSK;
 
     os_arch_planned_idle_ticks = 0U;
+    os_arch_kernel_mask_restore(os_arch_sleep_mask_state);
 
     return elapsed_ticks;
 }
 
 /******************************************************************************************************/
 /**
- * @brief Record low-power entry context for elapsed tick accounting.
+ * @brief Ticks that fit in one suppressed window given the register width (24-bit SysTick
+ *        reload) and the current tick-to-cycle ratio. Shared by os_arch_sleep_prepare (the cap)
+ *        and os_arch_max_suppressed_ticks_get (the public query) so the two can never disagree.
+ *
+ * @return uint64_t  Maximum ticks per window, 0 if the normal tick was never set up.
+ */
+static uint64_t os_arch_max_window_ticks_get(void)
+{
+    if (os_arch_tick_reload_cycles == 0U)
+    {
+        return 0U;
+    }
+
+    return (uint64_t)(OS_ARCH_SYST_RVR_RELOAD_MSK + 1UL) / (uint64_t)os_arch_tick_reload_cycles;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Reprogram SysTick to suppress ticking for (planned_ticks - 1) ticks and mask
+ *        interrupts until os_arch_elapsed_ticks_get() restores normal cadence.
+ *
+ * TICKINT stays enabled throughout: if this window fully elapses, the SysTick exception
+ * legitimately becomes pending exactly like a normal tick would, and os_arch_elapsed_ticks_get()
+ * relies on that pending exception to supply the final tick once it releases the mask below -
+ * FreeRTOS's own tickless-idle technique, reused here rather than a self-contained alternative.
  *
  * @param[in] planned_ticks  Planned idle duration in kernel ticks.
  * @return None.
  */
 void os_arch_sleep_prepare(uint32_t planned_ticks)
 {
-    os_arch_planned_idle_ticks = planned_ticks;
-    os_arch_sleep_entry_cycles = os_arch_cycle_count_get();
+    uint32_t clock_hz;
+    uint64_t max_window_ticks;
+    uint64_t suppressed_cycles64;
+
+    os_arch_planned_idle_ticks = 0U; /* not armed until proven below */
+
+    /* Below 2 ticks there is nothing meaningful to suppress (planned_ticks - 1
+     * would be 0); os_arch_elapsed_ticks_get() then reports 0 and this idle
+     * pass behaves like a plain WFI. */
+    if (planned_ticks < 2U)
+    {
+        return;
+    }
+
+    clock_hz = os_clock_hz_get_cb();
+
+    /* No usable clock, or the normal tick was never actually set up
+     * (os_arch_tick_init bailed at boot): nothing safe to reprogram. */
+    if ((clock_hz == 0U) || (os_arch_tick_reload_cycles == 0U))
+    {
+        return;
+    }
+
+    /* Cap the TICK COUNT first, then re-derive the cycle budget from the capped
+     * count: (planned_ticks - 1) * reload_cycles can vastly exceed uint32_t
+     * range for realistic tick counts, so capping after multiplying would
+     * overflow. */
+    max_window_ticks = os_arch_max_window_ticks_get();
+
+    if (max_window_ticks == 0U)
+    {
+        return; /* defensive only: unreachable given the reload range os_arch_tick_init enforces */
+    }
+
+    if ((uint64_t)(planned_ticks - 1U) > max_window_ticks)
+    {
+        planned_ticks = (uint32_t)max_window_ticks + 1U;
+    }
+
+    suppressed_cycles64 = (uint64_t)(planned_ticks - 1U) * (uint64_t)os_arch_tick_reload_cycles;
+
+    /* Committed to reprogramming SysTick: hold the kernel interrupt mask until
+     * os_arch_elapsed_ticks_get() restores normal cadence and releases it, so a
+     * real tick can never fire against a half-reprogrammed register set. */
+    os_arch_sleep_mask_state          = os_arch_kernel_mask_save();
+    os_arch_planned_idle_ticks        = planned_ticks;
+    os_arch_suppressed_reload_cycles  = (uint32_t)suppressed_cycles64;
+
+    OS_ARCH_REG_SYST_CSR = 0U;
+    OS_ARCH_REG_SYST_RVR = os_arch_suppressed_reload_cycles - 1UL;
+    OS_ARCH_REG_SYST_CVR = 0U;
+    OS_ARCH_REG_SYST_CSR = OS_ARCH_SYST_CSR_CLKSOURCE_MSK |
+                           OS_ARCH_SYST_CSR_TICKINT_MSK |
+                           OS_ARCH_SYST_CSR_ENABLE_MSK;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Maximum ticks this port can suppress in a single tickless window (see
+ *        os_arch_port_common.h for the full contract) - the planned_ticks value at which
+ *        os_arch_sleep_prepare's own cap first binds.
+ *
+ * @return uint32_t  Maximum suppressible ticks, 0 if the normal tick was never set up.
+ */
+uint32_t os_arch_max_suppressed_ticks_get(void)
+{
+    uint64_t max_window_ticks = os_arch_max_window_ticks_get();
+
+    return (max_window_ticks == 0U) ? 0U : ((uint32_t)max_window_ticks + 1U);
 }
 
 /*

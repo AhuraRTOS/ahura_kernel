@@ -512,6 +512,36 @@ void os_tickless_post_sleep_cb(void);
 
 /******************************************************************************************************/
 /**
+ * @brief Execute one tickless-idle pass: suppress ticking for the next known-idle
+ *        duration, sleep, and announce the real elapsed time on wake. A no-op when
+ *        OS_CONFIG_TICKLESS_ENABLE is 0. Not yet called by the idle task (see the
+ *        README "Tickless idle" section) - exposed here so it can be exercised
+ *        directly (e.g. by the self-test suite) ahead of that wiring.
+ */
+void os_tickless_idle_process(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Ticks the kernel would plan to suppress right now: the minimum of the next software-
+ *        timer expiry, the next ready work item, the next finite-delay task sleeper, and
+ *        OS_CONFIG_MAX_SUPPRESSED_TICKS. 0 when OS_CONFIG_TICKLESS_ENABLE is 0. Exposed for
+ *        diagnostics/tests - os_tickless_idle_process() calls this internally.
+ */
+uint32_t os_tickless_expected_idle_ticks_get(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Maximum ticks the active arch port can suppress in a single tickless window right now -
+ *        register-width limited (e.g. SysTick's 24-bit reload), so it varies with the platform
+ *        clock and OS_CONFIG_TICK_HZ, not a fixed constant. 0 when OS_CONFIG_TICKLESS_ENABLE is 0
+ *        or the active port does not yet suppress ticking for real (see README "Tickless idle").
+ *        Callers that need a tickless test/demo to work across platforms and clock speeds should
+ *        derive their horizon from this rather than assuming any fixed tick count.
+ */
+uint32_t os_tickless_max_suppressed_ticks_get(void);
+
+/******************************************************************************************************/
+/**
  * @brief Platform callback: return the CPU clock in Hz (0 = unknown). The weak default returns
  *        OS_CONFIG_CPU_CLOCK_HZ when configured, else the CMSIS SystemCoreClock global when the
  *        platform provides one. Platforms with another clock convention override this.

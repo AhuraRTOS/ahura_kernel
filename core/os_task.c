@@ -75,11 +75,6 @@ typedef struct
 
 } os_task_tcb_t;
 
-/* The current-task pointer is written by PendSV and read from task/ISR
- * context: the pointer itself is the shared object, so the typedef lets
- * __IO qualify it rather than the pointed-to TCB. */
-typedef os_task_tcb_t *os_task_tcb_ptr_t;
-
 /*
  * ***********************************************************************************************************
  * Global variables
@@ -93,9 +88,12 @@ typedef os_task_tcb_t *os_task_tcb_ptr_t;
 static uint8_t                 os_task_idle_stack[OS_CONFIG_CORE_COUNT][OS_CONFIG_MIN_STACK_SIZE] OS_STACK_ALIGNED;
 static os_task_tcb_t           os_task_idle_tcb[OS_CONFIG_CORE_COUNT];
 static os_task_tcb_t           os_task_table[OS_CONFIG_MAX_TASKS];
-static bool                    os_task_in_use[OS_CONFIG_MAX_TASKS];
 static uint32_t                os_task_next_id = 1U;
-static __IO os_task_tcb_ptr_t  os_task_current[OS_CONFIG_CORE_COUNT];
+
+/* Written by PendSV and read from task/ISR context: the pointer itself is the
+ * shared object (it changes on every context switch), not what it points to -
+ * __IO placed after the '*' qualifies the pointer, not the pointed-to TCB. */
+static os_task_tcb_t* __IO     os_task_current[OS_CONFIG_CORE_COUNT];
 
 /* Scheduler structures: one FIFO ready list per priority plus a bitmap of
  * non-empty priorities (bit n = priority n has ready tasks), and one list of
@@ -372,7 +370,6 @@ os_status os_task_delete(os_task_t *task)
     os_task_wake_compensate(tcb);
 
     os_task_unlink(tcb);
-    os_task_in_use[index] = false;
     os_task_tcb_clear(tcb);
 
     if (task != NULL)
@@ -1321,7 +1318,6 @@ void os_task_system_init(void)
 
     for (index = 0U; index < OS_CONFIG_MAX_TASKS; index++)
     {
-        os_task_in_use[index] = false;
         os_task_tcb_clear(&os_task_table[index]);
     }
 
@@ -1543,7 +1539,7 @@ static os_status os_task_create_any(os_task_t *task, const os_task_config_t *con
 
     for (index = 0U; index < OS_CONFIG_MAX_TASKS; index++)
     {
-        if (!os_task_in_use[index])
+        if (os_task_table[index].state == OS_TASK_STATE_INACTIVE)
         {
             os_task_tcb_t *tcb = &os_task_table[index];
 
@@ -1556,7 +1552,6 @@ static os_status os_task_create_any(os_task_t *task, const os_task_config_t *con
                 os_task_next_id++;
             }
 
-            os_task_in_use[index] = true;
             tcb->name             = config->name;
             tcb->stack_base       = (uint8_t *)config->stack_memory;
             tcb->stack_ptr        = stack_ptr;
@@ -1704,7 +1699,7 @@ static uint32_t os_task_find_index_by_id(uint32_t id)
 
     for (index = 0U; index < OS_CONFIG_MAX_TASKS; index++)
     {
-        if (os_task_in_use[index] && (os_task_table[index].id == id))
+        if ((os_task_table[index].state != OS_TASK_STATE_INACTIVE) && (os_task_table[index].id == id))
         {
             return index;
         }

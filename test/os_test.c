@@ -278,6 +278,7 @@ static void test_cpu_usage(void);
 static void test_task_footprint(void);
 static void test_context_switch_timing(void);
 static void test_tickless_hooks(void);
+static void test_tickless_sleep(void);
 static void test_list(void);
 static void test_unsupported_features(void);
 #if (OS_CONFIG_QUEUE_ENABLE == 1U) && (OS_CONFIG_MUTEX_ENABLE == 1U)
@@ -2267,6 +2268,104 @@ static void test_tickless_hooks(void)
     AHURA_TEST_CHECK(os_kernel_is_running(), "kernel state is intact after a paired pre/post call");
 }
 
+#if (OS_CONFIG_TICKLESS_ENABLE == 1U) && (OS_CONFIG_TIMER_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief End-to-end tickless sleep, called directly (bypassing the not-yet-wired idle task, same
+ *        as test_tickless_hooks() does for the sleep-bracket callbacks): arms a one-shot timer as
+ *        a horizon, calls os_tickless_idle_process() once, and checks the real elapsed time was
+ *        measured accurately - proving actual SysTick suppression, not just that the call is
+ *        safe. Fails against a plain-WFI (un-suppressed) OS_ARCH_SLEEP, since the CPU would then
+ *        wake at the very next real tick regardless of the requested horizon.
+ *
+ * The horizon is derived from os_tickless_max_suppressed_ticks_get() at runtime rather than any
+ * fixed tick count: the safe suppressible window is register-width limited (e.g. SysTick's 24-bit
+ * reload), so it depends on both the platform clock and OS_CONFIG_TICK_HZ - a constant tuned for
+ * one board/speed could silently collide with the cap, or with too-small a window to measure
+ * meaningfully, on another. This test holds across whatever platform/clock speed it runs on.
+ */
+static void test_tickless_sleep(void)
+{
+    uint32_t  t0;
+    uint32_t  t1;
+    uint32_t  delta;
+    uint32_t  max_suppressed;
+    uint32_t  horizon;
+    uint32_t  tolerance_low;
+    uint32_t  tolerance_high;
+    os_status init_status;
+    os_status start_status;
+
+    test_print_section("Tickless Sleep (end-to-end, real hardware timing)");
+
+    max_suppressed = os_tickless_max_suppressed_ticks_get();
+
+    if (max_suppressed < 4U)
+    {
+        printf("  [SKIP] os_tickless_max_suppressed_ticks_get() = %lu: this port does not yet\r\n"
+               "         suppress ticking for real (see kernel README \"Tickless idle\"), or the\r\n"
+               "         current clock/tick-rate combination allows too small a window to test.\r\n",
+               (unsigned long)max_suppressed);
+        return;
+    }
+
+    printf("  [INFO] calling os_tickless_idle_process() directly from this task (not the idle\r\n"
+           "         task - see kernel README \"Tickless idle\") to verify the suppress/measure\r\n"
+           "         mechanism before that wiring lands.\r\n");
+
+    /* Half the safe maximum, floored at the maximum itself when that is already small, capped so
+     * the test does not run unreasonably long on a platform where the safe window is huge. */
+    horizon = max_suppressed / 2U;
+    if (horizon < 4U)
+    {
+        horizon = max_suppressed;
+    }
+    if (horizon > 50U)
+    {
+        horizon = 50U;
+    }
+
+    /* Arm silently and sample t0 immediately after: any printf here would block on a polled
+     * UART transmit and eat into the window we are about to measure. Check/report status once
+     * the timing-critical section below is over instead. */
+    g_oneshot_fired = 0U;
+    init_status  = os_timer_init(&g_timer_oneshot, horizon, OS_TIMER_MODE_ONE_SHOT, timer_oneshot_cb, NULL);
+    start_status = os_timer_start(&g_timer_oneshot);
+
+    t0 = os_tick_get();
+    os_tickless_idle_process();
+    t1 = os_tick_get();
+    delta = t1 - t0;
+
+    /* A little slack either side for scheduling/measurement rounding, scaled to stay meaningful
+     * for small horizons too (a fixed +/-N would be too tight for a tiny horizon and too loose
+     * for a large one). */
+    tolerance_low  = (horizon > 2U) ? (horizon - 2U) : 1U;
+    tolerance_high = horizon + 5U;
+
+    AHURA_TEST_CHECK(init_status == OS_STATUS_OK, "os_timer_init() arms a %lu-tick horizon for the sleep test",
+                      (unsigned long)horizon);
+    AHURA_TEST_CHECK(start_status == OS_STATUS_OK, "one-shot timer started");
+    AHURA_TEST_CHECK((delta >= tolerance_low) && (delta <= tolerance_high),
+                      "os_tickless_idle_process() slept ~%lu ticks and measured it accurately (delta=%lu)",
+                      (unsigned long)horizon, (unsigned long)delta);
+    AHURA_TEST_CHECK(os_kernel_is_running(), "kernel state is intact after a real tickless sleep/wake cycle");
+
+    (void)os_delay_ms(5U); /* let the timer service task run the callback */
+    AHURA_TEST_CHECK(g_oneshot_fired == 1U, "the timer bounding the sleep fired exactly once (fired=%lu)",
+                      (unsigned long)g_oneshot_fired);
+
+    (void)os_timer_stop(&g_timer_oneshot);
+}
+#else
+/******************************************************************************************************/
+static void test_tickless_sleep(void)
+{
+    test_print_section("Tickless Sleep (end-to-end)");
+    printf("  [SKIP] requires OS_CONFIG_TICKLESS_ENABLE=1 and OS_CONFIG_TIMER_ENABLE=1\r\n");
+}
+#endif /* OS_CONFIG_TICKLESS_ENABLE && OS_CONFIG_TIMER_ENABLE */
+
 /*
  * ***********************************************************************************************************
  * Intrusive list (always compiled in - the scheduler runs on it)
@@ -2420,6 +2519,7 @@ void os_test(void)
     test_task_footprint();
     test_context_switch_timing();
     test_tickless_hooks();
+    test_tickless_sleep();
     test_list();
     test_unsupported_features();
 
