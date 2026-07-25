@@ -16,8 +16,6 @@
 
 #include "os_internal.h"
 
-#include <limits.h>
-
 #if (OS_CONFIG_TIMER_ENABLE == 1U)
 
 /*
@@ -35,12 +33,10 @@ static os_task_t            os_timer_task_handle;
 static void                 *os_timer_task_tcb = NULL;
 
 /* Registry of started timers, advanced on every kernel tick. Fixed slots so
- * tick-time iteration stays safe against concurrent start/stop calls.
- * The slot (the pointer itself) is what the ISR and tasks race on, so the
- * typedef lets __IO qualify the slot rather than the pointed-to timer. */
-typedef os_timer_t *os_timer_slot_t;
-
-static __IO os_timer_slot_t os_timer_registry[OS_CONFIG_MAX_TIMERS];
+ * tick-time iteration stays safe against concurrent start/stop calls. The slot
+ * (the pointer itself) is what the ISR and tasks race on, so __IO sits after
+ * the '*' to qualify the slot rather than the pointed-to timer. */
+static os_timer_t * __IO    os_timer_registry[OS_CONFIG_MAX_TIMERS];
 
 /*
  * ***********************************************************************************************************

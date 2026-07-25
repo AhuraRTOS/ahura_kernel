@@ -62,6 +62,57 @@ static volatile bool     g_busy_should_run = true;
 
 #define TEST_BURST_ITERATIONS 200000UL
 
+/*
+ * Benchmarks are timed with the CPU cycle counter (os_arch_cycle_count_get), not the kernel
+ * tick: the tick only resolves whole milliseconds, which is ~250000 cycles of quantization on a
+ * fast core - far coarser than the calls being measured. Cycle resolution is 1 cycle.
+ *
+ * Each operation is measured ON ITS OWN, sampled many times, and the MINIMUM is kept. Anything
+ * that perturbs a sample (the 1 kHz tick ISR landing mid-measurement, a flash/cache miss, a
+ * pipeline stall) only ever ADDS cycles, so the minimum converges on the true uninterrupted
+ * cost. The two cycle-counter reads have their own cost, measured the same way and subtracted.
+ */
+#define TEST_BENCH_SAMPLES         2000U
+#define TEST_BENCH_HEAVY_SAMPLES   200U
+
+/* Saturating subtract: an operation cheaper than the measurement overhead itself would
+ * otherwise wrap to a huge unsigned value. */
+#define TEST_BENCH_SUB(total, over) (((total) > (over)) ? ((total) - (over)) : 0U)
+
+/* Sample one operation TEST_BENCH_SAMPLES times, keeping the cheapest run. The statement is
+ * pasted inline (not called through a function pointer) so no call overhead is attributed to
+ * it; the compiler cannot reorder it across the two counter reads because all three are
+ * external calls into the kernel library. */
+#define TEST_BENCH_MIN_CYCLES(best_out, samples, op_stmt)                        \
+    do {                                                                         \
+        uint32_t bench_best = UINT32_MAX;                                        \
+        uint32_t bench_i;                                                        \
+        for (bench_i = 0U; bench_i < (samples); bench_i++)                       \
+        {                                                                        \
+            uint32_t bench_c0 = os_arch_cycle_count_get();                       \
+            op_stmt;                                                             \
+            uint32_t bench_d = os_arch_cycle_count_get() - bench_c0;             \
+            if (bench_d < bench_best) { bench_best = bench_d; }                  \
+        }                                                                        \
+        (best_out) = bench_best;                                                 \
+    } while (0)
+
+/* Dedicated benchmark objects, kept separate from the functional tests' shared ones so a
+ * leftover count/item/waiter from an earlier section cannot skew a measurement. */
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+static os_mutex_t     g_bench_mutex;
+#endif
+#if (OS_CONFIG_SEMAPHORE_ENABLE == 1U)
+static os_semaphore_t g_bench_sem;
+#endif
+#if (OS_CONFIG_QUEUE_ENABLE == 1U)
+static os_queue_t     g_bench_queue;
+static uint32_t       g_bench_queue_buf[4];
+#endif
+#if (OS_CONFIG_EVENT_ENABLE == 1U)
+static os_event_group_t g_bench_event;
+#endif
+
 /* Shared between two equal-priority tasks in test_context_switch_timing(): each increments
  * this once per loop turn, then yields - so its total over a fixed window is (approximately)
  * the number of context switches that occurred. */
@@ -173,6 +224,20 @@ static volatile uint32_t g_prio_order_count;
 static os_mutex_t        g_inherit_mutex;
 static volatile bool     g_inherit_high_done;
 static volatile uint32_t g_inherit_medium_counter;
+
+/* Two mutexes held at once by the same owner, each with its own higher-priority waiter -
+ * see test_mutex_multi_inheritance(). */
+typedef struct
+{
+    os_mutex_t *mutex;
+    uint32_t   tag;   /* OR'd into g_inherit2_done_mask once this waiter is granted the mutex */
+
+} test_inherit2_ctx_t;
+
+static test_inherit2_ctx_t g_inherit2_ctx[2];
+static os_mutex_t          g_inherit2_mutex_a;
+static os_mutex_t          g_inherit2_mutex_b;
+static volatile uint32_t   g_inherit2_done_mask;
 #endif
 
 #if (OS_CONFIG_QUEUE_ENABLE == 1U) && (OS_CONFIG_EVENT_ENABLE == 1U)
@@ -242,6 +307,7 @@ static void test_kernel_core(void);
 static void test_delay(void);
 static void test_critical_section(void);
 static void test_task_lifecycle(void);
+static void test_task_identity(void);
 static void test_priority_preemption(void);
 #if (OS_CONFIG_MUTEX_ENABLE == 1U)
 static void test_mutex(void);
@@ -277,6 +343,8 @@ static void test_cpu_usage(void);
 #endif
 static void test_task_footprint(void);
 static void test_context_switch_timing(void);
+static void test_bench_row(const char *name, uint32_t cycles, uint32_t clock_hz);
+static void test_benchmarks(void);
 static void test_tickless_hooks(void);
 static void test_tickless_sleep(void);
 static void test_list(void);
@@ -294,6 +362,8 @@ static void test_mutex_priority_ordering(void);
 static void test_inherit_high_entry(void *context);
 static void test_inherit_medium_entry(void *context);
 static void test_mutex_priority_inheritance(void);
+static void test_inherit2_waiter_entry(void *context);
+static void test_mutex_multi_inheritance(void);
 #endif
 #if (OS_CONFIG_QUEUE_ENABLE == 1U) && (OS_CONFIG_EVENT_ENABLE == 1U)
 static void test_fanin_worker_entry(void *context);
@@ -651,6 +721,75 @@ static void test_task_lifecycle(void)
      * os_task_exit() trampoline) - no explicit os_task_delete() here, that would fail with
      * INVALID_ARG since the slot is already freed. Just confirm the self-exit completed. */
     AHURA_TEST_CHECK(test_wait_inactive(&worker, 200U), "the resumed worker terminates cleanly on its own");
+}
+
+/*
+ * ***********************************************************************************************************
+ * Task identity (id allocation)
+ * ***********************************************************************************************************
+*/
+
+/******************************************************************************************************/
+/**
+ * @brief Proves task ids are true identities, not just slot indices: no two simultaneously live
+ *        tasks ever share an id, and a deleted task's id is never handed to the task that reuses
+ *        its slot. That second property is what stops a stale handle from silently addressing a
+ *        different task - e.g. unlocking a mutex owned by whoever now occupies the slot.
+ */
+static void test_task_identity(void)
+{
+    uint32_t id_a;
+    uint32_t id_b;
+    uint32_t id_c;
+    uint32_t stale_id;
+    os_task_t stale_handle;
+
+    test_print_section("Task Identity (id allocation)");
+
+    g_worker_should_run = true;
+
+    /* Three tasks alive at once: their ids must all differ. */
+    AHURA_TEST_CHECK(os_task_create(&worker, OS_TASK_CONFIG(worker, test_worker_entry, NULL, 1U)) == OS_STATUS_OK,
+                      "identity task A created");
+    AHURA_TEST_CHECK(os_task_create(&helper, OS_TASK_CONFIG(helper, test_worker_entry, NULL, 1U)) == OS_STATUS_OK,
+                      "identity task B created");
+    AHURA_TEST_CHECK(os_task_create(&helper2, OS_TASK_CONFIG(helper2, test_worker_entry, NULL, 1U)) == OS_STATUS_OK,
+                      "identity task C created");
+
+    id_a = worker.id;
+    id_b = helper.id;
+    id_c = helper2.id;
+
+    AHURA_TEST_CHECK((id_a != 0U) && (id_b != 0U) && (id_c != 0U),
+                      "every live task has a nonzero id (%lu, %lu, %lu)",
+                      (unsigned long)id_a, (unsigned long)id_b, (unsigned long)id_c);
+    AHURA_TEST_CHECK((id_a != id_b) && (id_b != id_c) && (id_a != id_c),
+                      "no two simultaneously live tasks share an id (%lu, %lu, %lu)",
+                      (unsigned long)id_a, (unsigned long)id_b, (unsigned long)id_c);
+
+    /* Keep a copy of B's handle, then delete B so its table slot is recycled. */
+    stale_handle = helper;
+    stale_id     = helper.id;
+
+    AHURA_TEST_CHECK(os_task_delete(&helper) == OS_STATUS_OK, "identity task B deleted, freeing its slot");
+    AHURA_TEST_CHECK(os_task_state_get(&stale_handle) == OS_TASK_STATE_INACTIVE,
+                      "a stale handle to the deleted task reports INACTIVE");
+
+    /* The next task very likely lands in B's freed slot - but must not inherit B's id. */
+    AHURA_TEST_CHECK(os_task_create(&helper3, OS_TASK_CONFIG(helper3, test_worker_entry, NULL, 1U)) == OS_STATUS_OK,
+                      "identity task D created into the freed slot");
+    AHURA_TEST_CHECK(helper3.id != stale_id,
+                      "the task reusing a freed slot gets a fresh id, not the deleted task's (%lu vs %lu)",
+                      (unsigned long)helper3.id, (unsigned long)stale_id);
+    AHURA_TEST_CHECK(os_task_state_get(&stale_handle) == OS_TASK_STATE_INACTIVE,
+                      "the stale handle still resolves to nothing, not to the task that took the slot");
+
+    g_worker_should_run = false;
+    (void)os_task_delete(&worker);
+    (void)os_task_delete(&helper2);
+    (void)os_task_delete(&helper3);
+
+    AHURA_TEST_CHECK(os_task_state_get(&worker) == OS_TASK_STATE_INACTIVE, "identity tasks cleaned up");
 }
 
 /*
@@ -1584,6 +1723,108 @@ static void test_mutex_priority_inheritance(void)
                       "medium-priority task ran to completion once nothing outranked it any more (count=%lu)",
                       (unsigned long)g_inherit_medium_counter);
 }
+
+/******************************************************************************************************/
+/**
+ * @brief Blocks on the mutex named by its context, records its tag once granted, releases it.
+ *        Two of these run at different priorities against two different mutexes held by the same
+ *        owner - see test_mutex_multi_inheritance().
+ */
+static void test_inherit2_waiter_entry(void *context)
+{
+    const test_inherit2_ctx_t *ctx = (const test_inherit2_ctx_t *)context;
+
+    (void)os_mutex_lock(ctx->mutex, OS_WAIT_FOREVER);
+    g_inherit2_done_mask |= ctx->tag;
+    (void)os_mutex_unlock(ctx->mutex);
+}
+
+/******************************************************************************************************/
+/**
+ * @brief The case a single-mutex inheritance test cannot reach: ONE task holding TWO contended
+ *        mutexes at once.
+ *
+ * The test task holds mutex A and mutex B. Waiter HIGH (+2) blocks on A, then waiter HIGHER (+3)
+ * blocks on B, boosting the owner twice. Releasing B must drop the owner only to +2 - the boost
+ * mutex A's waiter is still owed - NOT all the way back to base. That distinction is the whole
+ * point of recomputing against every still-held mutex, and a "just revert to base_priority on
+ * unlock" implementation passes the single-mutex test while failing here: the medium task (+1)
+ * would get CPU time it must not have while A is still held and contended.
+ */
+static void test_mutex_multi_inheritance(void)
+{
+    os_status status;
+
+    test_print_section("Combined: Mutex Priority Inheritance across TWO held mutexes");
+
+    AHURA_TEST_CHECK(os_mutex_init(&g_inherit2_mutex_a) == OS_STATUS_OK, "mutex A initialized");
+    AHURA_TEST_CHECK(os_mutex_init(&g_inherit2_mutex_b) == OS_STATUS_OK, "mutex B initialized");
+
+    AHURA_TEST_CHECK(os_mutex_lock(&g_inherit2_mutex_a, OS_WAIT_NOTHING) == OS_STATUS_OK,
+                      "test task takes mutex A (at its own priority %u)", (unsigned)OS_CONFIG_TEST_PRIORITY);
+    AHURA_TEST_CHECK(os_mutex_lock(&g_inherit2_mutex_b, OS_WAIT_NOTHING) == OS_STATUS_OK,
+                      "test task takes mutex B as well - two mutexes held at once");
+
+    g_inherit2_done_mask     = 0U;
+    g_inherit_medium_counter = 0U;
+
+    g_inherit2_ctx[0].mutex = &g_inherit2_mutex_a;
+    g_inherit2_ctx[0].tag   = 1U;
+    g_inherit2_ctx[1].mutex = &g_inherit2_mutex_b;
+    g_inherit2_ctx[1].tag   = 2U;
+
+    /* HIGH blocks on A: boosts the owner to +2 (synchronously, inside os_task_start). */
+    status = os_task_create(&helper, OS_TASK_CONFIG(helper, test_inherit2_waiter_entry, &g_inherit2_ctx[0],
+                                                            OS_CONFIG_TEST_PRIORITY + 2U));
+    AHURA_TEST_CHECK(status == OS_STATUS_OK, "waiter HIGH created for mutex A (priority %u)",
+                      (unsigned)(OS_CONFIG_TEST_PRIORITY + 2U));
+    AHURA_TEST_CHECK(os_task_start(&helper) == OS_STATUS_OK, "waiter HIGH started");
+
+    /* HIGHER blocks on B: boosts the owner again, to +3. */
+    status = os_task_create(&helper2, OS_TASK_CONFIG(helper2, test_inherit2_waiter_entry, &g_inherit2_ctx[1],
+                                                             OS_CONFIG_TEST_PRIORITY + 3U));
+    AHURA_TEST_CHECK(status == OS_STATUS_OK, "waiter HIGHER created for mutex B (priority %u)",
+                      (unsigned)(OS_CONFIG_TEST_PRIORITY + 3U));
+    AHURA_TEST_CHECK(os_task_start(&helper2) == OS_STATUS_OK, "waiter HIGHER started");
+
+    AHURA_TEST_CHECK(g_inherit2_done_mask == 0U,
+                      "both waiters blocked on the held mutexes instead of finishing (mask=%lu)",
+                      (unsigned long)g_inherit2_done_mask);
+
+    /* Medium (+1) must stay starved for as long as ANY boost is in effect. */
+    status = os_task_create(&worker, OS_TASK_CONFIG(worker, test_inherit_medium_entry, NULL,
+                                                             OS_CONFIG_TEST_PRIORITY + 1U));
+    AHURA_TEST_CHECK(status == OS_STATUS_OK, "medium-priority task created (priority %u)",
+                      (unsigned)(OS_CONFIG_TEST_PRIORITY + 1U));
+    AHURA_TEST_CHECK(os_task_start(&worker) == OS_STATUS_OK, "medium-priority task started");
+    AHURA_TEST_CHECK(g_inherit_medium_counter == 0U,
+                      "medium task got no CPU while the owner is boosted to +3 (count=%lu)",
+                      (unsigned long)g_inherit_medium_counter);
+
+    /* Release B only. HIGHER wakes, takes B and finishes; the owner must settle at +2 (still
+     * owed to A's waiter), so medium STILL must not run. */
+    AHURA_TEST_CHECK(os_mutex_unlock(&g_inherit2_mutex_b) == OS_STATUS_OK, "test task releases mutex B");
+    AHURA_TEST_CHECK(test_wait_inactive(&helper2, 300U), "waiter HIGHER finished after B was released");
+    AHURA_TEST_CHECK((g_inherit2_done_mask & 2U) != 0U, "waiter HIGHER actually acquired mutex B");
+
+    AHURA_TEST_CHECK((g_inherit2_done_mask & 1U) == 0U,
+                      "waiter HIGH is still blocked - mutex A was never released");
+    AHURA_TEST_CHECK(g_inherit_medium_counter == 0U,
+                      "THE KEY CHECK: releasing B kept the boost A's waiter is still owed, so the "
+                      "medium task still got zero CPU (count=%lu)",
+                      (unsigned long)g_inherit_medium_counter);
+
+    /* Release A: no held mutex left, so the owner finally drops to base and medium is free. */
+    AHURA_TEST_CHECK(os_mutex_unlock(&g_inherit2_mutex_a) == OS_STATUS_OK,
+                      "test task releases mutex A, dropping the last boost to base priority");
+    AHURA_TEST_CHECK(test_wait_inactive(&helper, 300U), "waiter HIGH finished after A was released");
+    AHURA_TEST_CHECK((g_inherit2_done_mask & 1U) != 0U, "waiter HIGH actually acquired mutex A");
+
+    AHURA_TEST_CHECK(test_wait_inactive(&worker, 300U), "medium-priority task finished");
+    AHURA_TEST_CHECK(g_inherit_medium_counter == TEST_BURST_ITERATIONS,
+                      "medium task ran to completion once every boost was released (count=%lu)",
+                      (unsigned long)g_inherit_medium_counter);
+}
 #endif /* OS_CONFIG_MUTEX_ENABLE */
 
 #if (OS_CONFIG_QUEUE_ENABLE == 1U) && (OS_CONFIG_EVENT_ENABLE == 1U)
@@ -2368,6 +2609,227 @@ static void test_tickless_sleep(void)
 
 /*
  * ***********************************************************************************************************
+ * Benchmarks
+ * ***********************************************************************************************************
+*/
+
+/******************************************************************************************************/
+/**
+ * @brief Print one benchmark row from a measured minimum cycle count.
+ *
+ * @param[in] name      Operation label.
+ * @param[in] cycles    Minimum cycles observed, measurement overhead already subtracted.
+ * @param[in] clock_hz  CPU clock for the ns conversion, 0 when unknown.
+ */
+static void test_bench_row(const char *name, uint32_t cycles, uint32_t clock_hz)
+{
+    if (clock_hz != 0U)
+    {
+        /* 64-bit throughout: a slow core with a big cycle count would overflow 32 bits here. */
+        uint64_t ns = ((uint64_t)cycles * 1000000000ULL) / (uint64_t)clock_hz;
+
+        printf("  %-40s %10lu %10lu\r\n", name, (unsigned long)cycles, (unsigned long)ns);
+    }
+    else
+    {
+        printf("  %-40s %10lu %10s\r\n", name, (unsigned long)cycles, "n/a");
+    }
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Timed cost of every hot kernel path, printed as a table at the end of the run.
+ *
+ * All measurements are UNCONTENDED fast paths (no blocking, no waiter wakeups) - the cost an
+ * application pays per call in the common case. Every row includes the loop's own overhead, so
+ * the first row measures an empty loop: subtract it to get the kernel call's own cost.
+ *
+ * These are real numbers from real silicon, not estimates, but they depend on the compiler's
+ * optimization level, flash wait states / caching, and whatever else the board is doing - treat
+ * them as a baseline to track regressions against, not as absolute specifications.
+ */
+static void test_benchmarks(void)
+{
+    volatile uint32_t sink = 0U;
+    uint32_t          best;
+    uint32_t          overhead;
+    uint32_t          clock_hz = os_clock_hz_get_cb();
+
+    printf("\r\n========================================\r\n");
+    printf(" BENCHMARKS\r\n");
+    printf("========================================\r\n");
+
+    /* Architecture profile from the compiler's own target macros - the same ones the port
+     * layer selects on, so this always names the code actually running. */
+    printf("  core      : ");
+#if defined(__ARM_ARCH_6M__)
+    printf("ARMv6-M (Cortex-M0/M0+)");
+#elif defined(__ARM_ARCH_7M__)
+    printf("ARMv7-M (Cortex-M3)");
+#elif defined(__ARM_ARCH_7EM__)
+    printf("ARMv7E-M (Cortex-M4/M7)");
+#elif defined(__ARM_ARCH_8M_BASE__)
+    printf("ARMv8-M baseline (Cortex-M23)");
+#elif defined(__ARM_ARCH_8M_MAIN__)
+    printf("ARMv8-M mainline (Cortex-M33/M35P)");
+#elif defined(__ARM_ARCH_8_1M_MAIN__)
+    printf("ARMv8.1-M mainline (Cortex-M52/M55/M85)");
+#else
+    printf("unknown ARM profile");
+#endif
+#if defined(__ARM_FP)
+    printf(", FPU");
+#else
+    printf(", no FPU");
+#endif
+#if defined(__ARM_FEATURE_MVE)
+    printf(", MVE");
+#elif defined(__ARM_FEATURE_DSP)
+    printf(", DSP");
+#endif
+#if (OS_CONFIG_TRUSTZONE == OS_CONFIG_TRUSTZONE_SECURE)
+    printf(", TrustZone secure");
+#elif (OS_CONFIG_TRUSTZONE == OS_CONFIG_TRUSTZONE_NON_SECURE)
+    printf(", TrustZone non-secure");
+#endif
+    printf("\r\n");
+
+    /* GCC exposes no macro for the numeric -O level, only these category flags, so report the
+     * category rather than guessing a number that could be wrong. */
+    printf("  build     : ");
+#if !defined(__OPTIMIZE__)
+    printf("-O0, NO optimization - expect several times slower than a release build");
+#elif defined(__OPTIMIZE_SIZE__)
+    printf("-Os, optimized for size");
+#else
+    printf("-O1/-O2/-O3, optimized for speed");
+#endif
+    printf(", %u-bit\r\n", (unsigned)(sizeof(void *) * 8U));
+
+    printf("  clocks    : tick %lu Hz", (unsigned long)OS_CONFIG_TICK_HZ);
+    if (clock_hz != 0U)
+    {
+        printf(", CPU %lu Hz\r\n", (unsigned long)clock_hz);
+    }
+    else
+    {
+        printf(", CPU clock unknown (cycles/op unavailable)\r\n");
+    }
+
+    printf("\r\n  Each operation is measured alone with the CPU cycle counter, sampled %u times,\r\n",
+           (unsigned)TEST_BENCH_SAMPLES);
+    printf("  keeping the MINIMUM. Interference (the 1 kHz tick ISR, cache misses) only ever adds\r\n");
+    printf("  cycles, so the minimum is the true uninterrupted cost. The cost of the two counter\r\n");
+    printf("  reads is measured the same way and already subtracted from every row below.\r\n\r\n");
+
+    printf("  %-40s %10s %10s\r\n", "Operation (uncontended fast path)", "cycles", "ns");
+    printf("  ------------------------------------------------------------\r\n");
+
+    /* Cost of the measurement itself: two counter reads with nothing between them. Subtracted
+     * from every row, so a row shows the operation's own cycles and nothing else. */
+    TEST_BENCH_MIN_CYCLES(overhead, TEST_BENCH_SAMPLES, (void)0);
+    test_bench_row("(measurement overhead, subtracted)", overhead, clock_hz);
+
+    TEST_BENCH_MIN_CYCLES(best, TEST_BENCH_SAMPLES, sink += os_tick_get());
+    test_bench_row("os_tick_get", TEST_BENCH_SUB(best, overhead), clock_hz);
+
+    TEST_BENCH_MIN_CYCLES(best, TEST_BENCH_SAMPLES, os_critical_enter(); os_critical_exit());
+    test_bench_row("os_critical_enter + exit", TEST_BENCH_SUB(best, overhead), clock_hz);
+
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+    if (os_mutex_init(&g_bench_mutex) == OS_STATUS_OK)
+    {
+        TEST_BENCH_MIN_CYCLES(best, TEST_BENCH_SAMPLES,
+                              (void)os_mutex_lock(&g_bench_mutex, OS_WAIT_FOREVER);
+                              (void)os_mutex_unlock(&g_bench_mutex));
+        test_bench_row("os_mutex_lock + unlock", TEST_BENCH_SUB(best, overhead), clock_hz);
+
+        TEST_BENCH_MIN_CYCLES(best, TEST_BENCH_SAMPLES,
+                              (void)os_mutex_try_lock(&g_bench_mutex);
+                              (void)os_mutex_unlock(&g_bench_mutex));
+        test_bench_row("os_mutex_try_lock + unlock", TEST_BENCH_SUB(best, overhead), clock_hz);
+    }
+#endif
+
+#if (OS_CONFIG_SEMAPHORE_ENABLE == 1U)
+    if (os_semaphore_init(&g_bench_sem, 0U, 1U) == OS_STATUS_OK)
+    {
+        TEST_BENCH_MIN_CYCLES(best, TEST_BENCH_SAMPLES,
+                              (void)os_semaphore_give(&g_bench_sem);
+                              (void)os_semaphore_take(&g_bench_sem, OS_WAIT_NOTHING));
+        test_bench_row("os_semaphore_give + take", TEST_BENCH_SUB(best, overhead), clock_hz);
+    }
+#endif
+
+#if (OS_CONFIG_QUEUE_ENABLE == 1U)
+    if (os_queue_init(&g_bench_queue, g_bench_queue_buf, sizeof(g_bench_queue_buf[0]),
+                       sizeof(g_bench_queue_buf) / sizeof(g_bench_queue_buf[0])) == OS_STATUS_OK)
+    {
+        uint32_t item = 0x5A5A5A5AUL;
+        uint32_t out;
+
+        TEST_BENCH_MIN_CYCLES(best, TEST_BENCH_SAMPLES,
+                              (void)os_queue_send(&g_bench_queue, &item, OS_WAIT_NOTHING);
+                              (void)os_queue_receive(&g_bench_queue, &out, OS_WAIT_NOTHING));
+        test_bench_row("os_queue_send + receive (4-byte item)", TEST_BENCH_SUB(best, overhead), clock_hz);
+    }
+#endif
+
+#if (OS_CONFIG_EVENT_ENABLE == 1U)
+    if (os_event_group_init(&g_bench_event) == OS_STATUS_OK)
+    {
+        uint32_t matched;
+
+        TEST_BENCH_MIN_CYCLES(best, TEST_BENCH_SAMPLES,
+                              (void)os_event_group_set_bits(&g_bench_event, 0x01U);
+                              (void)os_event_group_wait_bits(&g_bench_event, 0x01U, false, true,
+                                                              &matched, OS_WAIT_NOTHING));
+        test_bench_row("os_event_group_set + wait (immediate)", TEST_BENCH_SUB(best, overhead), clock_hz);
+    }
+#endif
+
+#if (OS_CONFIG_TASK_NOTIFY_ENABLE == 1U)
+    /* Created but never started: give() then only latches, which is exactly the ISR-side cost
+     * an application cares about (the wake path is a context switch, measured below). */
+    if (os_task_create(&helper, OS_TASK_CONFIG(helper, test_worker_entry, NULL, 1U)) == OS_STATUS_OK)
+    {
+        TEST_BENCH_MIN_CYCLES(best, TEST_BENCH_SAMPLES, (void)os_task_notify_give(&helper, 1U));
+        test_bench_row("os_task_notify_give (latch, no wake)", TEST_BENCH_SUB(best, overhead), clock_hz);
+
+        (void)os_task_delete(&helper);
+    }
+#endif
+
+#if (OS_CONFIG_ALLOC_ENABLE == 1U)
+    {
+        void *p;
+
+        TEST_BENCH_MIN_CYCLES(best, TEST_BENCH_SAMPLES, p = os_mem_alloc(64U); os_mem_free(p));
+        test_bench_row("os_mem_alloc + os_mem_free (64 B)", TEST_BENCH_SUB(best, overhead), clock_hz);
+    }
+#endif
+
+    /* os_task_yield always pends PendSV, so this is a FULL context-switch round trip - register
+     * save, scheduler pick, register restore - that happens to re-select this same task because
+     * nothing else is ready. That makes it the cleanest single-number context-switch cost:
+     * no second task's cache/branch-predictor effects mixed in. */
+    TEST_BENCH_MIN_CYCLES(best, TEST_BENCH_SAMPLES, os_task_yield());
+    test_bench_row("os_task_yield (switch, re-selects self)", TEST_BENCH_SUB(best, overhead), clock_hz);
+
+    TEST_BENCH_MIN_CYCLES(best, TEST_BENCH_HEAVY_SAMPLES,
+                          if (os_task_create(&helper, OS_TASK_CONFIG(helper, test_worker_entry,
+                                                                      NULL, 1U)) == OS_STATUS_OK)
+                          {
+                              (void)os_task_delete(&helper);
+                          });
+    test_bench_row("os_task_create + os_task_delete", TEST_BENCH_SUB(best, overhead), clock_hz);
+
+    printf("  ------------------------------------------------------------\r\n");
+    (void)sink;
+}
+
+/*
+ * ***********************************************************************************************************
  * Intrusive list (always compiled in - the scheduler runs on it)
  * ***********************************************************************************************************
 */
@@ -2462,6 +2924,7 @@ void os_test(void)
     test_delay();
     test_critical_section();
     test_task_lifecycle();
+    test_task_identity();
     test_priority_preemption();
 
 #if (OS_CONFIG_MUTEX_ENABLE == 1U)
@@ -2503,6 +2966,7 @@ void os_test(void)
 #endif
 #if (OS_CONFIG_MUTEX_ENABLE == 1U)
     test_mutex_priority_inheritance();
+    test_mutex_multi_inheritance();
 #endif
 #if (OS_CONFIG_QUEUE_ENABLE == 1U) && (OS_CONFIG_EVENT_ENABLE == 1U)
     test_event_queue_fanin();
@@ -2527,5 +2991,10 @@ void os_test(void)
     printf(" RESULT: %lu passed, %lu failed (of %lu checks)\r\n", (unsigned long)g_pass_count,
            (unsigned long)g_fail_count, (unsigned long)(g_pass_count + g_fail_count));
     printf("%s\r\n", (g_fail_count == 0U) ? " ALL RTOS FEATURES VERIFIED OK" : " SOME CHECKS FAILED - see log above");
-    printf("========================================\r\n\r\n");
+    printf("========================================\r\n");
+
+    /* Last, so the timings are the final thing on the console and are not interleaved with
+     * PASS/FAIL lines: benchmarks report numbers, they do not pass or fail. */
+    test_benchmarks();
+    printf("\r\n");
 }

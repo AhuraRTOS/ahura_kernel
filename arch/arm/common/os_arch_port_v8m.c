@@ -198,10 +198,11 @@ __asm(
 extern void     os_task_exit(void);
 extern uint32_t os_task_current_id_get(void);
 
-/* Bottom of the main (handler) stack. CMSIS linker scripts name it
- * __StackLimit, stock STM32CubeMX scripts provide _sstack; both are weak
- * references so either script family works unmodified. When neither symbol
- * exists both resolve to address 0 and the MSPLIM guard is skipped. */
+/* Bottom of the main (handler) stack, under the two names linker scripts
+ * commonly give it (__StackLimit in CMSIS-style scripts, _sstack in several
+ * vendor-generated ones). Both are weak references, so either naming works
+ * unmodified; when neither symbol exists both resolve to address 0 and the
+ * MSPLIM guard is skipped. */
 extern uint32_t __StackLimit OS_WEAK;
 extern uint32_t _sstack      OS_WEAK;
 

@@ -144,9 +144,9 @@ typedef struct
  */
 typedef struct
 {
-    bool      locked;   /**< True while held.                                  */
-    uint32_t  owner_id; /**< Task id of the holder, 0 when free/unknown owner. */
-    os_list_t waiters;  /**< Tasks blocked waiting for the mutex.              */
+    bool           locked;     /**< True while held.                                  */
+    uint32_t       owner_id;   /**< Task id of the holder, 0 when free/unknown owner. */
+    os_list_t      waiters;    /**< Tasks blocked waiting for the mutex.              */
     os_list_node_t owner_node; /**< Links into the owner's owned-mutex list (priority inheritance). */
 
 } os_mutex_t;
@@ -463,10 +463,6 @@ os_status os_task_stack_watermark_get(const os_task_t *task, size_t *min_free_by
 /**
  * @brief Deliver a value to a task's notification mailbox (overwrite: last write wins), waking
  *        it if it is currently blocked in os_task_notify_wait; ISR-safe.
- *
- * @param[in] task   Target task (must have been created via os_task_create).
- * @param[in] value  Value to store; delivered to the task's next os_task_notify_wait.
- * @return os_status  OK, or INVALID_ARG for a NULL/stale task handle.
  */
 os_status os_task_notify_give(os_task_t *task, uint32_t value);
 
@@ -474,11 +470,6 @@ os_status os_task_notify_give(os_task_t *task, uint32_t value);
 /**
  * @brief Wait for this task's notification mailbox, up to timeout_ms. Task-only (like
  *        os_mutex_lock, an ISR has no task identity of its own to wait as).
- *
- * @param[in]  timeout_ms  OS_WAIT_NOTHING, a duration in ms, or OS_WAIT_FOREVER.
- * @param[out] value_out   Set to the delivered value on OS_STATUS_OK.
- * @return os_status  OK on delivery, EMPTY when unavailable without waiting, TIMEOUT when the
- *                     wait elapsed, INVALID_ARG from an ISR.
  */
 os_status os_task_notify_wait(uint32_t timeout_ms, uint32_t *value_out);
 #endif /* OS_CONFIG_TASK_NOTIFY_ENABLE */
@@ -512,31 +503,22 @@ void os_tickless_post_sleep_cb(void);
 
 /******************************************************************************************************/
 /**
- * @brief Execute one tickless-idle pass: suppress ticking for the next known-idle
- *        duration, sleep, and announce the real elapsed time on wake. A no-op when
- *        OS_CONFIG_TICKLESS_ENABLE is 0. Not yet called by the idle task (see the
- *        README "Tickless idle" section) - exposed here so it can be exercised
- *        directly (e.g. by the self-test suite) ahead of that wiring.
+ * @brief Execute one tickless-idle pass: suppress ticking for the next known-idle duration,
+ *        sleep, and announce the real elapsed time on wake.
  */
 void os_tickless_idle_process(void);
 
 /******************************************************************************************************/
 /**
- * @brief Ticks the kernel would plan to suppress right now: the minimum of the next software-
- *        timer expiry, the next ready work item, the next finite-delay task sleeper, and
- *        OS_CONFIG_MAX_SUPPRESSED_TICKS. 0 when OS_CONFIG_TICKLESS_ENABLE is 0. Exposed for
- *        diagnostics/tests - os_tickless_idle_process() calls this internally.
+ * @brief Ticks the kernel would plan to suppress right now, bounded by the earliest kernel
+ *        time source (timer expiry, ready work item, finite-delay sleeper).
  */
 uint32_t os_tickless_expected_idle_ticks_get(void);
 
 /******************************************************************************************************/
 /**
- * @brief Maximum ticks the active arch port can suppress in a single tickless window right now -
- *        register-width limited (e.g. SysTick's 24-bit reload), so it varies with the platform
- *        clock and OS_CONFIG_TICK_HZ, not a fixed constant. 0 when OS_CONFIG_TICKLESS_ENABLE is 0
- *        or the active port does not yet suppress ticking for real (see README "Tickless idle").
- *        Callers that need a tickless test/demo to work across platforms and clock speeds should
- *        derive their horizon from this rather than assuming any fixed tick count.
+ * @brief Maximum ticks the active arch port can suppress in one tickless window, given the
+ *        platform clock and OS_CONFIG_TICK_HZ (not a fixed constant).
  */
 uint32_t os_tickless_max_suppressed_ticks_get(void);
 

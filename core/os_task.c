@@ -42,13 +42,11 @@
 
 typedef struct
 {
-    const char      *name;
+    const char      *name;         /* not read by the kernel: kept for debugger/trace visibility */
     uint8_t         *stack_base;
     uint32_t        *stack_ptr;
     size_t          stack_bytes;
     uint32_t        priority;
-    os_task_entry_t entry;
-    void            *context;
     uint32_t        id;
     uint32_t        delay_ticks;
     uint32_t        core_affinity; /* bitmask of cores the task may run on, 0 = any */
@@ -116,7 +114,6 @@ static void           os_task_stack_fill(uint8_t *stack_base, size_t stack_bytes
 static void           os_task_idle_entry(void *context);
 static void           os_task_tcb_clear(os_task_tcb_t *tcb);
 static os_task_tcb_t* os_task_find_by_id(uint32_t id);
-static uint32_t       os_task_find_index_by_id(uint32_t id);
 static void           os_task_make_ready(os_task_tcb_t *tcb);
 static void           os_task_unlink(os_task_tcb_t *tcb);
 static void           os_task_preempt_request(const os_task_tcb_t *tcb);
@@ -321,7 +318,6 @@ os_status os_task_pause(os_task_t *task)
 os_status os_task_delete(os_task_t *task)
 {
     uint32_t      core = os_arch_core_id_get();
-    uint32_t      index;
     os_task_tcb_t *tcb;
     bool          is_self;
 
@@ -336,7 +332,9 @@ os_status os_task_delete(os_task_t *task)
             return (tcb == &os_task_idle_tcb[core]) ? OS_STATUS_BUSY : OS_STATUS_INVALID_ARG;
         }
 
-        index = os_task_find_index_by_id(tcb->id);
+        /* Re-resolve through the table: confirms the running task really owns
+         * a live table slot before its TCB is torn down. */
+        tcb = os_task_find_by_id(tcb->id);
     }
     else if (task->id == 0U)
     {
@@ -345,16 +343,15 @@ os_status os_task_delete(os_task_t *task)
     }
     else
     {
-        index = os_task_find_index_by_id(task->id);
+        tcb = os_task_find_by_id(task->id);
     }
 
-    if (index >= OS_CONFIG_MAX_TASKS)
+    if (tcb == NULL)
     {
         os_critical_exit();
         return OS_STATUS_INVALID_ARG;
     }
 
-    tcb     = &os_task_table[index];
     is_self = (tcb == os_task_current[core]);
 
     /* A task executing on another core cannot be deleted from here: its
@@ -1098,8 +1095,8 @@ void os_task_mutex_owner_unlink_and_reprioritize(os_list_node_t *owner_node)
 
     for (node = current->owned_mutexes.head; node != NULL; node = node->next)
     {
-        const os_mutex_t      *held       = OS_MUTEX_FROM_OWNER_NODE(node);
-        const os_list_node_t  *top_waiter = held->waiters.head;
+        const os_mutex_t *held       = OS_MUTEX_FROM_OWNER_NODE(node);
+        os_list_node_t   *top_waiter = held->waiters.head;
 
         if (top_waiter != NULL)
         {
@@ -1282,8 +1279,6 @@ os_status os_task_idle_create(void)
 #if (OS_CONFIG_MUTEX_ENABLE == 1U)
         tcb->base_priority = OS_TASK_PRIO_IDLE;
 #endif
-        tcb->entry         = os_task_idle_entry;
-        tcb->context       = NULL;
         tcb->id            = 0U;
         tcb->delay_ticks   = 0U;
         tcb->core_affinity = (1UL << core);
@@ -1546,8 +1541,7 @@ static os_status os_task_create_any(os_task_t *task, const os_task_config_t *con
             /* Skip ids still owned by live tasks: the counter wraps at 2^32,
              * and a reused id would hand the new task another task's
              * identity (e.g. the right to unlock a dead owner's mutex). */
-            while ((os_task_next_id == 0U) ||
-                   (os_task_find_index_by_id(os_task_next_id) < OS_CONFIG_MAX_TASKS))
+            while ((os_task_next_id == 0U) || (os_task_find_by_id(os_task_next_id) != NULL))
             {
                 os_task_next_id++;
             }
@@ -1560,8 +1554,6 @@ static os_status os_task_create_any(os_task_t *task, const os_task_config_t *con
 #if (OS_CONFIG_MUTEX_ENABLE == 1U)
             tcb->base_priority    = config->priority;
 #endif
-            tcb->entry            = config->entry;
-            tcb->context          = config->context;
             tcb->id               = os_task_next_id;
             tcb->delay_ticks      = 0U;
             tcb->core_affinity    = config->core_affinity;
@@ -1635,8 +1627,6 @@ static void os_task_tcb_clear(os_task_tcb_t *tcb)
     tcb->stack_ptr   = NULL;
     tcb->stack_bytes = 0U;
     tcb->priority    = 0U;
-    tcb->entry       = (os_task_entry_t)0;
-    tcb->context     = NULL;
     tcb->id            = 0U;
     tcb->delay_ticks   = 0U;
     tcb->core_affinity = OS_TASK_CORE_ANY;
@@ -1674,26 +1664,15 @@ static void os_task_tcb_clear(os_task_tcb_t *tcb)
 
 /******************************************************************************************************/
 /**
- * @brief Find a task by its ID.
+ * @brief Find a live task by its ID.
+ *
+ * A slot only counts as live while its state is not INACTIVE, so a recycled or never-created
+ * slot can never be matched by a stale id.
  *
  * @param[in] id  Task ID.
  * @return os_task_tcb_t*  Pointer to the task control block, or NULL if not found.
  */
 static os_task_tcb_t* os_task_find_by_id(uint32_t id)
-{
-    uint32_t index = os_task_find_index_by_id(id);
-
-    return (index < OS_CONFIG_MAX_TASKS) ? &os_task_table[index] : NULL;
-}
-
-/******************************************************************************************************/
-/**
- * @brief Find the index of a task by its ID.
- *
- * @param[in] id  Task ID.
- * @return uint32_t  Index of the task in the task table, or OS_CONFIG_MAX_TASKS if not found.
- */
-static uint32_t os_task_find_index_by_id(uint32_t id)
 {
     uint32_t index;
 
@@ -1701,11 +1680,11 @@ static uint32_t os_task_find_index_by_id(uint32_t id)
     {
         if ((os_task_table[index].state != OS_TASK_STATE_INACTIVE) && (os_task_table[index].id == id))
         {
-            return index;
+            return &os_task_table[index];
         }
     }
 
-    return OS_CONFIG_MAX_TASKS;
+    return NULL;
 }
 
 /******************************************************************************************************/

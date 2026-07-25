@@ -31,13 +31,11 @@ static os_task_t           os_work_task_handle;
  * (submit and the tick-time expiry path) skips the id lookup. */
 static void                *os_work_task_tcb = NULL;
 
-/* Registry of submitted work items, advanced on every kernel tick. Fixed
- * slots so tick-time iteration stays safe against concurrent submit/cancel.
- * The slot (the pointer itself) is what the ISR and tasks race on, so the
- * typedef lets __IO qualify the slot rather than the pointed-to item. */
-typedef os_work_t *os_work_slot_t;
-
-static __IO os_work_slot_t os_work_registry[OS_CONFIG_MAX_WORKS];
+/* Registry of submitted work items, advanced on every kernel tick. Fixed slots
+ * so tick-time iteration stays safe against concurrent submit/cancel. The slot
+ * (the pointer itself) is what the ISR and tasks race on, so __IO sits after
+ * the '*' to qualify the slot rather than the pointed-to item. */
+static os_work_t * __IO    os_work_registry[OS_CONFIG_MAX_WORKS];
 
 /*
  * ***********************************************************************************************************

@@ -162,6 +162,24 @@ extern "C"
 
 #define OS_ARCH_REG_ICSR                  (*(__IO uint32_t *)0xE000ED04UL)
 #define OS_ARCH_ICSR_PENDSVSET_MSK        (1UL << 28)
+
+/* Byte-addressable priority register banks, indexed rather than read as whole
+ * words (os_arch_isr_priority_check reads one exception's priority byte):
+ *   NVIC_IPR   one byte per external interrupt, indexed by IRQ number
+ *              (IPSR value - OS_ARCH_IPSR_IRQ_BASE).
+ *   SHPR       one byte per configurable-priority system handler, indexed by
+ *              (IPSR value - OS_ARCH_IPSR_SYSHANDLER_BASE); the bank starts at
+ *              SHPR1, whose first byte is exception number 4 (MemManage). */
+#define OS_ARCH_REG_NVIC_IPR_BASE         ((__I uint8_t *)0xE000E400UL)
+#define OS_ARCH_REG_SHPR_BASE             ((__I uint8_t *)0xE000ED18UL)
+
+/* IPSR exception-number boundaries: 0 = thread mode, 1..15 = system
+ * exceptions, 16+ = external interrupts (IRQ n is IPSR 16 + n). */
+#define OS_ARCH_IPSR_THREAD_MODE          0U
+#define OS_ARCH_IPSR_SYSHANDLER_BASE      4U   /* MemManage: first byte of the SHPR bank */
+#define OS_ARCH_IPSR_SVCALL               11U
+#define OS_ARCH_IPSR_IRQ_BASE             16U
+
 #define OS_ARCH_STACK_ALIGNMENT_BYTES     4U
 #define OS_ARCH_DSB()                     __asm volatile("dsb 0xF" ::: "memory")
 #define OS_ARCH_ISB()                     __asm volatile("isb 0xF" ::: "memory")
@@ -328,17 +346,17 @@ static inline void os_arch_isr_priority_check(void)
 
     __asm volatile("mrs %0, ipsr" : "=r"(ipsr));
 
-    if (ipsr == 0U)
+    if (ipsr == OS_ARCH_IPSR_THREAD_MODE)
     {
         return; /* task context */
     }
 
-    if (ipsr >= 16U)
+    if (ipsr >= OS_ARCH_IPSR_IRQ_BASE)
     {
         /* External interrupt: priority byte in NVIC_IPR. */
-        priority = (uint32_t)(*(__I uint8_t *)(0xE000E400UL + (ipsr - 16U)));
+        priority = (uint32_t)OS_ARCH_REG_NVIC_IPR_BASE[ipsr - OS_ARCH_IPSR_IRQ_BASE];
     }
-    else if (ipsr >= 4U)
+    else if (ipsr >= OS_ARCH_IPSR_SYSHANDLER_BASE)
     {
         /* Configurable-priority system handler (MemManage, BusFault,
          * UsageFault, SecureFault, DebugMonitor): priority byte in
@@ -347,12 +365,12 @@ static inline void os_arch_isr_priority_check(void)
          * here. SVCall (11) is kernel-owned at the highest priority and
          * calls no kernel API; PendSV/SysTick (14/15) are kernel-owned at
          * the lowest priority and pass the comparison anyway. */
-        if (ipsr == 11U)
+        if (ipsr == OS_ARCH_IPSR_SVCALL)
         {
             return;
         }
 
-        priority = (uint32_t)(*(__I uint8_t *)(0xE000ED18UL + (ipsr - 4U)));
+        priority = (uint32_t)OS_ARCH_REG_SHPR_BASE[ipsr - OS_ARCH_IPSR_SYSHANDLER_BASE];
     }
     else
     {
