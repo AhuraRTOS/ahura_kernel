@@ -356,7 +356,7 @@ void os_arch_start_first_task(void)
  */
 void os_arch_tick_init(void)
 {
-    uint32_t clock_hz = os_clock_hz_get_cb();
+    uint32_t clock_hz = os_arch_clock_hz_get();
     uint32_t reload_value;
 
     if ((clock_hz == 0U) || (OS_CONFIG_TICK_HZ == 0U))
@@ -484,7 +484,7 @@ uint32_t os_arch_elapsed_ticks_get(void)
          * actually programmed for this window. */
         cvr            = OS_ARCH_REG_SYST_CVR & OS_ARCH_SYST_RVR_RELOAD_MSK;
         elapsed_cycles = (os_arch_suppressed_reload_cycles - 1U) - cvr;
-        clock_hz       = os_clock_hz_get_cb();
+        clock_hz       = os_arch_clock_hz_get();
 
         if (clock_hz == 0U)
         {
@@ -569,7 +569,7 @@ void os_arch_sleep_prepare(uint32_t planned_ticks)
         return;
     }
 
-    clock_hz = os_clock_hz_get_cb();
+    clock_hz = os_arch_clock_hz_get();
 
     /* No usable clock, or the normal tick was never actually set up
      * (os_arch_tick_init bailed at boot): nothing safe to reprogram. */

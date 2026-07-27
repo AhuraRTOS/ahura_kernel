@@ -2,9 +2,9 @@
  * @file os_test.c
  * @brief Boot-time self-test suite for the Ahura RTOS kernel.
  *
- * Strong override of the weak os_test() (declared in ahura.h, empty default in os_kernel.c; not
- * named with the "_cb" suffix - this is where the suite's own code runs, not a kernel query for
- * platform behavior): link this file's library (ahura_kernel/test, target "os_test") and, when
+ * Supplies os_test() (declared in ahura.h, defined nowhere else in the kernel; not named with the
+ * "_cb" suffix - this is where the suite's own code runs, not a kernel query for platform
+ * behavior): link this file's library (ahura_kernel/test, target "os_test") and, when
  * OS_CONFIG_TEST_ENABLE is 1, os_init() creates a task that calls this automatically - no explicit
  * call needed from the application. Runs once, exercises whichever OS_CONFIG_<FEATURE>_ENABLE
  * switches are on, and
@@ -17,6 +17,7 @@
 
 #include <stdio.h>
 #include <stdbool.h>
+#include <string.h>
 
 /*
  * ***********************************************************************************************************
@@ -61,6 +62,27 @@ static volatile uint32_t g_busy_counter    = 0U;
 static volatile bool     g_busy_should_run = true;
 
 #define TEST_BURST_ITERATIONS 200000UL
+
+/*
+ * Helper priorities, expressed relative to the test task rather than hardcoded.
+ *
+ * Several tests need a task that provably cannot run while the test task is runnable (LOW), or
+ * one that provably preempts it (HIGH). Spelling those as literal 1 and 3 silently stopped
+ * meaning that the moment OS_CONFIG_TEST_PRIORITY was not 2: a LOW helper written as 1 became a
+ * PEER of a test task at priority 1, the two round-robined, and "the spinner never advanced"
+ * failed by hundreds of microseconds of spinner time with nothing in the test looking wrong.
+ *
+ * OS_TASK_PRIO_USER_MIN is the floor for user tasks, so a test task sitting on it has no room
+ * underneath at all. test_priority_preemption checks that requirement rather than clamping:
+ * quietly nudging the priorities would keep the suite green while no longer testing preemption.
+ *
+ * Checked at run time, not with #error: OS_TASK_PRIO_* are enum constants rather than macros, so
+ * the preprocessor cannot see their values at all. It substitutes 0 for the unknown identifier and
+ * compares that instead, which makes any #if arithmetic over them quietly meaningless - it fires
+ * or stays silent for reasons unrelated to the configured priority.
+ */
+#define TEST_PRIO_LOW  (OS_CONFIG_TEST_PRIORITY - 1U)
+#define TEST_PRIO_HIGH (OS_CONFIG_TEST_PRIORITY + 1U)
 
 /*
  * Benchmarks are timed with the CPU cycle counter (os_arch_cycle_count_get), not the kernel
@@ -149,6 +171,18 @@ static volatile uint32_t g_periodic_fired = 0U;
 static os_work_t         g_work;
 static volatile bool     g_work_ran       = false;
 static volatile uint32_t g_work_run_count = 0U;
+#endif
+
+#if (OS_CONFIG_LOG_ENABLE == 1U)
+/* Capture buffer for test_log(): this file defines os_log_output_cb, overriding the kernel's
+ * weak default, so the log task hands its bytes here instead of to a UART. Kept small on
+ * purpose - only the most recent output needs inspecting. */
+#define TEST_LOG_CAPTURE_SIZE 512U
+
+static char              g_log_capture[TEST_LOG_CAPTURE_SIZE];
+static volatile size_t   g_log_capture_len   = 0U;
+static volatile uint32_t g_log_capture_lines = 0U;
+static volatile bool     g_log_capture_on    = false;
 #endif
 
 #if (OS_CONFIG_TASK_NOTIFY_ENABLE == 1U)
@@ -327,6 +361,11 @@ static void test_timer(void);
 #if (OS_CONFIG_WORK_ENABLE == 1U)
 static void test_work(void);
 #endif
+static void test_assert(void);
+static void test_log(void);
+#if (OS_CONFIG_LOG_ENABLE == 1U)
+static bool test_log_capture_contains(const char *needle);
+#endif
 #if (OS_CONFIG_TASK_NOTIFY_ENABLE == 1U)
 static void test_notify_wait_entry(void *context);
 static void test_notify_unrelated_block_entry(void *context);
@@ -385,6 +424,54 @@ static void      test_stress_timer_churn(void);
  * Shared helpers
  * ***********************************************************************************************************
 */
+
+/******************************************************************************************************/
+/**
+ * @brief Poll (bounded) until a task reports INACTIVE, i.e. it has fully self-terminated
+ *        and its stack is free to reuse for the next helper.
+ */
+#if (OS_CONFIG_LOG_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Strong override of the kernel's weak log output hook: captures what tsk_log would have
+ *        transmitted so test_log() can inspect it, and echoes it to the console.
+ *
+ * Runs on tsk_log, outside any critical section, exactly as a real transport would.
+ */
+void os_log_output_cb(const uint8_t *data, size_t length)
+{
+    size_t i;
+
+    for (i = 0U; i < length; i++)
+    {
+        char c = (char)data[i];
+
+        if (g_log_capture_on && (g_log_capture_len < (TEST_LOG_CAPTURE_SIZE - 1U)))
+        {
+            g_log_capture[g_log_capture_len] = c;
+            g_log_capture_len++;
+        }
+
+        if (c == '\n')
+        {
+            g_log_capture_lines++;
+        }
+    }
+
+    g_log_capture[g_log_capture_len] = '\0';
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Whether the captured log output contains the given text.
+ */
+static bool test_log_capture_contains(const char *needle)
+{
+    g_log_capture[TEST_LOG_CAPTURE_SIZE - 1U] = '\0';
+
+    return (strstr((const char *)g_log_capture, needle) != NULL);
+}
+#endif /* OS_CONFIG_LOG_ENABLE */
 
 /******************************************************************************************************/
 /**
@@ -810,13 +897,25 @@ static void test_priority_preemption(void)
     uint32_t  snapshot_immediate;
     uint32_t  snapshot_after;
     os_status status;
+    os_status start_status;
 
     test_print_section("Priority-Based Preemption");
 
+    /* Everything below rests on the test task having room underneath it. Reported as its own
+     * check so a misconfigured priority says exactly that, instead of surfacing as a spinner
+     * that mysteriously kept counting. */
+    AHURA_TEST_CHECK(OS_CONFIG_TEST_PRIORITY >= OS_TASK_PRIO_2,
+                      "OS_CONFIG_TEST_PRIORITY (%u) leaves a usable priority below the test task",
+                      (unsigned)OS_CONFIG_TEST_PRIORITY);
+    AHURA_TEST_CHECK(TEST_PRIO_HIGH <= OS_TASK_PRIO_USER_MAX,
+                      "OS_CONFIG_TEST_PRIORITY (%u) leaves a usable priority above the test task",
+                      (unsigned)OS_CONFIG_TEST_PRIORITY);
+
     g_busy_counter    = 0U;
     g_busy_should_run = true;
-    status = os_task_create(&worker, OS_TASK_CONFIG(worker, test_busy_spin_entry, NULL, 1U));
-    AHURA_TEST_CHECK(status == OS_STATUS_OK, "low-priority spinner task created (priority 1)");
+    status = os_task_create(&worker, OS_TASK_CONFIG(worker, test_busy_spin_entry, NULL, TEST_PRIO_LOW));
+    AHURA_TEST_CHECK(status == OS_STATUS_OK, "low-priority spinner task created (priority %u)",
+                      (unsigned)TEST_PRIO_LOW);
     AHURA_TEST_CHECK(os_task_start(&worker) == OS_STATUS_OK, "low-priority spinner started");
 
     (void)os_delay_ms(20U);
@@ -828,15 +927,28 @@ static void test_priority_preemption(void)
     /* A task at a strictly higher priority than both the spinner and this test task never
      * yields/delays for its whole burst - so the spinner cannot possibly run until it is gone. */
     status = os_task_create(&helper, OS_TASK_CONFIG(helper, test_burst_spin_entry, NULL,
-                                                            OS_CONFIG_TEST_PRIORITY + 1U));
+                                                            TEST_PRIO_HIGH));
     AHURA_TEST_CHECK(status == OS_STATUS_OK, "higher-priority burst task created (priority %u)",
-                      (unsigned)(OS_CONFIG_TEST_PRIORITY + 1U));
+                      (unsigned)TEST_PRIO_HIGH);
 
-    AHURA_TEST_CHECK(os_task_start(&helper) == OS_STATUS_OK, "higher-priority burst task started");
+    /* Both snapshots are taken with NOTHING in between but the start and a busy-wait: an
+     * AHURA_TEST_CHECK here would printf, and that polled UART write takes milliseconds during
+     * which ticks fire and the scheduler runs, which is precisely the window this check is
+     * supposed to prove is quiet. Statuses are recorded now and reported after the sampling.
+     *
+     * os_delay_us busy-waits and never yields, so those 100 us are real wall time in which the
+     * spinner is READY and simply must not be picked - a stronger claim than sampling
+     * instantly, which a lucky instant could pass by accident. */
+    snapshot_before   = g_busy_counter;
+    start_status      = os_task_start(&helper);
+    (void)os_delay_us(100U);
     snapshot_immediate = g_busy_counter;
+
+    AHURA_TEST_CHECK(start_status == OS_STATUS_OK, "higher-priority burst task started");
     AHURA_TEST_CHECK(snapshot_immediate == snapshot_before,
-                      "the spinner has not advanced right after the higher-priority task starts (count=%lu)",
-                      (unsigned long)snapshot_immediate);
+                      "the spinner stayed frozen for 100 us while a higher-priority task ran "
+                      "(count %lu -> %lu)",
+                      (unsigned long)snapshot_before, (unsigned long)snapshot_immediate);
 
     AHURA_TEST_CHECK(test_wait_inactive(&helper, 200U),
                       "the higher-priority burst task ran to completion and self-terminated");
@@ -1314,6 +1426,144 @@ static void test_task_notify(void)
                       (unsigned long)g_notify_wait_value);
 }
 #endif /* OS_CONFIG_TASK_NOTIFY_ENABLE */
+
+/*
+ * ***********************************************************************************************************
+ * Assertions and buffered logging
+ * ***********************************************************************************************************
+*/
+
+/******************************************************************************************************/
+/**
+ * @brief Checks that a PASSING assertion is invisible: no halt, no side effect, and the
+ *        expression is evaluated exactly once when assertions are compiled in.
+ *
+ * A FAILING assertion deliberately parks the core, so it cannot be exercised from inside a
+ * running suite - that path is verified by inspection and on hardware with a debugger.
+ */
+static void test_assert(void)
+{
+    test_print_section("Assertions");
+
+#if (OS_CONFIG_ASSERT_ENABLE == 1U)
+    {
+        volatile uint32_t evaluations = 0U;
+
+        OS_ASSERT((evaluations++, true));
+        AHURA_TEST_CHECK(evaluations == 1U,
+                          "a passing OS_ASSERT evaluates its expression exactly once (got %lu)",
+                          (unsigned long)evaluations);
+    }
+
+    OS_ASSERT(1 == 1);
+    AHURA_TEST_CHECK(os_kernel_is_running(), "a passing OS_ASSERT does not disturb the kernel");
+    printf("  [INFO] a FAILING assertion parks the core by design, so it is not exercised here\r\n");
+#else
+    {
+        volatile uint32_t evaluations = 0U;
+
+        OS_ASSERT((evaluations++, true));
+        AHURA_TEST_CHECK(evaluations == 0U,
+                          "with assertions off the expression is not evaluated at all (got %lu)",
+                          (unsigned long)evaluations);
+    }
+#endif
+}
+
+#if (OS_CONFIG_LOG_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Exercises the log ring end to end: delivery through the output hook, formatting, the
+ *        level filter, and the drop-and-count behavior when the buffer overruns.
+ *
+ * The suite installs its own os_log_output_cb (a strong definition overriding the kernel's weak
+ * one), so the bytes the log task would have transmitted are captured here instead of going to
+ * the UART. That also means this file's callback is the one the whole firmware uses.
+ */
+static void test_log(void)
+{
+    uint32_t dropped_before;
+    uint32_t dropped_after;
+    uint32_t i;
+
+    test_print_section("Buffered Logging");
+
+    /* Let tsk_log drain anything the kernel or earlier sections queued. */
+    (void)os_delay_ms(50U);
+
+    g_log_capture_len   = 0U;
+    g_log_capture_lines = 0U;
+    g_log_capture_on    = true;
+
+    OS_LOG_INFO("selftest marker %lu", 12345UL);
+    (void)os_delay_ms(50U);
+
+    AHURA_TEST_CHECK(g_log_capture_lines > 0U, "a logged line reached os_log_output_cb (%lu lines)",
+                      (unsigned long)g_log_capture_lines);
+    AHURA_TEST_CHECK(test_log_capture_contains("selftest marker 12345"),
+                      "the formatted text arrived intact");
+    AHURA_TEST_CHECK(test_log_capture_contains("] I "), "the line carries its severity marker");
+
+    /* Level filter: anything above OS_CONFIG_LOG_LEVEL must not even be
+     * evaluated, let alone reach the buffer. */
+    g_log_capture_len = 0U;
+    {
+        volatile uint32_t evaluated = 0U;
+
+        OS_LOG_DEBUG("filtered %lu", (unsigned long)(evaluated++));
+        (void)os_delay_ms(20U);
+
+#if (OS_CONFIG_LOG_LEVEL >= OS_LOG_LEVEL_DEBUG)
+        AHURA_TEST_CHECK(evaluated == 1U, "OS_LOG_DEBUG is compiled in at this level and ran");
+#else
+        AHURA_TEST_CHECK(evaluated == 0U,
+                          "OS_LOG_DEBUG above the configured level does not evaluate its arguments");
+        AHURA_TEST_CHECK(!test_log_capture_contains("filtered"),
+                          "and nothing from it reaches the output hook");
+#endif
+    }
+
+    /* Overrun: burst far more than the ring can hold, with the drain task
+     * starved (it runs below this one), so lines must be dropped whole. */
+    dropped_before = os_log_dropped_get();
+
+    for (i = 0U; i < 500U; i++)
+    {
+        OS_LOG_INFO("flood %lu 0123456789 0123456789 0123456789", (unsigned long)i);
+    }
+
+    dropped_after = os_log_dropped_get();
+    AHURA_TEST_CHECK(dropped_after > dropped_before,
+                      "a burst larger than the buffer drops lines instead of blocking (%lu dropped)",
+                      (unsigned long)(dropped_after - dropped_before));
+
+    /* Once drained, the kernel reports the loss and resumes normal service. */
+    g_log_capture_len = 0U;
+    (void)os_delay_ms(400U);
+
+    AHURA_TEST_CHECK(test_log_capture_contains("dropped"),
+                      "the dropped count is reported into the log itself");
+    AHURA_TEST_CHECK(os_log_dropped_get() == 0U,
+                      "the dropped counter is cleared once reported (now %lu)",
+                      (unsigned long)os_log_dropped_get());
+
+    g_log_capture_len = 0U;
+    OS_LOG_INFO("logging still works after an overrun");
+    (void)os_delay_ms(50U);
+    AHURA_TEST_CHECK(test_log_capture_contains("still works"), "logging recovers after an overrun");
+
+    AHURA_TEST_CHECK(os_kernel_is_running(), "kernel state is intact after the log stress");
+
+    g_log_capture_on = false;
+}
+#else
+/******************************************************************************************************/
+static void test_log(void)
+{
+    test_print_section("Buffered Logging");
+    printf("  [SKIP] requires OS_CONFIG_LOG_ENABLE=1\r\n");
+}
+#endif /* OS_CONFIG_LOG_ENABLE */
 
 /*
  * ***********************************************************************************************************
@@ -2653,7 +2903,7 @@ static void test_benchmarks(void)
     volatile uint32_t sink = 0U;
     uint32_t          best;
     uint32_t          overhead;
-    uint32_t          clock_hz = os_clock_hz_get_cb();
+    uint32_t          clock_hz = os_arch_clock_hz_get();
 
     printf("\r\n========================================\r\n");
     printf(" BENCHMARKS\r\n");
@@ -2910,9 +3160,9 @@ static void test_unsupported_features(void)
 
 /******************************************************************************************************/
 /**
- * @brief Kernel self-test suite entry point: strong override of the weak os_test() declared
- *        in ahura.h. os_kernel.c creates a task that calls this automatically when
- *        OS_CONFIG_TEST_ENABLE is 1 - nothing else to call.
+ * @brief Kernel self-test suite entry point, supplying the os_test() declared in ahura.h.
+ *        os_kernel.c creates a task that calls this automatically when OS_CONFIG_TEST_ENABLE
+ *        is 1 - nothing else to call.
  */
 void os_test(void)
 {
@@ -2948,6 +3198,8 @@ void os_test(void)
 #if (OS_CONFIG_TASK_NOTIFY_ENABLE == 1U)
     test_task_notify();
 #endif
+    test_assert();
+    test_log();
 #if (OS_CONFIG_ALLOC_ENABLE == 1U)
     test_alloc();
 #endif

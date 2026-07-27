@@ -563,6 +563,10 @@ os_status os_task_notify_wait(uint32_t timeout_ms, uint32_t *value_out)
     uint32_t start_tick;
     uint32_t remaining_ticks;
 
+    /* Task-only, like os_mutex_lock: an ISR has no task identity to wait as. */
+    OS_ASSERT(!os_arch_in_isr());
+    OS_ASSERT(value_out != NULL);
+
     if ((value_out == NULL) || os_arch_in_isr())
     {
         return OS_STATUS_INVALID_ARG;

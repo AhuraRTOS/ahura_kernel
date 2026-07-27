@@ -48,7 +48,8 @@ HAL or CMSIS dependency.
 [Task notifications](#task-notifications) ·
 [Work queue](#work-queue) ·
 [Kernel heap](#kernel-heap) ·
-[Diagnostics](#diagnostics)
+[Diagnostics](#diagnostics) ·
+[Debugging](#debugging)
 
 **[Platform support](#platform-support)**
 [Supported cores](#supported-cores) ·
@@ -139,8 +140,9 @@ can support, so it is not one of the options `os_config.h` defines.
 1. Route `SysTick_Handler` to `os_tick_handler()`. `SVC_Handler` and
    `PendSV_Handler` are provided by the port, so do not define them in
    `stm32*_it.c`.
-2. Call `os_init()` after clocks are configured. It reads the CPU clock through
-   `os_clock_hz_get_cb`, see [Platform clock](#platform-clock).
+2. Call `os_init()` after clocks are configured, so the live CMSIS
+   `SystemCoreClock` is already correct when the kernel reads it. See [Platform
+   clock](#platform-clock).
 3. Create and start any tasks the application needs before the scheduler runs.
    `os_init()` already created the default task (see [Default application
    task](#default-application-task)) unless this is a self-test build. Then call
@@ -173,13 +175,27 @@ compiles away entirely when its `OS_CONFIG_<FEATURE>_ENABLE` is 0.
 | **Work queue** | `os_work_init` · `os_work_submit` · `os_work_cancel` · `os_work_is_pending` |
 | **Kernel heap** | `os_mem_alloc` · `os_mem_free` · `os_mem_free_get` · `os_mem_watermark_get` |
 | **Diagnostics** | `os_task_stack_watermark_get` · `os_cpu_usage_get` |
+| **Debugging** | `OS_ASSERT` · `os_assert_failed_cb` · `OS_LOG_ERROR` / `OS_LOG_WARN` / `OS_LOG_INFO` / `OS_LOG_DEBUG` · `os_log_write` · `os_log_dropped_get` · `os_log_output_cb` |
 | **Intrusive list** | `os_list_init` · `os_list_is_empty` · `os_list_push_back` · `os_list_pop_front` · `os_list_remove` · `os_list_insert_before` |
 | **Tickless idle** | `os_tickless_idle_process` · `os_tickless_expected_idle_ticks_get` · `os_tickless_max_suppressed_ticks_get` |
-| **Application-provided** | `os_main` · `os_test` · `os_clock_hz_get_cb` · `os_tickless_pre_sleep_cb` · `os_tickless_post_sleep_cb` · `os_arch_tz_context_save_cb` · `os_arch_tz_context_restore_cb` · `os_arch_core_id_get_cb` · `os_arch_core_ipi_request_cb` |
+| **Application-provided** | `os_main` · `os_test` · `os_tickless_pre_sleep_cb` · `os_tickless_post_sleep_cb` · `os_arch_tz_context_save_cb` · `os_arch_tz_context_restore_cb` · `os_arch_core_id_get_cb` · `os_arch_core_ipi_request_cb` |
 
-Helper macros: `OS_TASK_DEFINE` (stack and handle), `OS_TASK_CONFIG` and
-`OS_TASK_CONFIG_CORE` (task parameters), `OS_TICKS_FROM_MS`, `OS_WAIT_NOTHING`,
-and `OS_WAIT_FOREVER`.
+Helper macros: `OS_TASK_DEFINE` (stack and handle), `OS_TASK_CONFIG` (task
+parameters), `OS_TICKS_FROM_MS`, `OS_WAIT_NOTHING`, and `OS_WAIT_FOREVER`.
+
+`OS_TASK_CONFIG` follows the core count. On a single-core build it takes
+`(name, entry, context, priority)`, because there is nothing to place a task on.
+On a multi-core build it takes a fifth `core_affinity` argument, and it is
+required rather than defaulted, so every task states where it may run:
+
+```c
+/* OS_CONFIG_CORE_COUNT == 1 */
+os_task_create(&worker, OS_TASK_CONFIG(worker, worker_entry, NULL, OS_TASK_PRIO_3));
+
+/* OS_CONFIG_CORE_COUNT > 1 */
+os_task_create(&worker, OS_TASK_CONFIG(worker, worker_entry, NULL, OS_TASK_PRIO_3,
+                                        OS_TASK_CORE(1) | OS_TASK_CORE(2)));
+```
 
 ### Default application task
 
@@ -194,11 +210,11 @@ os_init();
 os_start();
 ```
 
-The task's body is the weak function `os_main()`, whose prototype is in
-`ahura.h` and whose weak default in `os_kernel.c` simply idles forever. It is
-deliberately **not** a `_cb` function: this is where the application's own code
-runs, not a kernel query for platform behavior, even though it is wired up the
-same way through a weak default and a strong override.
+The task's body is `os_main()`, declared in `ahura.h` and defined by the
+application. The kernel ships no stub for it, so forgetting the file is a link
+error rather than a task that silently idles. It is deliberately **not** a `_cb`
+function: this is where the application's own code runs, not a kernel query for
+platform behavior.
 
 Override it with its own template, separate from `os_cb_template.c`. Copy
 `ahura_kernel/os_main_template.c` into the project as `os_main.c`, add it to the
@@ -371,6 +387,91 @@ window. Resolution is one tick, so sample at a period well above the tick period
 for example once per second at a 1 kHz tick. Ticks announced after a tickless
 sleep count as idle. The cost is two counter updates per tick.
 
+### Debugging
+
+Two independent features: assertions that catch programming errors where they
+happen, and logging that does not stall the caller.
+
+#### Assertions
+
+`OS_CONFIG_ASSERT_ENABLE` (default 1) turns on `OS_ASSERT(expr)`. A failing
+check calls `os_assert_failed_cb(file, line)` so the application can print or
+record the location, then parks the core with interrupts masked so a debugger
+stops at the cause. That callback is **required** when assertions are enabled:
+the kernel ships no stub, because a silent one would turn every assertion into
+an unexplained halt. Leaving it out is a link error.
+
+```c
+void os_assert_failed_cb(const char *file, uint32_t line)
+{
+    /* print it, stash it in a noinit/backup register, or just break */
+    __BKPT(0);
+}
+```
+
+The line the kernel draws is between a **static mistake in the code** and a
+**runtime outcome**. It asserts on the former: a NULL object handle, a blocking
+call made from an ISR, an `os_critical_exit()` with no matching enter (which
+returns `void`, so it has no other way to report at all).
+
+It does **not** assert on anything with a documented status, even when that
+status usually means someone made a mistake. `OS_STATUS_NOT_OWNER` from
+`os_mutex_unlock`, `BUSY`, `FULL`, `EMPTY`, and `TIMEOUT` all depend on runtime
+scheduling, and callers are entitled to attempt the operation and handle the
+result. Asserting there would halt correct programs.
+
+Assertions only **add** checks. Every API still returns exactly the same status
+either way, so a build with `OS_CONFIG_ASSERT_ENABLE=0` behaves identically,
+minus the halt. Use them for programming errors, never for conditions that can
+legitimately occur at runtime. The expression is not evaluated at all when
+assertions are compiled out, so it must be free of side effects.
+
+#### Logging
+
+`OS_CONFIG_LOG_ENABLE` (default 1) provides printf-style logging that returns
+immediately instead of waiting on a serial port:
+
+```c
+OS_LOG_ERROR("i2c timeout on 0x%02x", addr);
+OS_LOG_WARN ("battery low: %lu mV", (unsigned long)mv);
+OS_LOG_INFO ("sensor = %d", value);
+OS_LOG_DEBUG("state %u -> %u", from, to);
+```
+
+Each call formats the line, copies it into a ring buffer, and returns. A
+low-priority kernel task (`tsk_log`) drains the buffer in the background and
+hands finished bytes to the application:
+
+```c
+void os_log_output_cb(const uint8_t *data, size_t length)
+{
+    HAL_UART_Transmit(&huart3, (uint8_t *)data, length, HAL_MAX_DELAY);
+}
+```
+
+That callback runs on `tsk_log`, never from an ISR or a critical section, so it
+may block or start a DMA transfer. It is weak and discards output by default, so
+logging costs nothing until a transport is provided.
+
+Calls above `OS_CONFIG_LOG_LEVEL` expand to nothing, arguments included, so a
+disabled `OS_LOG_DEBUG` costs neither code nor the evaluation of its arguments.
+Logging is safe from tasks and ISRs and never blocks: when the buffer is full
+the line is dropped **whole** and counted, never written in part, and the count
+is reported into the log once space frees:
+
+```text
+[    1234] I sensor = 42
+[    1250] W *** 17 log lines dropped ***
+[    1251] I sensor = 45
+```
+
+Two costs to budget for. `tsk_log` occupies one `OS_CONFIG_MAX_TASKS` slot, and
+formatting uses libc `vsnprintf`, which pulls newlib's formatter into the link
+(roughly 1 to 3 KB) for a project that does not already use `printf`. As usual,
+`%f` additionally needs `-u _printf_float`. `OS_CONFIG_LOG_LINE_MAX` is the
+scratch buffer `os_log_write` places on the **caller's** stack, so every task
+that logs needs that much extra headroom.
+
 ---
 
 ## Platform support
@@ -394,14 +495,18 @@ in option bytes, in which case use `OS_CONFIG_TRUSTZONE_DISABLED`.
 
 ### Application callbacks
 
-All user-overridable hooks are weak `_cb` functions, so overriding is optional
-per function. For a clean starting point, copy `ahura_kernel/os_cb_template.c`
-into the application source tree as `os_cb.c`, add it to the **application**
-build (never to the kernel, where the template is deliberately absent from the
-CMakeLists), and adapt:
+Application hooks carry the `_cb` suffix. Most are weak, so overriding them is
+optional and the kernel's default applies otherwise; a few have no default at all
+because a silent one would hide the very thing the hook exists to report, and
+those are link errors until the application supplies them. For a clean starting
+point, copy `ahura_kernel/os_cb_template.c` into the application source tree as
+`os_cb.c`, add it to the **application** build (never to the kernel, where the
+template is deliberately absent from the CMakeLists), and adapt:
 
-- `os_clock_hz_get_cb` returns the CPU clock in Hz. See [Platform
-  clock](#platform-clock).
+- `os_assert_failed_cb` reports a failed assertion. **Required** when
+  `OS_CONFIG_ASSERT_ENABLE` is 1, see [Debugging](#debugging).
+- `os_log_output_cb` transmits finished log bytes. Optional: the weak default
+  discards them, so logging costs nothing until a transport is provided.
 - `os_tickless_pre_sleep_cb` and `os_tickless_post_sleep_cb` bracket the sleep.
 - `os_arch_tz_context_save_cb` and `os_arch_tz_context_restore_cb` handle
   TrustZone secure-context banking, for non-secure kernels only.
@@ -411,27 +516,36 @@ CMakeLists), and adapt:
 
 ### Platform clock
 
-The kernel never reads a platform global directly. Every place that needs the
-CPU frequency, such as the SysTick reload, `os_delay_us` busy-waits, and
-tickless accounting, calls the weak callback:
+Everything that needs the CPU frequency, such as the SysTick reload,
+`os_delay_us` busy-waits, and tickless accounting, reads it through one arch
+function:
 
 ```c
-uint32_t os_clock_hz_get_cb(void);   /* return the CPU clock in Hz, 0 = unknown */
+uint32_t os_arch_clock_hz_get(void);   /* current CPU clock in Hz */
 ```
 
-The default implementation covers the common cases without any code:
+On ARM that is simply the live CMSIS `SystemCoreClock` variable, so the function
+lives in the arch layer rather than in portable core code. There is nothing to
+configure and nothing to override on a normal CMSIS project: the device's
+`SystemInit()` sets the variable and `SystemCoreClockUpdate()` refreshes it after
+every clock-tree change, so a board that boots on an internal oscillator and
+later switches to a PLL is handled with no kernel involvement.
 
-- With `OS_CONFIG_CPU_CLOCK_HZ` set above 0, it returns that fixed value. This
-  suits platforms with a constant clock and no CMSIS.
-- With `OS_CONFIG_CPU_CLOCK_HZ` at 0, the default, it returns the CMSIS
-  `SystemCoreClock` global when the platform defines one. That is a weak
-  reference, so linking never fails without it, and the callback returns 0
-  instead.
+There is deliberately **no** build-time clock constant. A constant cannot follow
+a runtime clock switch, and a stale one would silently mis-program the SysTick
+reload and every busy-wait delay, which is a hard class of bug to find.
 
-Any other platform convention, such as a Zephyr-style config, a clock-driver
-query, or dynamic frequency scaling, plugs in by overriding the callback in
-application code. When the callback returns 0, tick setup and busy-wait delays
-refuse to run and return `OS_STATUS_ERROR` rather than miscounting.
+Devices whose startup code does not define the CMSIS symbol simply define it
+themselves, anywhere in the application:
+
+```c
+uint32_t SystemCoreClock = 120000000U;   /* keep updated if the clock tree changes */
+```
+
+That is also the hook for a platform that keeps its frequency somewhere else,
+such as a HAL getter: mirror the value into this variable whenever it changes.
+The kernel re-reads it on every use, so dynamic frequency scaling works as long
+as the variable stays current.
 
 ### TrustZone
 
@@ -564,9 +678,8 @@ Remaining work:
 
 The suite is not copied into the application. It is a normal buildable module
 with its own `CMakeLists.txt` (`ahura_kernel/test/CMakeLists.txt`), producing a
-static library `os_test` that links against `ahura_kernel` and supplies the
-strong override of the weak `os_test()`. Any project that already builds the
-kernel can add it:
+static library `os_test` that links against `ahura_kernel` and supplies
+`os_test()`. Any project that already builds the kernel can add it:
 
 ```cmake
 add_subdirectory(ahura_kernel)
@@ -574,22 +687,15 @@ add_subdirectory(ahura_kernel/test)   # builds the os_test library
 
 target_link_libraries(my_app PRIVATE
     ahura_kernel
-    -Wl,--whole-archive
     os_test
-    -Wl,--no-whole-archive
 )
 ```
 
-> **`--whole-archive` is required, not optional.** `os_test` only *overrides*
-> the weak `os_test()`. It never adds a new undefined symbol for the linker to
-> resolve. A normal static-library link only pulls in an archive member when
-> something is still undefined at that point, and since `os_kernel.c.o` (pulled
-> in for `os_init` and `os_start` anyway) already *defines* `os_test` weakly,
-> the linker never looks inside `libos_test.a`. The entire suite then silently
-> disappears from the build with no warning. Whole-archive forces every object
-> into the link so the strong definition can win. Note that `os_cb.c` and
-> `os_main.c` do not need this, because they are compiled directly into the
-> application's object list rather than packaged into an archive.
+That is an ordinary static-library link, with no `--whole-archive` needed. The
+kernel deliberately ships no stub for `os_test()`, so `os_kernel.c.o` leaves the
+symbol undefined and the linker has a reason to extract `os_test.c.o` from the
+archive. Forgetting the library is a link error rather than a test suite that
+silently vanishes from the build.
 
 Once linked, `os_init()` creates and starts the self-test task by itself, gated
 by `OS_CONFIG_TEST_ENABLE`, which is off by default in the template so each
@@ -647,6 +753,7 @@ HAL headers.
 | `os_main_mem.c` | Kernel heap with `os_mem_alloc` and `os_mem_free` |
 | `os_main_stack_watermark.c` | Worst-case stack headroom |
 | `os_main_cpu_usage.c` | CPU load sampling |
+| `os_main_log.c` | Buffered debug logging (`OS_LOG_*`) |
 | `os_main_list.c` | The intrusive list utility |
 
 Each file needs its matching `OS_CONFIG_<FEATURE>_ENABLE` on, and a compile-time
@@ -663,13 +770,12 @@ so copy any of them over the project's `os_main.c` to see it run.
 
 - `ahura.h` is the public umbrella API, and the only header applications
   include. It declares `os_main()` and `os_test()` as well, even though the
-  kernel only ships weak defaults for them, because overriding or linking the
-  real body is the application's job. Neither carries the `_cb` suffix used
+  kernel defines neither: supplying them is the application's job through its
+  `os_main.c`, or the test library's. Neither carries the `_cb` suffix used
   elsewhere in this header. That suffix is reserved for callbacks the kernel
-  queries for platform behavior, such as `os_clock_hz_get_cb` and
-  `os_tickless_pre_sleep_cb`, whereas `os_main()` and `os_test()` are where the
-  application's or suite's own code runs, even though they are wired up the same
-  way with a weak default and a strong override.
+  queries for platform behavior, such as `os_tickless_pre_sleep_cb`, whereas
+  `os_main()` and `os_test()` are where the application's or suite's own code
+  runs.
 - `os_config_template.h` is the template for the application's `os_config.h`. It
   lists every build-time option at its default value: tick rate, task and timer
   limits, stack sizes, heap size, TrustZone mode, core count, and the per-feature
@@ -697,8 +803,7 @@ so copy any of them over the project's `os_main.c` to see it run.
 All filenames are `os_`-prefixed:
 
 - `os_kernel.c` covers the lifecycle (`os_init`, `os_start`, the running flag),
-  the platform clock callback (`os_clock_hz_get_cb`, see [Platform
-  clock](#platform-clock)), the default application task (`os_main`, see
+  the default application task (`os_main`, see
   [Default application task](#default-application-task)), and the self-test task
   (`os_test`, see [Self-test suite](#self-test-suite)).
 - `os_mem.c` is the kernel heap (`os_mem_alloc` and `os_mem_free`), a first-fit

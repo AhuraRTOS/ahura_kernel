@@ -21,12 +21,6 @@
  * ***********************************************************************************************************
 */
 
-#if (OS_CONFIG_CPU_CLOCK_HZ == 0U)
-/* CMSIS platforms provide the SystemCoreClock global; the weak reference
- * resolves to address 0 on platforms without it, so linking never fails. */
-extern uint32_t SystemCoreClock OS_WEAK;
-#endif
-
 #if (OS_CONFIG_TEST_ENABLE == 0U)
 static os_status os_main_system_init(void);
 static void      os_main_task_entry(void *context);
@@ -80,6 +74,12 @@ void os_init(void)
 #endif
 #if (OS_CONFIG_TIMER_ENABLE == 1U)
     (void)os_timer_system_init();
+#endif
+    /* The log task sits at the opposite end from work/timer: lowest priority,
+     * so draining the log never preempts application work. Created before the
+     * main/test task so anything they log at startup already has a consumer. */
+#if (OS_CONFIG_LOG_ENABLE == 1U)
+    (void)os_log_system_init();
 #endif
     /* The self-test suite takes priority over the default application task:
      * both otherwise run tsk_main-priority-range code from os_init(), and a
@@ -155,68 +155,57 @@ bool os_kernel_is_running(void)
     return os_kernel_running;
 }
 
+#if (OS_CONFIG_ASSERT_ENABLE == 1U)
 /******************************************************************************************************/
 /**
- * @brief Platform callback: return the CPU clock in Hz (0 = unknown).
+ * @brief Report a failed OS_ASSERT and halt.
  *
- * Weak default: the fixed OS_CONFIG_CPU_CLOCK_HZ when configured, else the
- * CMSIS SystemCoreClock global when the platform provides one, else 0 (tick
- * setup and busy-wait delays then refuse to run rather than misbehave).
- * Platforms with another clock convention override this function.
+ * The application hook runs first, while the failure's context is still intact, so it can print
+ * or store the location. It then falls through to the same trap the boot-time configuration
+ * checks use: interrupts masked, core parked, debugger stops here. There is deliberately no way
+ * to continue - an assertion means an invariant the rest of the kernel relies on is already
+ * broken, so running on would only corrupt more state before the eventual failure.
  *
- * @return uint32_t  CPU clock frequency in Hz.
+ * @param[in] file  Source file of the failed check.
+ * @param[in] line  Line number of the failed check.
+ * @return None. Never returns.
  */
-OS_WEAK uint32_t os_clock_hz_get_cb(void)
+void os_assert_failed(const char *file, uint32_t line)
 {
-#if (OS_CONFIG_CPU_CLOCK_HZ > 0U)
-    return OS_CONFIG_CPU_CLOCK_HZ;
-#else
-    if (&SystemCoreClock != NULL)
-    {
-        return SystemCoreClock;
-    }
+    os_assert_failed_cb(file, line);
+    os_arch_config_fault_trap();
 
-    return 0U;
-#endif
-}
-
-/******************************************************************************************************/
-/**
- * @brief Default application task body (see OS_CONFIG_MAIN_TASK_* in os_config.h).
- *
- * Weak default: idles forever. Override in the application (copy of os_main_template.c
- * as os_main.c) with real application code - a plain while(1) loop, or spawn further
- * tasks from here. Not a "_cb" hook: this is where the application's own code runs.
- *
- * Never called when OS_CONFIG_TEST_ENABLE is also 1 (os_init() does not create tsk_main
- * in that build - see os_init()); the symbol still compiles so an application's os_main.c
- * links unchanged whether or not the test suite is enabled alongside it.
- *
- * @return None.
- */
-OS_WEAK void os_main(void)
-{
+    /* os_arch_config_fault_trap never returns; the loop only convinces the
+     * compiler of that when it is inlined as a plain call. */
     while (1)
     {
-        (void)os_delay_ms(1000U);
     }
 }
 
-#if (OS_CONFIG_TEST_ENABLE == 1U)
-/******************************************************************************************************/
-/**
- * @brief Kernel self-test suite entry point (see OS_CONFIG_TEST_* in os_config.h).
- *
- * Weak default: does nothing. Link the ahura_kernel/test library (CMake target "os_test")
- * to get the real suite's strong override instead - see README "Self-test suite". Not a
- * "_cb" hook, same reasoning as os_main().
- *
- * @return None.
+/*
+ * os_assert_failed_cb() is deliberately NOT defined here, not even as a weak stub. A stub that
+ * did nothing would make the one thing an assertion exists to do - tell you where it fired -
+ * silently unavailable, leaving only an unexplained halt. Enabling assertions therefore requires
+ * the application to say what happens on failure (see os_cb_template.c), and forgetting to is a
+ * link error rather than a debugging session spent wondering why the core stopped.
  */
-OS_WEAK void os_test(void)
-{
-}
-#endif /* OS_CONFIG_TEST_ENABLE */
+#endif /* OS_CONFIG_ASSERT_ENABLE */
+
+/*
+ * os_main() and os_test() are deliberately NOT defined here, not even as weak stubs.
+ *
+ * os_main() is the application's own code, supplied by its os_main.c (copied from
+ * os_main_template.c). A weak "idle forever" stub would let a project that simply forgot the
+ * file link and boot into a task that does nothing, which is far harder to diagnose than the
+ * undefined-reference error the linker gives instead. It is only referenced when
+ * OS_CONFIG_TEST_ENABLE is 0, so a self-test build needs no os_main.c at all.
+ *
+ * os_test() comes from the ahura_kernel/test library. Leaving it undefined here is also what
+ * makes plain static-library linking work: the reference below is unresolved, so the linker has
+ * a reason to pull os_test.c.o out of libos_test.a. A weak stub would satisfy the reference
+ * first and the archive would never be searched, silently dropping the entire suite - which is
+ * why linking it used to require -Wl,--whole-archive.
+ */
 
 /*
  * ***********************************************************************************************************

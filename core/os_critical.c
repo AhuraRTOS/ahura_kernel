@@ -86,6 +86,12 @@ void os_critical_exit(void)
 {
     uint32_t core = os_arch_core_id_get();
 
+    /* An exit without a matching enter means the pairing is broken somewhere:
+     * whoever raised the mask is no longer tracked, so the next outermost exit
+     * would restore a stale state. Returning quietly (as this still does with
+     * assertions off) keeps the kernel consistent but hides the caller's bug. */
+    OS_ASSERT(os_critical_nesting_count[core] != 0U);
+
     if (os_critical_nesting_count[core] == 0U)
     {
         return;

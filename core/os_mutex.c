@@ -82,6 +82,11 @@ os_status os_mutex_lock(os_mutex_t *mutex, uint32_t timeout_ms)
     uint32_t start_tick;
     uint32_t remaining_ticks;
 
+    /* A mutex is an ownership object and an ISR has no identity of its own, so
+     * locking from one could only borrow whichever task it interrupted. */
+    OS_ASSERT(!os_arch_in_isr());
+    OS_ASSERT(mutex != NULL);
+
     if ((mutex == NULL) || os_arch_in_isr())
     {
         return OS_STATUS_INVALID_ARG;
@@ -167,6 +172,9 @@ os_status os_mutex_unlock(os_mutex_t *mutex)
 {
     uint32_t self_id;
 
+    OS_ASSERT(!os_arch_in_isr());
+    OS_ASSERT(mutex != NULL);
+
     if ((mutex == NULL) || os_arch_in_isr())
     {
         return OS_STATUS_INVALID_ARG;
@@ -182,7 +190,12 @@ os_status os_mutex_unlock(os_mutex_t *mutex)
         return OS_STATUS_ERROR;
     }
 
-    /* Enforce ownership when both sides are identifiable tasks. */
+    /* Enforce ownership when both sides are identifiable tasks.
+     *
+     * Deliberately NOT an OS_ASSERT: OS_STATUS_NOT_OWNER is a documented return
+     * value, so callers are entitled to attempt the unlock and handle it. It
+     * also depends on runtime scheduling rather than on a static mistake in the
+     * code, which is the line assertions are meant to sit on. */
     if ((mutex->owner_id != 0U) && (self_id != 0U) && (mutex->owner_id != self_id))
     {
         os_critical_exit();

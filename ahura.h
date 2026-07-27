@@ -311,12 +311,80 @@ typedef enum
  *  of allowed cores: OS_TASK_CORE(0) | OS_TASK_CORE(2). */
 #define OS_TASK_CORE(n)         (1UL << (n))
 
+/** Check a condition that must hold if the program is correct, and halt at the
+ *  point of failure when it does not (see OS_CONFIG_ASSERT_ENABLE).
+ *
+ *  Assertions only ADD checks: the kernel still returns the same status codes
+ *  either way, so a build with assertions off behaves exactly as one with them
+ *  on, minus the halt. Use them for programming errors (a bad handle, blocking
+ *  from an ISR), never for conditions that can legitimately happen at runtime.
+ *
+ *  The expression is not evaluated at all when assertions are compiled out, so
+ *  it must be free of side effects. */
+#if (OS_CONFIG_ASSERT_ENABLE == 1U)
+#define OS_ASSERT(expr)                                                       \
+    do {                                                                      \
+        if (!(expr))                                                          \
+        {                                                                     \
+            os_assert_failed(__FILE__, (uint32_t)__LINE__);                   \
+        }                                                                     \
+    } while (0)
+#else
+#define OS_ASSERT(expr)         ((void)0)
+#endif
+
+/** Severity values for OS_CONFIG_LOG_LEVEL. An os_config.h selects one by name
+ *  even though it is read before this header: a macro body is only expanded
+ *  where it is used, and every comparison against these lives below. They are
+ *  compared numerically in #if, so the increasing order is part of the
+ *  contract, not just a convention. */
+#define OS_LOG_LEVEL_NONE       0U
+#define OS_LOG_LEVEL_ERROR      1U
+#define OS_LOG_LEVEL_WARN       2U
+#define OS_LOG_LEVEL_INFO       3U
+#define OS_LOG_LEVEL_DEBUG      4U
+
+/** Buffered log calls (see OS_CONFIG_LOG_ENABLE / OS_CONFIG_LOG_LEVEL). Each
+ *  formats like printf, returns immediately, and is safe from tasks and ISRs.
+ *  Calls above the configured level expand to nothing, arguments included, so
+ *  a disabled OS_LOG_DEBUG costs neither code nor the cost of its arguments. */
+#if (OS_CONFIG_LOG_ENABLE == 1U) && (OS_CONFIG_LOG_LEVEL >= OS_LOG_LEVEL_ERROR)
+#define OS_LOG_ERROR(...)       os_log_write(OS_LOG_LEVEL_ERROR, __VA_ARGS__)
+#else
+#define OS_LOG_ERROR(...)       ((void)0)
+#endif
+
+#if (OS_CONFIG_LOG_ENABLE == 1U) && (OS_CONFIG_LOG_LEVEL >= OS_LOG_LEVEL_WARN)
+#define OS_LOG_WARN(...)        os_log_write(OS_LOG_LEVEL_WARN, __VA_ARGS__)
+#else
+#define OS_LOG_WARN(...)        ((void)0)
+#endif
+
+#if (OS_CONFIG_LOG_ENABLE == 1U) && (OS_CONFIG_LOG_LEVEL >= OS_LOG_LEVEL_INFO)
+#define OS_LOG_INFO(...)        os_log_write(OS_LOG_LEVEL_INFO, __VA_ARGS__)
+#else
+#define OS_LOG_INFO(...)        ((void)0)
+#endif
+
+#if (OS_CONFIG_LOG_ENABLE == 1U) && (OS_CONFIG_LOG_LEVEL >= OS_LOG_LEVEL_DEBUG)
+#define OS_LOG_DEBUG(...)       os_log_write(OS_LOG_LEVEL_DEBUG, __VA_ARGS__)
+#else
+#define OS_LOG_DEBUG(...)       ((void)0)
+#endif
+
 #define OS_TICKS_FROM_S(sec)    ((uint32_t)((uint64_t)(sec) * (uint64_t)OS_CONFIG_TICK_HZ))
 #define OS_TICKS_FROM_MS(ms)    ((uint32_t)((((uint64_t)(ms) * (uint64_t)OS_CONFIG_TICK_HZ) + 999ULL) / 1000ULL))
 #define OS_TICKS_FROM_US(us)    ((uint32_t)((((uint64_t)(us) * (uint64_t)OS_CONFIG_TICK_HZ) + 999999ULL) / 1000000ULL))
 
-#if defined(__GNUC__)
-#define OS_STACK_ALIGNED        __attribute__((aligned(8)))
+/* 8-byte task stack alignment. Order matters: armclang also defines __clang__,
+ * and clang also defines __GNUC__, so the most specific test has to come first
+ * or the later branches are dead code. */
+#if defined(__ARMCC_VERSION) && (__ARMCC_VERSION >= 6000000)
+#define OS_STACK_ALIGNED        __attribute__((aligned(8)))   /* Arm Compiler 6 (armclang) */
+#elif defined(__clang__)
+#define OS_STACK_ALIGNED        __attribute__((aligned(8)))   /* LLVM clang                */
+#elif defined(__GNUC__)
+#define OS_STACK_ALIGNED        __attribute__((aligned(8)))   /* GNU GCC                   */
 #else
 #define OS_STACK_ALIGNED
 #endif
@@ -331,11 +399,21 @@ typedef enum
     static uint8_t   name##_STACK[(((stack_bytes) + 7U) & ~7U)] OS_STACK_ALIGNED; \
     static os_task_t name
 
-/** Task configuration bound to specific cores: core_affinity is a bitmask
- *  (OS_TASK_CORE(n), OR-combinable; OS_TASK_CORE_ANY = any core). Bits naming
- *  cores beyond OS_CONFIG_CORE_COUNT make os_task_create fail with
+/** Task configuration for os_task_create, built from a stack declared with
+ *  OS_TASK_DEFINE. The signature follows OS_CONFIG_CORE_COUNT:
+ *
+ *    single-core  OS_TASK_CONFIG(name, entry, context, priority)
+ *    multi-core   OS_TASK_CONFIG(name, entry, context, priority, core_affinity)
+ *
+ *  There is nothing to place a task on when the build has one core, so the
+ *  argument does not exist there rather than being an ignored constant. On a
+ *  multi-core build it is required, which makes every task state where it may
+ *  run instead of silently defaulting: core_affinity is a bitmask
+ *  (OS_TASK_CORE(n), OR-combinable; OS_TASK_CORE_ANY = any core), and bits
+ *  naming cores beyond OS_CONFIG_CORE_COUNT make os_task_create fail with
  *  OS_STATUS_INVALID_ARG, so a stale pin is caught, not silently ignored. */
-#define OS_TASK_CONFIG_CORE(name, entry, context, priority, core_affinity) \
+#if (OS_CONFIG_CORE_COUNT > 1U)
+#define OS_TASK_CONFIG(name, entry, context, priority, core_affinity) \
     &(os_task_config_t) { \
         #name, \
         (entry), \
@@ -345,10 +423,18 @@ typedef enum
         sizeof(name##_STACK), \
         (core_affinity) \
     }
-
-/** Task configuration runnable on any core (single-core builds use this). */
+#else
 #define OS_TASK_CONFIG(name, entry, context, priority) \
-    OS_TASK_CONFIG_CORE(name, entry, context, priority, OS_TASK_CORE_ANY)
+    &(os_task_config_t) { \
+        #name, \
+        (entry), \
+        (context), \
+        (priority), \
+        (void *)(name##_STACK), \
+        sizeof(name##_STACK), \
+        OS_TASK_CORE_ANY \
+    }
+#endif
 
 /*
  * ***********************************************************************************************************
@@ -371,13 +457,14 @@ void os_start(void);
 /******************************************************************************************************/
 /**
  * @brief Default application task body (see OS_CONFIG_MAIN_TASK_* in os_config.h). os_init()
- *        creates and starts this task automatically; weak default idles - override in the
- *        application (copy of os_main_template.c, see README "Default application task") with
- *        real code. Not a "_cb" hook: this is where the application's own code runs, not a
- *        kernel query for platform behavior.
+ *        creates and starts this task automatically, so the application must define it: copy
+ *        os_main_template.c into the project as os_main.c (see README "Default application
+ *        task"). The kernel ships no stub, so a missing definition is a link error rather than
+ *        a task that silently does nothing. Not a "_cb" hook: this is where the application's
+ *        own code runs, not a kernel query for platform behavior.
  *
- *        Not started when OS_CONFIG_TEST_ENABLE is also 1: the self-test suite runs alone in
- *        that build instead of racing the application's own task (see README "Self-test suite").
+ *        Not referenced at all when OS_CONFIG_TEST_ENABLE is 1: the self-test suite runs alone
+ *        in that build (see README "Self-test suite"), so no os_main.c is needed there.
  */
 void os_main(void);
 
@@ -385,9 +472,11 @@ void os_main(void);
 /******************************************************************************************************/
 /**
  * @brief Kernel self-test suite entry point (see OS_CONFIG_TEST_* in os_config.h). os_init()
- *        creates and starts a task that calls this automatically; weak default does nothing -
- *        link the ahura_kernel/test library (CMake target "os_test") to run the real suite
- *        (see README "Self-test suite"). Not a "_cb" hook, same reasoning as os_main().
+ *        creates and starts a task that calls this automatically, so link the ahura_kernel/test
+ *        library (CMake target "os_test") to supply it (see README "Self-test suite"). The
+ *        kernel ships no stub, which is what lets a plain static-library link pull the suite in
+ *        and turns "forgot to link it" into a link error. Not a "_cb" hook, same reasoning as
+ *        os_main().
  */
 void os_test(void);
 #endif /* OS_CONFIG_TEST_ENABLE */
@@ -489,6 +578,56 @@ uint32_t os_tick_get(void);
 uint32_t os_cpu_usage_get(void);
 #endif /* OS_CONFIG_CPU_USAGE_ENABLE */
 
+#if (OS_CONFIG_ASSERT_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Report a failed OS_ASSERT and halt. Calls os_assert_failed_cb, then parks the core
+ *        with interrupts masked so a debugger stops at the cause. Never returns.
+ */
+void os_assert_failed(const char *file, uint32_t line);
+
+/******************************************************************************************************/
+/**
+ * @brief Application hook for a failed assertion: record or print the location before the
+ *        kernel halts. The application must define it (see os_cb_template.c) - the kernel
+ *        ships no stub, because a silent one would leave an assertion with nothing to report.
+ *        Runs with the failure's own context still intact, so keep it short and do not expect
+ *        to return from the assertion.
+ */
+void os_assert_failed_cb(const char *file, uint32_t line);
+#endif /* OS_CONFIG_ASSERT_ENABLE */
+
+#if (OS_CONFIG_LOG_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Format a log line and queue it for transmission. Prefer the OS_LOG_ERROR/WARN/INFO/
+ *        DEBUG macros, which also drop the call entirely below OS_CONFIG_LOG_LEVEL.
+ *
+ * Safe from tasks and ISRs, and never blocks: the line is formatted, copied into the ring
+ * buffer, and the caller returns. A line that does not fit is dropped whole and counted
+ * (os_log_dropped_get), never written in part.
+ */
+void os_log_write(uint32_t level, const char *fmt, ...);
+
+/******************************************************************************************************/
+/**
+ * @brief Number of log lines dropped so far because the buffer was full. Also reported into
+ *        the log itself once space frees up, so this is only needed for programmatic checks.
+ */
+uint32_t os_log_dropped_get(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Application hook that transmits finished log bytes; called from the kernel log task,
+ *        never from an ISR or a critical section, so it may block or start a DMA transfer.
+ *        Weak default discards everything, so logging costs nothing until this is provided.
+ *
+ * @param[in] data    Bytes to transmit; valid only for the duration of the call.
+ * @param[in] length  Number of bytes.
+ */
+void os_log_output_cb(const uint8_t *data, size_t length);
+#endif /* OS_CONFIG_LOG_ENABLE */
+
 /******************************************************************************************************/
 /**
  * @brief Pre-sleep callback invoked before entering low-power mode.
@@ -521,14 +660,6 @@ uint32_t os_tickless_expected_idle_ticks_get(void);
  *        platform clock and OS_CONFIG_TICK_HZ (not a fixed constant).
  */
 uint32_t os_tickless_max_suppressed_ticks_get(void);
-
-/******************************************************************************************************/
-/**
- * @brief Platform callback: return the CPU clock in Hz (0 = unknown). The weak default returns
- *        OS_CONFIG_CPU_CLOCK_HZ when configured, else the CMSIS SystemCoreClock global when the
- *        platform provides one. Platforms with another clock convention override this.
- */
-uint32_t os_clock_hz_get_cb(void);
 
 #if (OS_CONFIG_TRUSTZONE == OS_CONFIG_TRUSTZONE_NON_SECURE)
 /******************************************************************************************************/

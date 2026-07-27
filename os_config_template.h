@@ -69,18 +69,38 @@
  * since the previous call. Costs two counter updates per tick. */
 #define OS_CONFIG_CPU_USAGE_ENABLE          1U
 
-/* os_init() unconditionally creates and starts a default application task
- * running the weak os_main() (override it in the application, e.g.
- * os_main.c, copied from os_main_template.c) - sized in "Kernel sizing"
- * below, see the README "Default application task" section. Not created
- * when OS_CONFIG_TEST_ENABLE below is 1: the self-test task runs alone
- * instead (see the README "Self-test suite" section).
+/* OS_ASSERT(): catch static programming errors (a NULL object handle, a blocking call made
+ * from an ISR, an unbalanced critical section) at the point they happen instead of only
+ * through a status code the caller may ignore. Runtime outcomes that have a documented
+ * status - NOT_OWNER, BUSY, FULL, EMPTY, TIMEOUT - are never asserted on: callers are
+ * entitled to attempt the operation and handle the result.
  *
- * os_init() creates and starts a self-test task running the weak os_test()
- * (empty by default; link ahura_kernel/test - the "os_test" library - to run
- * the real kernel self-test suite there) - sized in "Kernel sizing" below,
- * see the README "Self-test suite" section. Off by default: opt in per
- * project. */
+ * A failure calls os_assert_failed_cb(), which the application must define, then parks the
+ * core with interrupts masked so a debugger lands on the cause. Assertions only ADD checks:
+ * every API still returns the same status either way, so turning this off leaves behavior
+ * unchanged. */
+#define OS_CONFIG_ASSERT_ENABLE             1U
+
+/* Buffered debug logging (OS_LOG_ERROR/WARN/INFO/DEBUG): printf-style calls format into a ring
+ * buffer and return immediately, and a low-priority kernel task (tsk_log) hands finished bytes
+ * to os_log_output_cb() for the application to transmit. Safe from tasks and ISRs, and it never
+ * blocks the caller. Two costs to budget for: tsk_log occupies one OS_CONFIG_MAX_TASKS slot,
+ * and formatting uses libc vsnprintf, which pulls newlib's formatter into the link (~1-3 KB) if
+ * the application does not already use printf. As usual, %f additionally needs the linker flag
+ * -u _printf_float. See the README "Debugging" section. */
+#define OS_CONFIG_LOG_ENABLE                1U
+
+/* os_init() unconditionally creates and starts a default application task running os_main(),
+ * which the application must define in its own os_main.c (copied from os_main_template.c) -
+ * the kernel ships no stub, so a missing one is a link error. Sized in "Kernel sizing" below,
+ * see the README "Default application task" section. Not created when OS_CONFIG_TEST_ENABLE
+ * below is 1: the self-test task runs alone instead, and no os_main.c is needed at all (see
+ * the README "Self-test suite" section).
+ *
+ * os_init() creates and starts a self-test task running os_test(), which comes from the
+ * ahura_kernel/test library (the "os_test" CMake target) - link it and the suite runs, forget
+ * it and the link fails. Sized in "Kernel sizing" below, see the README "Self-test suite"
+ * section. Off by default: opt in per project. */
 #define OS_CONFIG_TEST_ENABLE               0U
 
 /*
@@ -91,21 +111,17 @@
 
 #define OS_CONFIG_TICK_HZ                   1000U
 
-/**
- * CPU clock source. The kernel reads the clock through the weak callback
- * os_clock_hz_get_cb() so any platform can plug in:
- *   0            auto: the callback returns the CMSIS SystemCoreClock global
- *                when the platform provides it (weak reference), else 0.
- *   > 0          fixed clock in Hz; the callback returns this constant
- *                (platforms without CMSIS and without dynamic scaling).
- * Platforms with their own convention override os_clock_hz_get_cb() instead.
- */
-#define OS_CONFIG_CPU_CLOCK_HZ              0U
+/* The CPU clock is NOT configured here. The kernel reads the live CMSIS
+ * SystemCoreClock variable, which the device's own SystemInit() sets and
+ * SystemCoreClockUpdate() refreshes after every clock-tree change - a
+ * build-time constant could not follow a runtime switch. Devices whose startup
+ * code does not define that symbol just define it themselves; see the kernel
+ * README, "Platform clock". */
 
 /* Kernel heap size in bytes for os_mem_alloc/os_mem_free. */
 #define OS_CONFIG_HEAP_SIZE                 4096U
 
-/* Task table size; each enabled kernel service task (work, timer) occupies
+/* Task table size; each enabled kernel service task (work, timer, log) occupies
  * one of these slots - and so does the default application task (tsk_main,
  * unconditional unless OS_CONFIG_TEST_ENABLE above is 1) and the self-test
  * task (tsk_test, OS_CONFIG_TEST_ENABLE above) when enabled. Budget for all
@@ -143,6 +159,25 @@
  * OS_CONFIG_MAIN_TASK_* above. */
 #define OS_CONFIG_TEST_STACK_SIZE           2048U
 #define OS_CONFIG_TEST_PRIORITY             2U
+
+/**
+ * Debug log sizing (OS_CONFIG_LOG_ENABLE above).
+ *
+ * LEVEL        Calls above this compile to nothing at the call site, arguments included:
+ *              OS_LOG_LEVEL_NONE / _ERROR / _WARN / _INFO / _DEBUG.
+ * BUFFER_SIZE  Ring buffer in bytes. Sized for the burst you want to survive: a task logging
+ *              faster than the UART drains simply loses the excess (counted, then reported).
+ * LINE_MAX     Longest single formatted line. Also the scratch buffer os_log_write() puts on
+ *              the CALLER's stack, so every task that logs needs this much headroom. Longer
+ *              lines are truncated, never overflowed.
+ * TASK_*       tsk_log, which drains the ring and calls os_log_output_cb(). Its stack must hold
+ *              that callback. Keep the priority low: logging must never preempt real work.
+ */
+#define OS_CONFIG_LOG_LEVEL                 OS_LOG_LEVEL_INFO
+#define OS_CONFIG_LOG_BUFFER_SIZE           1024U
+#define OS_CONFIG_LOG_LINE_MAX              128U
+#define OS_CONFIG_LOG_TASK_STACK_SIZE       512U
+#define OS_CONFIG_LOG_TASK_PRIORITY         1U
 
 /* Which cores the kernel service tasks (and so the work handlers and timer
  * callbacks) may run on: core-affinity bitmasks, 0 = any core. Only

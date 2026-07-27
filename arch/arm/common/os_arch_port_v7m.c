@@ -285,7 +285,7 @@ void os_arch_start_first_task(void)
  */
 void os_arch_tick_init(void)
 {
-    uint32_t clock_hz = os_clock_hz_get_cb();
+    uint32_t clock_hz = os_arch_clock_hz_get();
     uint32_t reload_value;
 
     if ((clock_hz == 0U) || (OS_CONFIG_TICK_HZ == 0U))
@@ -372,7 +372,7 @@ uint32_t os_arch_cycle_count_get(void)
  */
 uint32_t os_arch_elapsed_ticks_get(void)
 {
-    uint32_t clock_hz = os_clock_hz_get_cb();
+    uint32_t clock_hz = os_arch_clock_hz_get();
     uint32_t now_cycles;
     uint32_t delta_cycles;
     uint32_t elapsed_ticks;

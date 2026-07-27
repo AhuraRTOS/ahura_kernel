@@ -74,6 +74,7 @@ add_library(ahura_kernel STATIC
 	core/os_event.c
 	core/os_kernel.c
 	core/os_list.c
+	core/os_log.c
 	core/os_mem.c
 	core/os_mutex.c
 	core/os_queue.c

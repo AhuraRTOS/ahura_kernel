@@ -43,9 +43,13 @@
     !defined(OS_CONFIG_ALLOC_ENABLE) ||                                                                \
     !defined(OS_CONFIG_STACK_WATERMARK_ENABLE) ||                                                      \
     !defined(OS_CONFIG_CPU_USAGE_ENABLE) ||                                                            \
+    !defined(OS_CONFIG_ASSERT_ENABLE) || !defined(OS_CONFIG_LOG_ENABLE) ||                             \
+    !defined(OS_CONFIG_LOG_LEVEL) || !defined(OS_CONFIG_LOG_BUFFER_SIZE) ||                            \
+    !defined(OS_CONFIG_LOG_LINE_MAX) || !defined(OS_CONFIG_LOG_TASK_STACK_SIZE) ||                     \
+    !defined(OS_CONFIG_LOG_TASK_PRIORITY) ||                                                           \
     !defined(OS_CONFIG_TEST_ENABLE) ||                                                                 \
     !defined(OS_CONFIG_TICK_HZ) ||                                                                     \
-    !defined(OS_CONFIG_CPU_CLOCK_HZ) || !defined(OS_CONFIG_HEAP_SIZE) ||                               \
+    !defined(OS_CONFIG_HEAP_SIZE) ||                                                                   \
     !defined(OS_CONFIG_MAX_TASKS) ||                                                                   \
     !defined(OS_CONFIG_MAX_TIMERS) || !defined(OS_CONFIG_MAX_WORKS) ||                                 \
     !defined(OS_CONFIG_MIN_STACK_SIZE) || !defined(OS_CONFIG_WORK_STACK_SIZE) ||                       \
@@ -95,10 +99,16 @@ extern "C"
 #endif
 
 /* Weak-linkage marker for user-overridable defaults (the _cb callbacks and
- * optional linker symbols). */
+ * optional linker symbols). Same ordering rule as OS_STACK_ALIGNED in ahura.h:
+ * armclang also defines __clang__, and clang also defines __GNUC__, so the
+ * most specific test comes first or the later branches never match. */
 #ifndef OS_WEAK
-#if defined(__GNUC__)
-#define OS_WEAK __attribute__((weak))
+#if defined(__ARMCC_VERSION) && (__ARMCC_VERSION >= 6000000)
+#define OS_WEAK __attribute__((weak))   /* Arm Compiler 6 (armclang) */
+#elif defined(__clang__)
+#define OS_WEAK __attribute__((weak))   /* LLVM clang                */
+#elif defined(__GNUC__)
+#define OS_WEAK __attribute__((weak))   /* GNU GCC                   */
 #else
 #define OS_WEAK
 #endif
@@ -557,17 +567,37 @@ void os_arch_tz_context_restore_cb(uint32_t task_id);
 
 /*
  * ***********************************************************************************************************
- * Platform callbacks
+ * CPU clock
  * ***********************************************************************************************************
 */
 
+/* The CPU clock in Hz, as maintained by the device's own startup code. On CMSIS platforms
+ * SystemInit() sets it and SystemCoreClockUpdate() refreshes it after every clock-tree change,
+ * so reading the live variable is always correct - including on a board that boots on an
+ * internal oscillator and only later switches to a PLL.
+ *
+ * The kernel deliberately does NOT mirror this into a build-time constant: a constant cannot
+ * follow a runtime clock switch, and a stale one would silently mis-program the SysTick reload
+ * and every busy-wait delay.
+ *
+ * Devices whose startup code does not provide the CMSIS symbol simply define it themselves,
+ * which is all the kernel needs:
+ *
+ *     uint32_t SystemCoreClock = 120000000U;   // and update it if the clock tree changes
+ */
+extern uint32_t SystemCoreClock;
+
 /******************************************************************************************************/
 /**
- * @brief Platform callback: return the CPU clock in Hz (0 = unknown). The weak default (os_kernel.c)
- *        returns OS_CONFIG_CPU_CLOCK_HZ when configured, else the CMSIS SystemCoreClock global when
- *        the platform provides one; platforms with another clock convention override it.
+ * @brief Current CPU clock in Hz. Lives in the arch layer because SystemCoreClock is an
+ *        ARM/CMSIS convention, not a portable one.
+ *
+ * @return uint32_t  CPU clock frequency in Hz.
  */
-uint32_t os_clock_hz_get_cb(void);
+static inline uint32_t os_arch_clock_hz_get(void)
+{
+    return SystemCoreClock;
+}
 
 /*
  * ***********************************************************************************************************

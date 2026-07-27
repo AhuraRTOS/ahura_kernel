@@ -10,10 +10,10 @@
  *
  * os_main() is deliberately not named with the "_cb" suffix used elsewhere
  * in this kernel: that suffix is reserved for callbacks the kernel queries
- * for platform behavior (os_clock_hz_get_cb, os_tickless_pre_sleep_cb, ...).
+ * for platform behavior (os_tickless_pre_sleep_cb, os_arch_core_id_get_cb, ...).
  * os_main() is different in kind - it is where the application's own code
  * runs, not a query the kernel makes about the platform - even though it is
- * wired up the same way (a weak default in os_kernel.c, overridden here).
+ * supplied the same way (declared in ahura.h, defined here).
  *
  * Task creation itself lives in the kernel (os_kernel.c's os_main_system_init(),
  * called from os_init()) and is unconditional except in self-test builds

@@ -234,6 +234,14 @@ void os_timer_tick_process(uint32_t elapsed_ticks);
  */
 os_status os_work_system_init(void);
 
+#if (OS_CONFIG_LOG_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Create and start the kernel log service task (os_log.c).
+ */
+os_status os_log_system_init(void);
+#endif
+
 /******************************************************************************************************/
 /**
  * @brief Advance delayed work items by elapsed ticks (os_work.c, ISR context).

@@ -31,20 +31,71 @@
  * ***********************************************************************************************************
 */
 
+/* Nothing to implement here. The kernel reads the CPU frequency straight from the CMSIS
+ * SystemCoreClock variable, which the device's SystemInit() sets and SystemCoreClockUpdate()
+ * refreshes after every clock-tree change, so a board that boots on an internal oscillator and
+ * later switches to a PLL is handled with no kernel involvement.
+ *
+ * Only devices whose startup code does not provide that symbol need to act, and then only by
+ * defining it (anywhere in the application):
+ *
+ *     uint32_t SystemCoreClock = 120000000U;
+ *
+ * Keep it updated if the clock tree changes at runtime; the kernel re-reads it on every use.
+ */
+
+/*
+ * ***********************************************************************************************************
+ * Debug hooks
+ * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_ASSERT_ENABLE == 1U)
 /******************************************************************************************************/
 /**
- * @brief Return the CPU clock in Hz (0 = unknown; tick setup and busy-waits then refuse to run).
+ * @brief Called when an OS_ASSERT fails, just before the kernel halts.
  *
- * This body matches the kernel default for CMSIS platforms. Adapt for
- * anything else: return a constant, query the clock driver, or report the
- * current frequency under dynamic frequency scaling.
+ * REQUIRED when OS_CONFIG_ASSERT_ENABLE is 1: the kernel ships no default, so leaving this out
+ * is a link error. That is deliberate - a stub that did nothing would turn every assertion into
+ * an unexplained halt with no clue where it came from.
+ *
+ * The kernel parks the core right after this returns, so there is no way to continue. Record
+ * enough to find the cause: print it, store it in a retained/backup register or a noinit
+ * section that survives reset, or just break into the debugger as below.
+ *
+ * Do not log from here through OS_LOG_*: the log task cannot run once the core is parked, so
+ * the line would sit unsent in the buffer. Write directly to the transport instead.
  */
-uint32_t os_clock_hz_get_cb(void)
+void os_assert_failed_cb(const char *file, uint32_t line)
 {
-    extern uint32_t SystemCoreClock;    /* CMSIS platforms */
+    (void)file;
+    (void)line;
 
-    return SystemCoreClock;
+    /* Example: __asm volatile("bkpt 0"); or a direct blocking UART write. */
 }
+#endif /* OS_CONFIG_ASSERT_ENABLE */
+
+#if (OS_CONFIG_LOG_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Transmit finished log bytes.
+ *
+ * Called from the kernel log task, never from an ISR or a critical section, so it may block or
+ * start a DMA transfer. The buffer is only valid for the duration of the call: copy it if the
+ * transport completes asynchronously, or block here until it has been consumed.
+ *
+ * Keep this reasonably prompt. It runs at OS_CONFIG_LOG_TASK_PRIORITY, so a slow transport
+ * delays only the log, but the ring keeps filling while it runs and lines are dropped once it
+ * is full.
+ */
+void os_log_output_cb(const uint8_t *data, size_t length)
+{
+    (void)data;
+    (void)length;
+
+    /* Example: HAL_UART_Transmit(&huart, (uint8_t *)data, length, HAL_MAX_DELAY); */
+}
+#endif /* OS_CONFIG_LOG_ENABLE */
 
 /*
  * ***********************************************************************************************************

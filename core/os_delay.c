@@ -84,7 +84,7 @@ os_status os_delay_ms(uint32_t milliseconds)
  */
 os_status os_delay_us(uint32_t microseconds)
 {
-    uint32_t clock_hz = os_clock_hz_get_cb();
+    uint32_t clock_hz = os_arch_clock_hz_get();
     uint64_t cycle_count;
 
     if (microseconds == 0U)
@@ -208,7 +208,7 @@ static os_status os_delay_ticks(uint32_t ticks)
     }
 
     /* Pre-scheduler or interrupt context: precise busy-wait. */
-    clock_hz = os_clock_hz_get_cb();
+    clock_hz = os_arch_clock_hz_get();
     if (clock_hz == 0U)
     {
         return OS_STATUS_ERROR;
