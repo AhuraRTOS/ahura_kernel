@@ -84,6 +84,11 @@
  * ***********************************************************************************************************
 */
 
+/* Backs os_arch_atomic_cas on this port, which has no exclusives to rely on. Separate from the
+ * kernel critical section's lock so an atomic operation never waits on unrelated kernel work.
+ * One instance for the whole system, which is why it lives here and not in a header. */
+static os_arch_spinlock_t os_arch_atomic_lock = OS_ARCH_SPINLOCK_INIT;
+
 static uint32_t os_arch_sleep_entry_cycles = 0U;
 static uint32_t os_arch_planned_idle_ticks = 0U;
 static uint32_t os_arch_cycle_accum        = 0U;
@@ -399,39 +404,72 @@ uint32_t os_arch_cycle_count_get(void)
  */
 uint32_t os_arch_elapsed_ticks_get(void)
 {
-    uint32_t clock_hz = os_arch_clock_hz_get();
-    uint32_t now_cycles;
-    uint32_t delta_cycles;
-    uint32_t elapsed_ticks;
-
-    if (os_arch_planned_idle_ticks == 0U)
-    {
-        return 0U;
-    }
-
-    now_cycles   = os_arch_cycle_count_get();
-    delta_cycles = now_cycles - os_arch_sleep_entry_cycles;
-
-    if (clock_hz == 0U)
-    {
-        elapsed_ticks = os_arch_planned_idle_ticks;
-    }
-    else
-    {
-        uint64_t scaled_ticks = ((uint64_t)delta_cycles * (uint64_t)OS_CONFIG_TICK_HZ);
-
-        scaled_ticks /= (uint64_t)clock_hz;
-        elapsed_ticks = (uint32_t)scaled_ticks;
-    }
-
-    if (elapsed_ticks > os_arch_planned_idle_ticks)
-    {
-        elapsed_ticks = os_arch_planned_idle_ticks;
-    }
-
+    /* Always 0 on this port, and deliberately so.
+     *
+     * os_arch_max_suppressed_ticks_get() returns 0 here: ticking is never suppressed, so the WFI
+     * runs with SysTick still counting and its interrupt still enabled, and the interrupt that
+     * ends the sleep is normally the very next tick. Every tick that passed was therefore already
+     * counted, one at a time, by os_tick_handler().
+     *
+     * Returning a measured duration as well would have os_tick.c announce time the ISR had just
+     * accounted for, advancing os_tick_count at roughly twice real time for the whole idle period
+     * - delays and timers would then fire early in proportion to how long the system sat idle. A
+     * suppression-capable port (v8m) returns a real figure precisely because there the ISR did not
+     * run. Measuring the sleep only becomes meaningful here once this port learns to reprogram
+     * SysTick, at which point os_arch_sleep_prepare's recorded entry cycle count is what it needs.
+     */
     os_arch_planned_idle_ticks = 0U;
 
-    return elapsed_ticks;
+    return 0U;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Close the tickless window. Nothing to release on this port.
+ *
+ * @return None.
+ */
+void os_arch_sleep_finish(void)
+{
+    /* os_arch_sleep_prepare takes no interrupt mask here: a plain WFI needs interrupts left
+     * enabled in order to wake at all, so there is nothing to hand back. */
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Atomic compare-and-swap. See os_arch_port_common.h.
+ *
+ * ARMv6-M has no LDREX/STREX, so atomicity is bought by excluding everyone else for the handful
+ * of instructions the update takes: interrupts are masked, and on a multi-core build the kernel
+ * spinlock keeps the other cores out as well. That makes this the one port where an atomic
+ * operation costs interrupt latency, which is worth knowing before putting one in a hot path.
+ *
+ * Never fails spuriously, unlike the exclusives-based ports, but callers still loop because the
+ * portable contract allows it.
+ *
+ * @param[in,out] target    Word to update.
+ * @param[in]     expected  Value the caller believes target holds.
+ * @param[in]     desired   Value to store if it still does.
+ * @return bool  true if desired was stored.
+ */
+bool os_arch_atomic_cas(__IO int32_t *target, int32_t expected, int32_t desired)
+{
+    bool     swapped = false;
+    uint32_t mask_state;
+
+    mask_state = os_arch_kernel_mask_save();
+    os_arch_spinlock_acquire(&os_arch_atomic_lock);
+
+    if (*target == expected)
+    {
+        *target = desired;
+        swapped = true;
+    }
+
+    os_arch_spinlock_release(&os_arch_atomic_lock);
+    os_arch_kernel_mask_restore(mask_state);
+
+    return swapped;
 }
 
 /******************************************************************************************************/

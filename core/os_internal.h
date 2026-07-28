@@ -24,6 +24,18 @@ extern "C"
  * ***********************************************************************************************************
 */
 
+/*
+ * ***********************************************************************************************************
+ * PART 1 - ALWAYS AVAILABLE
+ * ***********************************************************************************************************
+*/
+
+/*
+ * ***********************************************************************************************************
+ * Tasks and the scheduler
+ * ***********************************************************************************************************
+*/
+
 /******************************************************************************************************/
 /**
  * @brief Initialize the task management subsystem (os_task.c).
@@ -142,31 +154,6 @@ void os_task_waiters_wake_all(os_list_t *waiters);
  */
 uint32_t os_task_current_id_get(void);
 
-#if (OS_CONFIG_MUTEX_ENABLE == 1U)
-/******************************************************************************************************/
-/**
- * @brief Link a just-acquired mutex into the calling task's owned-mutex list (os_task.c,
- *        call inside the same critical section as the successful lock).
- */
-void os_task_mutex_owner_link(os_list_node_t *owner_node);
-
-/******************************************************************************************************/
-/**
- * @brief Boost owner_task_id's effective priority to the calling (waiting) task's effective
- *        priority if that is higher; single-level only, not transitive (os_task.c, call inside
- *        a critical section, right before joining the mutex's waiter list).
- */
-void os_task_mutex_priority_inherit(uint32_t owner_task_id);
-
-/******************************************************************************************************/
-/**
- * @brief Unlink a released mutex from its owner's owned-mutex list and recompute the owner's
- *        effective priority as max(base_priority, highest waiter still queued on any mutex it
- *        still holds) (os_task.c, call inside a critical section, right after releasing).
- */
-void os_task_mutex_owner_unlink_and_reprioritize(os_list_node_t *owner_node);
-#endif /* OS_CONFIG_MUTEX_ENABLE */
-
 /******************************************************************************************************/
 /**
  * @brief Check whether the idle task is currently running (os_task.c, ISR-safe).
@@ -200,6 +187,18 @@ uint32_t* os_task_stack_select_next(void);
 
 /******************************************************************************************************/
 /**
+ * @brief Return ticks until the next finite-delay sleeper wakes, UINT32_MAX when none (os_task.c).
+ */
+uint32_t os_task_next_delay_ticks_get(void);
+
+/*
+ * ***********************************************************************************************************
+ * Tick
+ * ***********************************************************************************************************
+*/
+
+/******************************************************************************************************/
+/**
  * @brief Initialize the kernel tick source and bookkeeping (os_tick.c).
  */
 void os_tick_init(void);
@@ -216,6 +215,12 @@ void os_tick_handler(void);
  */
 void os_tick_announce(uint32_t elapsed_ticks);
 
+/*
+ * ***********************************************************************************************************
+ * Software timers
+ * ***********************************************************************************************************
+*/
+
 /******************************************************************************************************/
 /**
  * @brief Create and start the kernel timer service task (os_timer.c).
@@ -230,17 +235,21 @@ void os_timer_tick_process(uint32_t elapsed_ticks);
 
 /******************************************************************************************************/
 /**
+ * @brief Return ticks until the next active timer expiry, UINT32_MAX when none (os_timer.c).
+ */
+uint32_t os_timer_next_expiry_ticks_get(void);
+
+/*
+ * ***********************************************************************************************************
+ * Work queue
+ * ***********************************************************************************************************
+*/
+
+/******************************************************************************************************/
+/**
  * @brief Create and start the kernel work service task (os_work.c).
  */
 os_status os_work_system_init(void);
-
-#if (OS_CONFIG_LOG_ENABLE == 1U)
-/******************************************************************************************************/
-/**
- * @brief Create and start the kernel log service task (os_log.c).
- */
-os_status os_log_system_init(void);
-#endif
 
 /******************************************************************************************************/
 /**
@@ -250,22 +259,10 @@ void os_work_tick_process(uint32_t elapsed_ticks);
 
 /******************************************************************************************************/
 /**
- * @brief Return ticks until the next active timer expiry, UINT32_MAX when none (os_timer.c).
- */
-uint32_t os_timer_next_expiry_ticks_get(void);
-
-/******************************************************************************************************/
-/**
  * @brief Return ticks until the next delayed work item becomes ready, 0 when one is already
  *        ready, UINT32_MAX when none (os_work.c).
  */
 uint32_t os_work_next_ready_ticks_get(void);
-
-/******************************************************************************************************/
-/**
- * @brief Return ticks until the next finite-delay sleeper wakes, UINT32_MAX when none (os_task.c).
- */
-uint32_t os_task_next_delay_ticks_get(void);
 
 /*
  * ***********************************************************************************************************
@@ -354,6 +351,57 @@ static inline uint32_t os_internal_wait_remaining(uint32_t budget_ticks, uint32_
 
     return (elapsed >= budget_ticks) ? 0U : (budget_ticks - elapsed);
 }
+
+/*
+ * ***********************************************************************************************************
+ * PART 2 - CONFIGURABLE
+ * ***********************************************************************************************************
+*/
+
+/*
+ * ***********************************************************************************************************
+ * Mutex priority inheritance - OS_CONFIG_MUTEX_ENABLE
+ * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Link a just-acquired mutex into the calling task's owned-mutex list (os_task.c,
+ *        call inside the same critical section as the successful lock).
+ */
+void os_task_mutex_owner_link(os_list_node_t *owner_node);
+
+/******************************************************************************************************/
+/**
+ * @brief Boost owner_task_id's effective priority to the calling (waiting) task's effective
+ *        priority if that is higher; single-level only, not transitive (os_task.c, call inside
+ *        a critical section, right before joining the mutex's waiter list).
+ */
+void os_task_mutex_priority_inherit(uint32_t owner_task_id);
+
+/******************************************************************************************************/
+/**
+ * @brief Unlink a released mutex from its owner's owned-mutex list and recompute the owner's
+ *        effective priority as max(base_priority, highest waiter still queued on any mutex it
+ *        still holds) (os_task.c, call inside a critical section, right after releasing).
+ */
+void os_task_mutex_owner_unlink_and_reprioritize(os_list_node_t *owner_node);
+#endif /* OS_CONFIG_MUTEX_ENABLE */
+
+/*
+ * ***********************************************************************************************************
+ * Buffered logging           - OS_CONFIG_LOG_ENABLE
+ * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_LOG_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Create and start the kernel log service task (os_log.c).
+ */
+os_status os_log_system_init(void);
+#endif
 
 #ifdef __cplusplus
 }

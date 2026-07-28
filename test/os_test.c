@@ -52,14 +52,14 @@ OS_TASK_DEFINE(helper, 512U);
 OS_TASK_DEFINE(helper2, 512U);
 OS_TASK_DEFINE(helper3, 512U);
 
-static volatile uint32_t g_worker_counter    = 0U;
-static volatile bool     g_worker_should_run = true;
+static __IO uint32_t g_worker_counter    = 0U;
+static __IO bool     g_worker_should_run = true;
 
 /* Shared between test_priority_preemption() and test_cpu_usage(): a task that spins
  * incrementing this counter, without ever yielding/delaying, so it only runs on ticks
  * nothing higher-priority is ready for. */
-static volatile uint32_t g_busy_counter    = 0U;
-static volatile bool     g_busy_should_run = true;
+static __IO uint32_t g_busy_counter    = 0U;
+static __IO bool     g_busy_should_run = true;
 
 #define TEST_BURST_ITERATIONS 200000UL
 
@@ -138,17 +138,29 @@ static os_event_group_t g_bench_event;
 /* Shared between two equal-priority tasks in test_context_switch_timing(): each increments
  * this once per loop turn, then yields - so its total over a fixed window is (approximately)
  * the number of context switches that occurred. */
-static volatile uint32_t g_switch_count      = 0U;
-static volatile bool     g_switch_should_run = true;
+static __IO uint32_t g_switch_count      = 0U;
+static __IO bool     g_switch_should_run = true;
 
 #if (OS_CONFIG_MUTEX_ENABLE == 1U)
 static os_mutex_t g_mutex;
 #endif
 
+/* test_spawn_helper drives the mutex, semaphore, queue and event sections, so it has to exist
+ * whenever any one of them is compiled in. Guarding it on a single feature left the other three
+ * calling an undeclared function. */
+#define TEST_HELPER_NEEDED ((OS_CONFIG_SEMAPHORE_ENABLE == 1U) || (OS_CONFIG_MUTEX_ENABLE == 1U) || \
+                            (OS_CONFIG_QUEUE_ENABLE == 1U)     || (OS_CONFIG_EVENT_ENABLE == 1U))
+
 #if (OS_CONFIG_SEMAPHORE_ENABLE == 1U)
-static os_semaphore_t g_sync_sem;   /* helper -> main "ready" signal, reused across sections */
 static os_semaphore_t g_bin_sem;
 static os_semaphore_t g_count_sem;
+#endif
+
+/* Every use of this one - the give in test_helper_entry and the init/take in test_mutex - sits
+ * behind both switches, so defining it on the semaphore switch alone left it unused whenever
+ * mutexes were compiled out. */
+#if (OS_CONFIG_SEMAPHORE_ENABLE == 1U) && (OS_CONFIG_MUTEX_ENABLE == 1U)
+static os_semaphore_t g_sync_sem;   /* helper -> main "ready" signal */
 #endif
 
 #if (OS_CONFIG_QUEUE_ENABLE == 1U)
@@ -163,32 +175,40 @@ static os_event_group_t g_event;
 #if (OS_CONFIG_TIMER_ENABLE == 1U)
 static os_timer_t        g_timer_oneshot;
 static os_timer_t        g_timer_periodic;
-static volatile uint32_t g_oneshot_fired  = 0U;
-static volatile uint32_t g_periodic_fired = 0U;
+static __IO uint32_t g_oneshot_fired  = 0U;
+static __IO uint32_t g_periodic_fired = 0U;
 #endif
 
 #if (OS_CONFIG_WORK_ENABLE == 1U)
 static os_work_t         g_work;
-static volatile bool     g_work_ran       = false;
-static volatile uint32_t g_work_run_count = 0U;
+static __IO bool     g_work_ran       = false;
+static __IO uint32_t g_work_run_count = 0U;
 #endif
 
 #if (OS_CONFIG_LOG_ENABLE == 1U)
 /* Capture buffer for test_log(): this file defines os_log_output_cb, overriding the kernel's
  * weak default, so the log task hands its bytes here instead of to a UART. Kept small on
  * purpose - only the most recent output needs inspecting. */
-#define TEST_LOG_CAPTURE_SIZE 512U
+/* Must hold everything a single drain can deliver after the capture is cleared: a full ring, plus
+ * the dropped-lines notice tsk_log emits once that ring empties.
+ *
+ * Sized from the ring rather than fixed, because getting this wrong does not look like a capture
+ * problem. At 512 bytes the flood test filled the capture with "flood ..." lines and silently
+ * discarded the notice that arrived after them, so three checks failed as though the kernel had
+ * never emitted it. */
+#define TEST_LOG_CAPTURE_SIZE (OS_CONFIG_LOG_BUFFER_SIZE + 128U)
 
 static char              g_log_capture[TEST_LOG_CAPTURE_SIZE];
-static volatile size_t   g_log_capture_len   = 0U;
-static volatile uint32_t g_log_capture_lines = 0U;
-static volatile bool     g_log_capture_on    = false;
+static __IO size_t   g_log_capture_len      = 0U;
+static __IO uint32_t g_log_capture_lines    = 0U;
+static __IO bool     g_log_capture_on       = false;
+static __IO bool     g_log_capture_overflow = false;
 #endif
 
 #if (OS_CONFIG_TASK_NOTIFY_ENABLE == 1U)
-static volatile os_status g_notify_wait_status;
-static volatile uint32_t  g_notify_wait_value;
-static volatile uint32_t  g_notify_wait_ticks;
+static __IO os_status g_notify_wait_status;
+static __IO uint32_t  g_notify_wait_value;
+static __IO uint32_t  g_notify_wait_ticks;
 static uint32_t           g_notify_wait_timeout_ms; /* set by the test before starting the waiter */
 #endif
 
@@ -237,8 +257,8 @@ typedef struct
 
 static test_producer_ctx_t g_producer_ctx[2];
 static os_mutex_t          g_pipeline_mutex;
-static volatile uint32_t   g_pipeline_total;
-static volatile uint32_t   g_pipeline_processed;
+static __IO uint32_t   g_pipeline_total;
+static __IO uint32_t   g_pipeline_processed;
 #endif
 
 #if (OS_CONFIG_MUTEX_ENABLE == 1U)
@@ -250,14 +270,14 @@ typedef struct
 
 static test_prio_ctx_t   g_prio_ctx[3];
 static os_mutex_t        g_prio_mutex;
-static volatile uint32_t g_prio_order[3];
-static volatile uint32_t g_prio_order_count;
+static __IO uint32_t g_prio_order[3];
+static __IO uint32_t g_prio_order_count;
 #endif
 
 #if (OS_CONFIG_MUTEX_ENABLE == 1U)
 static os_mutex_t        g_inherit_mutex;
-static volatile bool     g_inherit_high_done;
-static volatile uint32_t g_inherit_medium_counter;
+static __IO bool     g_inherit_high_done;
+static __IO uint32_t g_inherit_medium_counter;
 
 /* Two mutexes held at once by the same owner, each with its own higher-priority waiter -
  * see test_mutex_multi_inheritance(). */
@@ -271,7 +291,7 @@ typedef struct
 static test_inherit2_ctx_t g_inherit2_ctx[2];
 static os_mutex_t          g_inherit2_mutex_a;
 static os_mutex_t          g_inherit2_mutex_b;
-static volatile uint32_t   g_inherit2_done_mask;
+static __IO uint32_t   g_inherit2_done_mask;
 #endif
 
 #if (OS_CONFIG_QUEUE_ENABLE == 1U) && (OS_CONFIG_EVENT_ENABLE == 1U)
@@ -309,13 +329,13 @@ typedef struct
 } test_stress_ctx_t;
 
 static test_stress_ctx_t g_stress_ctx[OS_TEST_STRESS_WORKER_COUNT];
-static volatile uint32_t g_stress_done[OS_TEST_STRESS_WORKER_COUNT];        /* iterations completed   */
-static volatile uint32_t g_stress_mutex_hits[OS_TEST_STRESS_WORKER_COUNT];  /* successful mutex locks */
-static volatile bool     g_stress_corrupt[OS_TEST_STRESS_WORKER_COUNT];    /* heap/queue corruption seen */
+static __IO uint32_t g_stress_done[OS_TEST_STRESS_WORKER_COUNT];        /* iterations completed   */
+static __IO uint32_t g_stress_mutex_hits[OS_TEST_STRESS_WORKER_COUNT];  /* successful mutex locks */
+static __IO bool     g_stress_corrupt[OS_TEST_STRESS_WORKER_COUNT];    /* heap/queue corruption seen */
 static size_t            g_stress_watermark[OS_TEST_STRESS_WORKER_COUNT];  /* self-reported stack watermark */
 
 static os_mutex_t        g_stress_mutex;
-static volatile uint32_t g_stress_shared_counter; /* protected exclusively by g_stress_mutex */
+static __IO uint32_t g_stress_shared_counter; /* protected exclusively by g_stress_mutex */
 
 static os_semaphore_t    g_stress_sem;
 static os_event_group_t  g_stress_event;
@@ -333,7 +353,7 @@ static bool      test_wait_inactive(const os_task_t *task, uint32_t timeout_ms);
 static void      test_worker_entry(void *context);
 static void      test_self_pause_worker_entry(void *context);
 static void      test_helper_entry(void *context);
-#if (OS_CONFIG_SEMAPHORE_ENABLE == 1U)
+#if TEST_HELPER_NEEDED
 static os_status test_spawn_helper(helper_role_t role, uint32_t hold_ms, uint32_t bits, uint32_t value);
 #endif
 
@@ -351,6 +371,10 @@ static void test_semaphore(void);
 #endif
 #if (OS_CONFIG_QUEUE_ENABLE == 1U)
 static void test_queue(void);
+static void test_queue_define_and_dynamic(void);
+#if (OS_CONFIG_ATOMIC_ENABLE == 1U)
+static void test_atomic(void);
+#endif
 #endif
 #if (OS_CONFIG_EVENT_ENABLE == 1U)
 static void test_event_group(void);
@@ -446,10 +470,19 @@ void os_log_output_cb(const uint8_t *data, size_t length)
     {
         char c = (char)data[i];
 
-        if (g_log_capture_on && (g_log_capture_len < (TEST_LOG_CAPTURE_SIZE - 1U)))
+        if (g_log_capture_on)
         {
-            g_log_capture[g_log_capture_len] = c;
-            g_log_capture_len++;
+            if (g_log_capture_len < (TEST_LOG_CAPTURE_SIZE - 1U))
+            {
+                g_log_capture[g_log_capture_len] = c;
+                g_log_capture_len++;
+            }
+            else
+            {
+                /* Remember that bytes were thrown away. Without this, a capture that is too small
+                 * makes the kernel look like it never emitted what the test is searching for. */
+                g_log_capture_overflow = true;
+            }
         }
 
         if (c == '\n')
@@ -532,7 +565,7 @@ static void test_busy_spin_entry(void *context)
  */
 static void test_burst_spin_entry(void *context)
 {
-    volatile uint32_t i;
+    __IO uint32_t i;
 
     (void)context;
 
@@ -621,7 +654,7 @@ static void test_helper_entry(void *context)
     }
 }
 
-#if (OS_CONFIG_SEMAPHORE_ENABLE == 1U)
+#if TEST_HELPER_NEEDED
 /******************************************************************************************************/
 static os_status test_spawn_helper(helper_role_t role, uint32_t hold_ms, uint32_t bits, uint32_t value)
 {
@@ -973,10 +1006,15 @@ static void test_priority_preemption(void)
 /******************************************************************************************************/
 static void test_mutex(void)
 {
+#if (OS_CONFIG_SEMAPHORE_ENABLE == 1U)
+    /* Only the contention part below uses these, and it needs a semaphore to know when the helper
+     * has actually taken the mutex. Declaring them unconditionally left them unused whenever
+     * semaphores were compiled out. */
     uint32_t  t0;
     uint32_t  t1;
     uint32_t  delta;
     os_status status;
+#endif
 
     test_print_section("Mutex");
 
@@ -1072,6 +1110,277 @@ static void test_semaphore(void)
 
 #if (OS_CONFIG_QUEUE_ENABLE == 1U)
 /******************************************************************************************************/
+#if (OS_CONFIG_ATOMIC_ENABLE == 1U)
+/* Shared between the two contenders in test_atomic(): both hammer the same counters, one through
+ * os_atomic_inc and one with a plain read-modify-write, so the two can be compared directly. */
+#define TEST_ATOMIC_ITERATIONS 20000UL
+
+static os_atomic_t      g_atomic_counter = OS_ATOMIC_INIT(0);
+static __IO int32_t g_plain_counter  = 0;
+
+/* Declared as os_atomic_t rather than a volatile int, which is what the header asks for: casting
+ * some other type to os_atomic_t * to reach these calls is how a "volatile" counter quietly
+ * becomes one the compiler is free to cache again. */
+static os_atomic_t      g_atomic_done    = OS_ATOMIC_INIT(0);
+
+/******************************************************************************************************/
+static void test_atomic_hammer_entry(void *context)
+{
+    uint32_t i;
+
+    (void)context;
+
+    for (i = 0U; i < TEST_ATOMIC_ITERATIONS; i++)
+    {
+        (void)os_atomic_inc(&g_atomic_counter);
+
+        /* Deliberately NOT atomic, as the control case: load, add, store, with a preemption point
+         * wide open in the middle of it. */
+        g_plain_counter = g_plain_counter + 1;
+    }
+
+    (void)os_atomic_inc(&g_atomic_done);
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Covers the os_atomic_* API: return values, bit operations, and that concurrent updates
+ *        from two tasks actually survive.
+ */
+static void test_atomic(void)
+{
+    os_atomic_t value = OS_ATOMIC_INIT(0);
+    uint32_t    waited;
+    bool        ok;
+
+    test_print_section("Atomics");
+
+    /* Every read-modify-write returns the value held BEFORE the operation, so a return of 20 from
+     * inc() means the word now reads 21. Checked as one group because a single wrong return value
+     * here invalidates the whole convention, not just one call. */
+    (void)os_atomic_set(&value, 10);
+    ok  = (os_atomic_get(&value) == 10);
+    ok &= (os_atomic_set(&value, 20) == 10);
+    ok &= (os_atomic_add(&value, 5) == 20) && (os_atomic_get(&value) == 25);
+    ok &= (os_atomic_sub(&value, 5) == 25) && (os_atomic_get(&value) == 20);
+    ok &= (os_atomic_inc(&value)    == 20) && (os_atomic_get(&value) == 21);
+    ok &= (os_atomic_dec(&value)    == 21) && (os_atomic_get(&value) == 20);
+    ok &= (os_atomic_clear(&value)  == 20) && (os_atomic_get(&value) == 0);
+    AHURA_TEST_CHECK(ok, "set/add/sub/inc/dec/clear all return the value from before the operation");
+
+    (void)os_atomic_set(&value, 0x0F0F);
+    ok  = (os_atomic_or(&value, 0xF000) == 0x0F0F) && (os_atomic_get(&value) == 0xFF0F);
+    (void)os_atomic_set(&value, 0x0F0F);
+    ok &= (os_atomic_and(&value, 0x00FF) == 0x0F0F) && (os_atomic_get(&value) == 0x000F);
+    (void)os_atomic_set(&value, 0x0F0F);
+    ok &= (os_atomic_xor(&value, 0xFFFF) == 0x0F0F) && (os_atomic_get(&value) == 0xF0F0);
+    (void)os_atomic_set(&value, 0x0F0F);
+    ok &= (os_atomic_nand(&value, 0x00FF) == 0x0F0F) && (os_atomic_get(&value) == (int32_t)~0x000F);
+    AHURA_TEST_CHECK(ok, "or/and/xor/nand apply the right operation and return the previous value");
+
+    (void)os_atomic_set(&value, 100);
+    ok  = os_atomic_cas(&value, 100, 200) && (os_atomic_get(&value) == 200);
+    ok &= !os_atomic_cas(&value, 100, 300) && (os_atomic_get(&value) == 200);
+    AHURA_TEST_CHECK(ok, "os_atomic_cas() swaps on a match and leaves the word alone otherwise");
+
+    (void)os_atomic_clear(&value);
+    os_atomic_set_bit(&value, 3U);
+    ok  = (os_atomic_get(&value) == 8) && os_atomic_test_bit(&value, 3U) &&
+          !os_atomic_test_bit(&value, 4U);
+    ok &= os_atomic_test_and_set_bit(&value, 3U);          /* was already set */
+    ok &= !os_atomic_test_and_set_bit(&value, 4U) && os_atomic_test_bit(&value, 4U);
+    ok &= os_atomic_test_and_clear_bit(&value, 4U) && !os_atomic_test_bit(&value, 4U);
+    os_atomic_clear_bit(&value, 3U);
+    ok &= (os_atomic_get(&value) == 0);
+    os_atomic_set_bit_to(&value, 7U, true);
+    ok &= os_atomic_test_bit(&value, 7U);
+    os_atomic_set_bit_to(&value, 7U, false);
+    ok &= !os_atomic_test_bit(&value, 7U);
+    AHURA_TEST_CHECK(ok, "the bit operations set, clear and report previous state correctly");
+
+    /* Bit 31 is a valid index and must not be mistaken for a sign problem. */
+    (void)os_atomic_clear(&value);
+    os_atomic_set_bit(&value, 31U);
+    AHURA_TEST_CHECK(os_atomic_test_bit(&value, 31U) && (os_atomic_get(&value) == INT32_MIN),
+                      "bit 31 works like any other and is the word's sign bit");
+
+    /* --- The part that actually matters: concurrent updates --- */
+
+    g_atomic_counter = OS_ATOMIC_INIT(0);
+    g_plain_counter  = 0;
+    g_atomic_done    = OS_ATOMIC_INIT(0);
+
+    /* Two tasks at the same priority as each other: they round-robin every tick, so each is
+     * preempted repeatedly mid-update. That is precisely the window a non-atomic
+     * read-modify-write loses. */
+    if ((os_task_create(&worker, OS_TASK_CONFIG(worker, test_atomic_hammer_entry, NULL,
+                                                        TEST_PRIO_HIGH)) == OS_STATUS_OK) &&
+        (os_task_create(&helper, OS_TASK_CONFIG(helper, test_atomic_hammer_entry, NULL,
+                                                        TEST_PRIO_HIGH)) == OS_STATUS_OK))
+    {
+        (void)os_task_start(&worker);
+        (void)os_task_start(&helper);
+
+        for (waited = 0U; (waited < 4000U) &&
+                          (os_atomic_get(&g_atomic_done) < 2); waited++)
+        {
+            (void)os_delay_ms(1U);
+        }
+
+        AHURA_TEST_CHECK(os_atomic_get(&g_atomic_done) == 2,
+                          "both contending tasks finished");
+        AHURA_TEST_CHECK(os_atomic_get(&g_atomic_counter) == (int32_t)(2UL * TEST_ATOMIC_ITERATIONS),
+                          "os_atomic_inc() lost nothing across %lu concurrent increments (got %ld)",
+                          (unsigned long)(2UL * TEST_ATOMIC_ITERATIONS),
+                          (long)os_atomic_get(&g_atomic_counter));
+
+        /* Reported, not asserted: a plain read-modify-write is ALLOWED to come out correct if the
+         * scheduler never lands between its load and its store. Asserting that it breaks would
+         * make this test fail for the wrong reason on a machine where it happens to survive. */
+        printf("  [INFO] the same loop without atomics reached %ld of %lu\r\n",
+               (long)g_plain_counter, (unsigned long)(2UL * TEST_ATOMIC_ITERATIONS));
+
+        (void)os_task_delete(&worker);
+        (void)os_task_delete(&helper);
+    }
+    else
+    {
+        printf("  [SKIP] could not create the two contending tasks\r\n");
+    }
+}
+
+#endif /* OS_CONFIG_ATOMIC_ENABLE */
+
+/* Statically defined queue used by test_queue_define_and_dynamic(): the whole point of the macro
+ * pair is that the geometry is stated once, here, and never repeated at the init call. */
+typedef struct
+{
+    uint32_t id;
+    uint8_t  payload[6];
+
+} test_queue_item_t;
+
+OS_QUEUE_DEFINE(g_defined_queue, test_queue_item_t, 4);
+
+/******************************************************************************************************/
+/**
+ * @brief Covers both ways of getting a queue: OS_QUEUE_DEFINE static storage, and os_queue_create
+ *        heap storage, including that delete frees one and not the other.
+ */
+static void test_queue_define_and_dynamic(void)
+{
+    test_queue_item_t sent    = { 0 };
+    test_queue_item_t got     = { 0 };
+    os_queue_t        dynamic = { 0 };
+    uint32_t          value   = 0U;
+    size_t            heap_before;
+    size_t            heap_after;
+    os_status         status;
+
+    test_print_section("Queue Definition (static macro and dynamic allocation)");
+
+    /* --- OS_QUEUE_DEFINE + OS_QUEUE_INIT --- */
+
+    AHURA_TEST_CHECK(sizeof(g_defined_queue_BUFFER) == (4U * sizeof(test_queue_item_t)),
+                      "OS_QUEUE_DEFINE() sized the buffer for 4 items of the declared type (%u bytes)",
+                      (unsigned)sizeof(g_defined_queue_BUFFER));
+
+    AHURA_TEST_CHECK(OS_QUEUE_INIT(g_defined_queue) == OS_STATUS_OK,
+                      "OS_QUEUE_INIT() initializes the queue declared by OS_QUEUE_DEFINE()");
+
+    /* The geometry the macro derived has to match the declaration, since getting either wrong is
+     * exactly the out-of-bounds bug the macro pair exists to make impossible. */
+    AHURA_TEST_CHECK(g_defined_queue.item_size == sizeof(test_queue_item_t),
+                      "the derived item size matches the declared type (%u bytes)",
+                      (unsigned)g_defined_queue.item_size);
+    AHURA_TEST_CHECK(g_defined_queue.capacity == 4U,
+                      "the derived capacity matches the declared count (%u)",
+                      (unsigned)g_defined_queue.capacity);
+    AHURA_TEST_CHECK(g_defined_queue.buffer == (uint8_t *)g_defined_queue_BUFFER,
+                      "the queue points at the buffer the macro declared");
+
+    sent.id         = 0xA5A5A5A5UL;
+    sent.payload[0] = 0x11U;
+    sent.payload[5] = 0x99U;
+
+    AHURA_TEST_CHECK(os_queue_send(&g_defined_queue, &sent, OS_WAIT_NOTHING) == OS_STATUS_OK,
+                      "a struct item goes into the statically defined queue");
+    AHURA_TEST_CHECK(os_queue_receive(&g_defined_queue, &got, OS_WAIT_NOTHING) == OS_STATUS_OK,
+                      "and comes back out");
+    AHURA_TEST_CHECK((got.id == sent.id) && (got.payload[0] == 0x11U) && (got.payload[5] == 0x99U),
+                      "the whole struct survived the round trip intact");
+
+    /* --- os_queue_create / os_queue_delete --- */
+
+#if (OS_CONFIG_ALLOC_ENABLE == 1U)
+    heap_before = os_mem_free_get();
+
+    status = os_queue_create(&dynamic, sizeof(uint32_t), 8U);
+    AHURA_TEST_CHECK(status == OS_STATUS_OK, "os_queue_create() allocates an 8-slot uint32 queue");
+
+    /* Ownership has to be true the moment the queue is usable, not a moment later: it is what
+     * tells os_queue_delete the buffer came from the heap. A create that published the queue
+     * before claiming ownership would leak that buffer to any delete landing in between. */
+    AHURA_TEST_CHECK(dynamic.buffer_owned,
+                      "a created queue owns its buffer as soon as it is usable");
+    AHURA_TEST_CHECK(!g_defined_queue.buffer_owned,
+                      "a statically defined queue never claims ownership of its buffer");
+
+    heap_after = os_mem_free_get();
+    AHURA_TEST_CHECK(heap_after < heap_before,
+                      "creating it consumed kernel heap (%u -> %u bytes free)",
+                      (unsigned)heap_before, (unsigned)heap_after);
+
+    value = 0xDEADBEEFUL;
+    AHURA_TEST_CHECK(os_queue_send(&dynamic, &value, OS_WAIT_NOTHING) == OS_STATUS_OK,
+                      "the dynamic queue accepts an item");
+    value = 0U;
+    AHURA_TEST_CHECK(os_queue_receive(&dynamic, &value, OS_WAIT_NOTHING) == OS_STATUS_OK,
+                      "the dynamic queue returns it");
+    AHURA_TEST_CHECK(value == 0xDEADBEEFUL, "with the value intact (0x%08lX)", (unsigned long)value);
+
+    AHURA_TEST_CHECK(os_queue_delete(&dynamic) == OS_STATUS_OK, "os_queue_delete() tears it down");
+    AHURA_TEST_CHECK(os_mem_free_get() == heap_before,
+                      "and returned every byte it took to the heap (%u bytes free)",
+                      (unsigned)os_mem_free_get());
+    AHURA_TEST_CHECK(dynamic.buffer == NULL, "the deleted queue no longer points at freed memory");
+
+    /* A zero or overflowing geometry must be refused rather than wrapped into a small allocation
+     * that every later send would index past. */
+    AHURA_TEST_CHECK(os_queue_create(&dynamic, 0U, 4U) == OS_STATUS_INVALID_ARG,
+                      "os_queue_create() rejects a zero item size");
+    AHURA_TEST_CHECK(os_queue_create(&dynamic, 4U, 0U) == OS_STATUS_INVALID_ARG,
+                      "os_queue_create() rejects a zero capacity");
+    AHURA_TEST_CHECK(os_queue_create(&dynamic, SIZE_MAX / 2U, 4U) == OS_STATUS_INVALID_ARG,
+                      "os_queue_create() rejects a geometry whose byte count would overflow");
+
+    /* A geometry that is valid but larger than the whole heap has to come back as NO_MEMORY, so a
+     * caller can tell "ask for less" apart from "that request was nonsense". */
+    AHURA_TEST_CHECK(os_queue_create(&dynamic, 1U, OS_CONFIG_HEAP_SIZE * 2U) == OS_STATUS_NO_MEMORY,
+                      "os_queue_create() reports NO_MEMORY when the heap cannot cover the request");
+
+    AHURA_TEST_CHECK(os_mem_free_get() == heap_before,
+                      "and none of those rejections leaked heap");
+
+    /* Deleting a statically defined queue is allowed and must NOT hand its storage to the heap. */
+    heap_before = os_mem_free_get();
+    AHURA_TEST_CHECK(os_queue_delete(&g_defined_queue) == OS_STATUS_OK,
+                      "os_queue_delete() also accepts a statically defined queue");
+    AHURA_TEST_CHECK(os_mem_free_get() == heap_before,
+                      "and did not free the static buffer into the kernel heap");
+
+    /* Leave it usable for anything that runs later. */
+    (void)OS_QUEUE_INIT(g_defined_queue);
+#else
+    (void)dynamic;
+    (void)value;
+    (void)heap_before;
+    (void)heap_after;
+    (void)status;
+    printf("  [SKIP] os_queue_create()/os_queue_delete() require OS_CONFIG_ALLOC_ENABLE=1\r\n");
+#endif /* OS_CONFIG_ALLOC_ENABLE */
+}
+
 static void test_queue(void)
 {
     uint32_t  items[3] = { 0 };
@@ -1447,7 +1756,7 @@ static void test_assert(void)
 
 #if (OS_CONFIG_ASSERT_ENABLE == 1U)
     {
-        volatile uint32_t evaluations = 0U;
+        __IO uint32_t evaluations = 0U;
 
         OS_ASSERT((evaluations++, true));
         AHURA_TEST_CHECK(evaluations == 1U,
@@ -1460,7 +1769,7 @@ static void test_assert(void)
     printf("  [INFO] a FAILING assertion parks the core by design, so it is not exercised here\r\n");
 #else
     {
-        volatile uint32_t evaluations = 0U;
+        __IO uint32_t evaluations = 0U;
 
         OS_ASSERT((evaluations++, true));
         AHURA_TEST_CHECK(evaluations == 0U,
@@ -1508,7 +1817,7 @@ static void test_log(void)
      * evaluated, let alone reach the buffer. */
     g_log_capture_len = 0U;
     {
-        volatile uint32_t evaluated = 0U;
+        __IO uint32_t evaluated = 0U;
 
         OS_LOG_DEBUG("filtered %lu", (unsigned long)(evaluated++));
         (void)os_delay_ms(20U);
@@ -1537,12 +1846,30 @@ static void test_log(void)
                       "a burst larger than the buffer drops lines instead of blocking (%lu dropped)",
                       (unsigned long)(dropped_after - dropped_before));
 
-    /* Once drained, the kernel reports the loss and resumes normal service. */
-    g_log_capture_len = 0U;
+    /* Once drained, the kernel reports the loss and resumes normal service.
+     *
+     * The whole ring is delivered before the notice is, so the capture has to survive a full drain
+     * plus the notice; TEST_LOG_CAPTURE_SIZE is sized from the ring for exactly that. The overflow
+     * flag is cleared here so the check below reports a capture that was too small as itself,
+     * rather than as the kernel failing to emit anything. */
+    g_log_capture_len      = 0U;
+    g_log_capture_overflow = false;
     (void)os_delay_ms(400U);
 
+    AHURA_TEST_CHECK(!g_log_capture_overflow,
+                      "the test capture held the whole drain (%u bytes) without discarding any",
+                      (unsigned)TEST_LOG_CAPTURE_SIZE);
+
+    /* The notice is assembled by hand rather than through vsnprintf: running the formatter on the
+     * log task's own stack overflowed it, so every part of the line below is the kernel's own
+     * formatting and worth checking, not libc's. */
     AHURA_TEST_CHECK(test_log_capture_contains("dropped"),
                       "the dropped count is reported into the log itself");
+    AHURA_TEST_CHECK(test_log_capture_contains("*** ") &&
+                      test_log_capture_contains(" log lines dropped ***"),
+                      "the hand-formatted notice carries both of its delimiters");
+    AHURA_TEST_CHECK(test_log_capture_contains("] W "),
+                      "the notice is emitted at warning severity");
     AHURA_TEST_CHECK(os_log_dropped_get() == 0U,
                       "the dropped counter is cleared once reported (now %lu)",
                       (unsigned long)os_log_dropped_get());
@@ -1669,7 +1996,7 @@ static void test_cpu_usage(void)
      * have gotten). */
     g_busy_counter    = 0U;
     g_busy_should_run = true;
-    status = os_task_create(&worker, OS_TASK_CONFIG(worker, test_busy_spin_entry, NULL, 1U));
+    status = os_task_create(&worker, OS_TASK_CONFIG(worker, test_busy_spin_entry, NULL, TEST_PRIO_LOW));
     AHURA_TEST_CHECK(status == OS_STATUS_OK, "busy worker task created to load the CPU (priority 1)");
     AHURA_TEST_CHECK(os_task_start(&worker) == OS_STATUS_OK, "busy worker task started");
 
@@ -1907,7 +2234,7 @@ static void test_inherit_high_entry(void *context)
  */
 static void test_inherit_medium_entry(void *context)
 {
-    volatile uint32_t i;
+    __IO uint32_t i;
 
     (void)context;
 
@@ -2441,7 +2768,7 @@ static void test_stress_soak(void)
 
 #define OS_TEST_CHURN_ITERATIONS 500U
 
-static volatile uint32_t g_churn_counter = 0U;
+static __IO uint32_t g_churn_counter = 0U;
 
 /******************************************************************************************************/
 static void test_churn_worker_entry(void *context)
@@ -2519,7 +2846,7 @@ static void test_stress_task_churn(void)
 #if (OS_CONFIG_TIMER_ENABLE == 1U)
 #define OS_TEST_TIMER_CHURN_ITERATIONS 500U
 
-static volatile uint32_t g_churn_timer_fired = 0U;
+static __IO uint32_t g_churn_timer_fired = 0U;
 
 /******************************************************************************************************/
 static void test_churn_timer_cb(void *context)
@@ -2635,7 +2962,7 @@ static void test_task_footprint(void)
          * feature applied to a task other than "self". */
         g_busy_counter    = 0U;
         g_busy_should_run = true;
-        status = os_task_create(&worker, OS_TASK_CONFIG(worker, test_busy_spin_entry, NULL, 1U));
+        status = os_task_create(&worker, OS_TASK_CONFIG(worker, test_busy_spin_entry, NULL, TEST_PRIO_LOW));
         if (status == OS_STATUS_OK)
         {
             (void)os_task_start(&worker);
@@ -2728,6 +3055,7 @@ static void test_context_switch_timing(void)
  */
 static void test_tickless_hooks(void)
 {
+#if (OS_CONFIG_TICKLESS_ENABLE == 1U)
     uint32_t t0;
     uint32_t t1;
 
@@ -2757,6 +3085,12 @@ static void test_tickless_hooks(void)
     os_tickless_pre_sleep_cb();
     os_tickless_post_sleep_cb();
     AHURA_TEST_CHECK(os_kernel_is_running(), "kernel state is intact after a paired pre/post call");
+#else
+    /* The hooks are only declared when tickless idle is enabled, since the application is only
+     * required to define them then, so there is nothing to call here. */
+    test_print_section("Tickless Sleep Hooks (called directly, not via the idle task)");
+    printf("  [SKIP] requires OS_CONFIG_TICKLESS_ENABLE=1\r\n");
+#endif /* OS_CONFIG_TICKLESS_ENABLE */
 }
 
 #if (OS_CONFIG_TICKLESS_ENABLE == 1U) && (OS_CONFIG_TIMER_ENABLE == 1U)
@@ -2784,6 +3118,8 @@ static void test_tickless_sleep(void)
     uint32_t  horizon;
     uint32_t  tolerance_low;
     uint32_t  tolerance_high;
+    uint32_t  mask_before;
+    uint32_t  mask_after;
     os_status init_status;
     os_status start_status;
 
@@ -2823,16 +3159,30 @@ static void test_tickless_sleep(void)
     init_status  = os_timer_init(&g_timer_oneshot, horizon, OS_TIMER_MODE_ONE_SHOT, timer_oneshot_cb, NULL);
     start_status = os_timer_start(&g_timer_oneshot);
 
+    mask_before = os_arch_kernel_mask_active();
+
     t0 = os_tick_get();
     os_tickless_idle_process();
     t1 = os_tick_get();
     delta = t1 - t0;
+
+    mask_after = os_arch_kernel_mask_active();
 
     /* A little slack either side for scheduling/measurement rounding, scaled to stay meaningful
      * for small horizons too (a fixed +/-N would be too tight for a tiny horizon and too loose
      * for a large one). */
     tolerance_low  = (horizon > 2U) ? (horizon - 2U) : 1U;
     tolerance_high = horizon + 5U;
+
+    /* The sleep path masks interrupts before it decides how long to sleep, and the port masks
+     * again inside os_arch_sleep_prepare, so two save/restore pairs are nested. Getting that
+     * wrong leaves the core masked on return, which does not fail loudly - the system simply
+     * stops taking interrupts and looks hung - so it is worth asserting directly rather than
+     * inferring from later tests. */
+    AHURA_TEST_CHECK(mask_after == mask_before,
+                      "os_tickless_idle_process() restored the interrupt mask it found "
+                      "(before=0x%08lX after=0x%08lX)",
+                      (unsigned long)mask_before, (unsigned long)mask_after);
 
     AHURA_TEST_CHECK(init_status == OS_STATUS_OK, "os_timer_init() arms a %lu-tick horizon for the sleep test",
                       (unsigned long)horizon);
@@ -2900,7 +3250,7 @@ static void test_bench_row(const char *name, uint32_t cycles, uint32_t clock_hz)
  */
 static void test_benchmarks(void)
 {
-    volatile uint32_t sink = 0U;
+    __IO uint32_t sink = 0U;
     uint32_t          best;
     uint32_t          overhead;
     uint32_t          clock_hz = os_arch_clock_hz_get();
@@ -3185,6 +3535,10 @@ void os_test(void)
 #endif
 #if (OS_CONFIG_QUEUE_ENABLE == 1U)
     test_queue();
+    test_queue_define_and_dynamic();
+#if (OS_CONFIG_ATOMIC_ENABLE == 1U)
+    test_atomic();
+#endif
 #endif
 #if (OS_CONFIG_EVENT_ENABLE == 1U)
     test_event_group();

@@ -134,6 +134,7 @@ __asm(
 ".type   os_arch_context_restore_asm, %function\n"
 ".thumb_func\n"
 "os_arch_context_restore_asm:\n"           /* r0 = stack pointer of task to restore */
+"    clrex\n"                              /* drop any LDREX reservation the outgoing task left */
 "    ldmia   r0!, {r4-r11, lr}\n"
 #if defined(__ARM_FP)
 "    tst     lr, #0x10\n"
@@ -372,39 +373,68 @@ uint32_t os_arch_cycle_count_get(void)
  */
 uint32_t os_arch_elapsed_ticks_get(void)
 {
-    uint32_t clock_hz = os_arch_clock_hz_get();
-    uint32_t now_cycles;
-    uint32_t delta_cycles;
-    uint32_t elapsed_ticks;
-
-    if (os_arch_planned_idle_ticks == 0U)
-    {
-        return 0U;
-    }
-
-    now_cycles   = os_arch_cycle_count_get();
-    delta_cycles = now_cycles - os_arch_sleep_entry_cycles;
-
-    if (clock_hz == 0U)
-    {
-        elapsed_ticks = os_arch_planned_idle_ticks;
-    }
-    else
-    {
-        uint64_t scaled_ticks = ((uint64_t)delta_cycles * (uint64_t)OS_CONFIG_TICK_HZ);
-
-        scaled_ticks /= (uint64_t)clock_hz;
-        elapsed_ticks = (uint32_t)scaled_ticks;
-    }
-
-    if (elapsed_ticks > os_arch_planned_idle_ticks)
-    {
-        elapsed_ticks = os_arch_planned_idle_ticks;
-    }
-
+    /* Always 0 on this port, and deliberately so.
+     *
+     * os_arch_max_suppressed_ticks_get() returns 0 here: ticking is never suppressed, so the WFI
+     * runs with SysTick still counting and its interrupt still enabled, and the interrupt that
+     * ends the sleep is normally the very next tick. Every tick that passed was therefore already
+     * counted, one at a time, by os_tick_handler().
+     *
+     * Returning a measured duration as well would have os_tick.c announce time the ISR had just
+     * accounted for, advancing os_tick_count at roughly twice real time for the whole idle period
+     * - delays and timers would then fire early in proportion to how long the system sat idle. A
+     * suppression-capable port (v8m) returns a real figure precisely because there the ISR did not
+     * run. Measuring the sleep only becomes meaningful here once this port learns to reprogram
+     * SysTick, at which point os_arch_sleep_prepare's recorded entry cycle count is what it needs.
+     */
     os_arch_planned_idle_ticks = 0U;
 
-    return elapsed_ticks;
+    return 0U;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Close the tickless window. Nothing to release on this port.
+ *
+ * @return None.
+ */
+void os_arch_sleep_finish(void)
+{
+    /* os_arch_sleep_prepare takes no interrupt mask here: a plain WFI needs interrupts left
+     * enabled in order to wake at all, so there is nothing to hand back. */
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Atomic compare-and-swap. See os_arch_port_common.h.
+ *
+ * Lock-free: this core has exclusives, so nothing is masked and an ISR that preempts the sequence
+ * simply causes the STREX to fail and the caller to retry.
+ *
+ * @param[in,out] target    Word to update.
+ * @param[in]     expected  Value the caller believes target holds.
+ * @param[in]     desired   Value to store if it still does.
+ * @return bool  true if desired was stored.
+ */
+bool os_arch_atomic_cas(__IO int32_t *target, int32_t expected, int32_t desired)
+{
+    int32_t  current;
+    uint32_t store_failed;
+
+    __asm volatile("ldrex %0, [%1]" : "=r"(current) : "r"(target) : "memory");
+
+    if (current != expected)
+    {
+        /* Drop the exclusive monitor rather than leaving it set on a word this call is walking
+         * away from: a stale reservation can make an unrelated later STREX succeed when it should
+         * not, and the architecture only guarantees one outstanding reservation per core. */
+        __asm volatile("clrex" ::: "memory");
+        return false;
+    }
+
+    __asm volatile("strex %0, %1, [%2]" : "=&r"(store_failed) : "r"(desired), "r"(target) : "memory");
+
+    return (store_failed == 0U);
 }
 
 /******************************************************************************************************/

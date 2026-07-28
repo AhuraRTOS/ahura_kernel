@@ -53,12 +53,13 @@ os_status os_queue_init(os_queue_t *queue, void *buffer, size_t item_size, size_
         return OS_STATUS_BUSY;
     }
 
-    queue->buffer    = (uint8_t *)buffer;
-    queue->item_size = item_size;
-    queue->capacity  = capacity;
-    queue->head      = 0U;
-    queue->tail      = 0U;
-    queue->count     = 0U;
+    queue->buffer       = (uint8_t *)buffer;
+    queue->item_size    = item_size;
+    queue->capacity     = capacity;
+    queue->head         = 0U;
+    queue->tail         = 0U;
+    queue->count        = 0U;
+    queue->buffer_owned = false; /* caller's storage: os_queue_delete must never free it */
     os_list_init(&queue->send_waiters);
     os_list_init(&queue->receive_waiters);
 
@@ -237,5 +238,145 @@ size_t os_queue_count_get(const os_queue_t *queue)
 
     return count;
 }
+
+#if (OS_CONFIG_ALLOC_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Create a queue whose item buffer is allocated from the kernel heap.
+ *
+ * The dynamic counterpart to OS_QUEUE_DEFINE + OS_QUEUE_INIT, for queues whose geometry is not
+ * known until run time. Everything else about the queue behaves identically; the only difference
+ * is that os_queue_delete() releases the buffer, because this call is what obtained it.
+ *
+ * The queue object itself is still the caller's, exactly as with os_queue_init: only the item
+ * buffer comes from the heap. That keeps the handle's lifetime obvious and lets it live wherever
+ * suits the application, and it means a failed create leaves nothing to clean up.
+ *
+ * @param[out] queue      Queue object, on zero-initialized storage (see os_queue_init).
+ * @param[in]  item_size  Size of one item in bytes.
+ * @param[in]  capacity   Number of items the queue can hold.
+ * @return os_status  OS_STATUS_OK, OS_STATUS_INVALID_ARG for a zero/overflowing geometry,
+ *                    OS_STATUS_BUSY if the queue still has blocked waiters, or
+ *                    OS_STATUS_NO_MEMORY when the heap cannot satisfy the request.
+ */
+os_status os_queue_create(os_queue_t *queue, size_t item_size, size_t capacity)
+{
+    void      *buffer;
+    size_t    buffer_size;
+    os_status status;
+
+    if ((queue == NULL) || (item_size == 0U) || (capacity == 0U))
+    {
+        return OS_STATUS_INVALID_ARG;
+    }
+
+    /* Reject a geometry whose byte count does not fit in size_t before allocating: the product
+     * would otherwise wrap to a small, successful allocation that every send and receive then
+     * indexes far beyond. */
+    if (capacity > (SIZE_MAX / item_size))
+    {
+        return OS_STATUS_INVALID_ARG;
+    }
+
+    buffer_size = item_size * capacity;
+
+    buffer = os_mem_alloc(buffer_size);
+    if (buffer == NULL)
+    {
+        return OS_STATUS_NO_MEMORY;
+    }
+
+    /* One critical section covers both the initialization and the ownership flag.
+     *
+     * Setting buffer_owned in a second, separate critical section would leave the queue fully
+     * usable but still claiming it does not own its buffer. An os_queue_delete landing in that gap
+     * would reset the queue and, seeing buffer_owned false, walk away without freeing the
+     * allocation just made - a permanent leak of item_size * capacity bytes with nothing to
+     * report it. The window is only a few instructions wide, which is exactly the kind that
+     * survives testing and fails in the field.
+     *
+     * os_queue_init performs the waiter check and every field assignment, so the static and
+     * dynamic paths cannot drift apart. It only fails here if the queue still has blocked waiters,
+     * in which case the allocation has to go back rather than leak. */
+    os_critical_enter();
+
+    status = os_queue_init(queue, buffer, item_size, capacity);
+
+    if (status == OS_STATUS_OK)
+    {
+        queue->buffer_owned = true;
+    }
+
+    os_critical_exit();
+
+    if (status != OS_STATUS_OK)
+    {
+        os_mem_free(buffer);
+        return OS_STATUS_BUSY;
+    }
+
+    return OS_STATUS_OK;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Tear down a queue, freeing the buffer only if os_queue_create allocated it.
+ *
+ * Safe to call on a statically defined queue as well: the queue is reset either way, and the
+ * buffer is released only when this kernel allocated it, so a caller tearing down a mixed set of
+ * queues does not have to track which kind each one is.
+ *
+ * Refuses while tasks are blocked on the queue. Freeing underneath them would leave those tasks
+ * parked on list nodes inside memory the heap is free to hand out again, and waking them instead
+ * would mean inventing a status for "the object you were waiting on disappeared" that senders and
+ * receivers have no way to distinguish from a real transfer. Drain the queue and let the waiters
+ * time out first.
+ *
+ * @param[in,out] queue  Queue to tear down.
+ * @return os_status  OS_STATUS_OK, OS_STATUS_INVALID_ARG for NULL, or OS_STATUS_BUSY if any task
+ *                    is currently blocked on the queue.
+ */
+os_status os_queue_delete(os_queue_t *queue)
+{
+    void *buffer_to_free = NULL;
+
+    if (queue == NULL)
+    {
+        return OS_STATUS_INVALID_ARG;
+    }
+
+    os_critical_enter();
+
+    if ((queue->send_waiters.head != NULL) || (queue->receive_waiters.head != NULL))
+    {
+        os_critical_exit();
+        return OS_STATUS_BUSY;
+    }
+
+    if (queue->buffer_owned)
+    {
+        buffer_to_free = queue->buffer;
+    }
+
+    /* Cleared before the critical section ends so the queue cannot be used against a buffer that
+     * is about to be released; the freeing itself happens outside, since os_mem_free walks the
+     * heap free list and there is no reason to hold interrupts off for it. */
+    queue->buffer       = NULL;
+    queue->item_size    = 0U;
+    queue->capacity     = 0U;
+    queue->head         = 0U;
+    queue->tail         = 0U;
+    queue->count        = 0U;
+    queue->buffer_owned = false;
+    os_list_init(&queue->send_waiters);
+    os_list_init(&queue->receive_waiters);
+
+    os_critical_exit();
+
+    os_mem_free(buffer_to_free); /* NULL is ignored, so the static case needs no branch */
+
+    return OS_STATUS_OK;
+}
+#endif /* OS_CONFIG_ALLOC_ENABLE */
 
 #endif /* OS_CONFIG_QUEUE_ENABLE */

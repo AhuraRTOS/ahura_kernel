@@ -35,7 +35,7 @@
  * kernel service task and stack.
  */
 
-/* Mutexes always do single-level priority inheritance (like FreeRTOS/Zephyr): os_mutex_lock
+/* Mutexes always do single-level priority inheritance: os_mutex_lock
  * boosts a lower-priority owner to the blocking waiter's (effective) priority for as long as it
  * holds the mutex, restoring it on os_mutex_unlock (accounting for other mutexes the task still
  * holds). Transitive/chained inheritance across multiple mutexes is NOT implemented - see
@@ -56,6 +56,14 @@
 /* Kernel heap (os_mem_alloc/os_mem_free): first-fit allocator with coalescing over a
  * static heap of OS_CONFIG_HEAP_SIZE bytes. */
 #define OS_CONFIG_ALLOC_ENABLE              1U
+
+/* Atomic operations on a single word (os_atomic_*): indivisible add/sub/bitwise/compare-and-swap
+ * updates that no task, ISR or core can observe half-finished. Lock-free where the ISA has
+ * LDREX/STREX, otherwise implemented by briefly excluding interrupts. Costs no RAM and no kernel
+ * task; unused operations are dropped by the linker, so disabling this removes API surface rather
+ * than footprint. */
+#define OS_CONFIG_ATOMIC_ENABLE             1U
+
 
 /* Note: the intrusive list module has no switch - the scheduler itself runs
  * on it, so it is always compiled in and its os_list_ API is always there. */

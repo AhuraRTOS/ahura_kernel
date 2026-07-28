@@ -105,6 +105,9 @@ static uint32_t os_arch_planned_idle_ticks      = 0U;
 static uint32_t os_arch_suppressed_reload_cycles = 0U;
 static uint32_t os_arch_sleep_mask_state        = 0U;
 
+/* Whether os_arch_sleep_mask_state actually holds a mask os_arch_sleep_finish must release. */
+static bool     os_arch_sleep_mask_held         = false;
+
 /*
  * ***********************************************************************************************************
  * Context switch handlers (SVC starts the first task, PendSV switches tasks)
@@ -176,6 +179,7 @@ __asm(
 ".type   os_arch_context_restore_asm, %function\n"
 ".thumb_func\n"
 "os_arch_context_restore_asm:\n"           /* r0 = stack pointer of task to restore */
+"    clrex\n"                              /* drop any LDREX reservation the outgoing task left */
 "    ldmia   r0!, {r2, r4-r11, lr}\n"
 "    msr     psplim, r2\n"                 /* restore the stack limit before PSP */
 #if defined(__ARM_FP)
@@ -517,9 +521,30 @@ uint32_t os_arch_elapsed_ticks_get(void)
                            OS_ARCH_SYST_CSR_ENABLE_MSK;
 
     os_arch_planned_idle_ticks = 0U;
-    os_arch_kernel_mask_restore(os_arch_sleep_mask_state);
 
+    /* The kernel interrupt mask taken in os_arch_sleep_prepare stays held: os_arch_sleep_finish()
+     * releases it once os_tick.c has announced this sleep and restored the application's hardware.
+     * Releasing it here instead would expose a window in which os_tick_count is short by the
+     * entire sleep duration while the pending SysTick and any other interrupt are free to run. */
     return elapsed_ticks;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Release the interrupt mask held across the tickless window. See os_arch_port_common.h.
+ *
+ * @return None.
+ */
+void os_arch_sleep_finish(void)
+{
+    /* os_arch_sleep_prepare only masks once it commits to reprogramming SysTick; every early
+     * return leaves the mask untaken. Restoring unconditionally would then push a stale saved
+     * state onto a core that was never masked, so the flag tracks ownership explicitly. */
+    if (os_arch_sleep_mask_held)
+    {
+        os_arch_sleep_mask_held = false;
+        os_arch_kernel_mask_restore(os_arch_sleep_mask_state);
+    }
 }
 
 /******************************************************************************************************/
@@ -542,13 +567,46 @@ static uint64_t os_arch_max_window_ticks_get(void)
 
 /******************************************************************************************************/
 /**
+ * @brief Atomic compare-and-swap. See os_arch_port_common.h.
+ *
+ * Lock-free: this core has exclusives, so nothing is masked and an ISR that preempts the sequence
+ * simply causes the STREX to fail and the caller to retry.
+ *
+ * @param[in,out] target    Word to update.
+ * @param[in]     expected  Value the caller believes target holds.
+ * @param[in]     desired   Value to store if it still does.
+ * @return bool  true if desired was stored.
+ */
+bool os_arch_atomic_cas(__IO int32_t *target, int32_t expected, int32_t desired)
+{
+    int32_t  current;
+    uint32_t store_failed;
+
+    __asm volatile("ldrex %0, [%1]" : "=r"(current) : "r"(target) : "memory");
+
+    if (current != expected)
+    {
+        /* Drop the exclusive monitor rather than leaving it set on a word this call is walking
+         * away from: a stale reservation can make an unrelated later STREX succeed when it should
+         * not, and the architecture only guarantees one outstanding reservation per core. */
+        __asm volatile("clrex" ::: "memory");
+        return false;
+    }
+
+    __asm volatile("strex %0, %1, [%2]" : "=&r"(store_failed) : "r"(desired), "r"(target) : "memory");
+
+    return (store_failed == 0U);
+}
+
+/******************************************************************************************************/
+/**
  * @brief Reprogram SysTick to suppress ticking for (planned_ticks - 1) ticks and mask
  *        interrupts until os_arch_elapsed_ticks_get() restores normal cadence.
  *
  * TICKINT stays enabled throughout: if this window fully elapses, the SysTick exception
  * legitimately becomes pending exactly like a normal tick would, and os_arch_elapsed_ticks_get()
  * relies on that pending exception to supply the final tick once it releases the mask below -
- * FreeRTOS's own tickless-idle technique, reused here rather than a self-contained alternative.
+ * The established technique for this, rather than a self-contained alternative.
  *
  * @param[in] planned_ticks  Planned idle duration in kernel ticks.
  * @return None.
@@ -600,6 +658,7 @@ void os_arch_sleep_prepare(uint32_t planned_ticks)
      * os_arch_elapsed_ticks_get() restores normal cadence and releases it, so a
      * real tick can never fire against a half-reprogrammed register set. */
     os_arch_sleep_mask_state          = os_arch_kernel_mask_save();
+    os_arch_sleep_mask_held           = true;
     os_arch_planned_idle_ticks        = planned_ticks;
     os_arch_suppressed_reload_cycles  = (uint32_t)suppressed_cycles64;
 

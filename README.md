@@ -46,6 +46,8 @@ HAL or CMSIS dependency.
 [Timeout semantics](#timeout-semantics) ·
 [Mutexes and priority inheritance](#mutexes-and-priority-inheritance) ·
 [Task notifications](#task-notifications) ·
+[Queues](#queues) ·
+[Atomics](#atomics) ·
 [Work queue](#work-queue) ·
 [Kernel heap](#kernel-heap) ·
 [Diagnostics](#diagnostics) ·
@@ -166,9 +168,10 @@ compiles away entirely when its `OS_CONFIG_<FEATURE>_ENABLE` is 0.
 | **Tasks** | `os_task_create` · `os_task_start` · `os_task_pause` · `os_task_delete` · `os_task_yield` · `os_task_state_get` · `os_task_core_affinity_set` |
 | **Delays and time** | `os_delay_ms` · `os_delay_us` · `os_delay_s` · `os_tick_get` |
 | **Critical sections** | `os_critical_enter` · `os_critical_exit` |
+| **Atomics** | `os_atomic_get` · `os_atomic_set` · `os_atomic_add` · `os_atomic_sub` · `os_atomic_inc` · `os_atomic_dec` · `os_atomic_or` · `os_atomic_and` · `os_atomic_xor` · `os_atomic_nand` · `os_atomic_clear` · `os_atomic_cas` · `os_atomic_test_bit` · `os_atomic_set_bit` · `os_atomic_clear_bit` · `os_atomic_test_and_set_bit` · `os_atomic_test_and_clear_bit` · `os_atomic_set_bit_to` |
 | **Mutex** | `os_mutex_init` · `os_mutex_lock` · `os_mutex_try_lock` · `os_mutex_unlock` |
 | **Semaphore** | `os_semaphore_init` · `os_semaphore_give` · `os_semaphore_take` |
-| **Queue** | `os_queue_init` · `os_queue_send` · `os_queue_receive` · `os_queue_count_get` |
+| **Queue** | `OS_QUEUE_DEFINE` · `OS_QUEUE_INIT` · `os_queue_init` · `os_queue_create` · `os_queue_delete` · `os_queue_send` · `os_queue_receive` · `os_queue_count_get` |
 | **Event group** | `os_event_group_init` · `os_event_group_set_bits` · `os_event_group_clear_bits` · `os_event_group_wait_bits` |
 | **Task notifications** | `os_task_notify_give` · `os_task_notify_wait` |
 | **Software timers** | `os_timer_init` · `os_timer_start` · `os_timer_stop` |
@@ -324,6 +327,95 @@ running as normal. The value simply waits to be picked up on its next
 `os_task_notify_wait` call, so nothing is lost. `os_task_notify_wait` is
 task-only, like `os_mutex_lock`, because an ISR has no task identity to wait as,
 and it follows the `timeout_ms` convention above.
+
+### Queues
+
+A queue copies fixed-size items between tasks, or from an ISR to a task. There
+are two ways to give it storage, and they differ only in where the item buffer
+comes from. Everything else, including every send and receive call, is the same.
+
+**Static, when the size is known at compile time.** `OS_QUEUE_DEFINE` declares
+the queue and its buffer together, and `OS_QUEUE_INIT` initializes it:
+
+```c
+typedef struct { uint32_t id; uint8_t payload[6]; } sample_t;
+
+OS_QUEUE_DEFINE(sensor_q, sample_t, 8);   /* file scope: both objects are static */
+
+os_status status = OS_QUEUE_INIT(sensor_q);
+os_queue_send(&sensor_q, &sample, 10U);
+```
+
+The buffer is declared as `sensor_q_BUFFER`, and nothing outside `OS_QUEUE_INIT`
+should touch it. The reason to prefer this pair over calling `os_queue_init`
+by hand is that the item size and capacity are **derived from the array**, so
+they cannot disagree with the storage that actually exists. Passing
+`os_queue_init` an `item_size` or `capacity` that does not match the buffer is
+otherwise easy to do and silently reads or writes past the end of it.
+
+**Dynamic, when the size is only known at run time.** `os_queue_create`
+allocates the item buffer from the kernel heap, so it needs
+`OS_CONFIG_ALLOC_ENABLE`:
+
+```c
+static os_queue_t rx_q;   /* the handle is still yours; only the buffer is allocated */
+
+os_status status = os_queue_create(&rx_q, item_size, capacity);
+...
+os_queue_delete(&rx_q);   /* returns the buffer to the heap */
+```
+
+Keeping the handle out of the allocation means its lifetime stays obvious and a
+failed create leaves nothing to clean up. `os_queue_create` returns
+`OS_STATUS_NO_MEMORY` when the heap cannot satisfy the request, and
+`OS_STATUS_INVALID_ARG` for a zero or overflowing geometry rather than wrapping
+it into a small allocation that later sends would index past.
+
+`os_queue_delete` also accepts a statically defined queue and simply resets it,
+freeing only a buffer that `os_queue_create` allocated, so code tearing down a
+mixed set of queues does not need to track which kind each one is. It returns
+`OS_STATUS_BUSY` while any task is still blocked on the queue: freeing
+underneath waiters would leave them parked on list nodes inside memory the heap
+can hand out again. Drain the queue and let the waiters time out first.
+
+### Atomics
+
+An operation no other task, ISR, or core can observe half-finished. Enabled with
+`OS_CONFIG_ATOMIC_ENABLE`.
+
+```c
+static os_atomic_t counter = OS_ATOMIC_INIT(0);
+
+os_atomic_inc(&counter);              /* returns the value from BEFORE the increment */
+os_atomic_add(&counter, 5);
+os_atomic_cas(&counter, 10, 20);      /* swap only if it still holds 10 */
+os_atomic_set_bit(&flags, 3U);
+```
+
+The problem it solves: `count = count + 1` is a load, an add, and a store.
+Anything that preempts between the load and the store makes both writers compute
+from the same starting value, so one increment silently disappears.
+
+**Every read-modify-write returns the value from before the operation**, not
+after it. `os_atomic_inc` returning `4` means the counter now reads `5`.
+
+Two rules worth stating outright:
+
+- **Declare shared words as `os_atomic_t`**, not as a plain or `volatile` int
+  that you cast at the call site. An ordinary read or write of the same word is
+  not ordered against these calls, which is the usual way a counter that "uses
+  atomics" still loses updates.
+- **`os_atomic_cas` does not retry.** A `false` return may mean another writer
+  won *or* that exclusive access was lost, so it does not by itself prove the
+  value changed. Loop if you only care about the final state; re-read the value
+  if you need to know which happened.
+
+**Cost depends on the core.** On ARMv7-M and ARMv8-M these compile to an
+`LDREX`/`STREX` pair and are genuinely lock-free, never masking interrupts.
+ARMv6-M (Cortex-M0, M0+) has no exclusive instructions, so the port briefly
+disables interrupts instead, and on a multi-core build takes a spinlock as well.
+That is worth knowing before putting one in an ARMv6-M interrupt-latency budget.
+All of them are safe to call from tasks and from ISRs.
 
 ### Work queue
 
@@ -624,14 +716,41 @@ Config options: `OS_CONFIG_TICKLESS_ENABLE` (default 0),
 `OS_CONFIG_TICKLESS_MIN_IDLE` (the shortest idle worth sleeping for), and
 `OS_CONFIG_MAX_SUPPRESSED_TICKS`.
 
-Two weak application callbacks bracket the sleep window, with prototypes in
-`ahura.h`. Override them by defining the functions in application code.
-User-overridable callbacks carry the `_cb` suffix by convention:
+Two application callbacks bracket the sleep window, with prototypes in
+`ahura.h`. Both are **mandatory** whenever `OS_CONFIG_TICKLESS_ENABLE` is 1: the
+kernel declares them and defines neither, so a missing one is a link error
+naming the function rather than a hook that quietly does nothing. Write them in
+the application's callback file. Callbacks the application provides carry the
+`_cb` suffix by convention:
 
 ```c
 void os_tickless_pre_sleep_cb(void)   { /* select sleep mode (e.g. SLEEPDEEP), gate clocks */ }
 void os_tickless_post_sleep_cb(void)  { /* clear SLEEPDEEP, restore clocks */ }
 ```
+
+The reason they are required rather than defaulted is the paragraph below: an
+empty pre-sleep hook on a part whose HAL runs its own tick source shortens every
+suppressed sleep to that source's period, which presents as tickless idle simply
+not saving any power.
+
+**What the post-sleep hook may assume.** It runs with the kernel's interrupts
+still masked and **before** the sleep has been announced, so `os_tick_get()` is
+still short by the entire sleep duration while it executes. Restore hardware
+there; do not call anything that blocks, delays, or waits on a tick-driven
+timeout, and keep it short, because its whole duration is added to interrupt
+latency. The order is deliberate:
+
+| Step | Why it is there and not later |
+|---|---|
+| Measure the sleep | The counter still holds it, and the normal tick cadence is restored |
+| `os_tickless_post_sleep_cb` | Hardware must be back before any kernel work depends on it |
+| `os_tick_announce` | Catches up `os_tick_count`, timers, work and task delays in one go |
+| Release the interrupt mask | Only now is the kernel's view of time consistent |
+
+Announcing after the mask is released would let a tick or timer run against a
+clock hundreds of ticks behind reality; announcing before the hardware is
+restored would let the context switch `os_tick_announce` can pend be taken
+immediately, leaving the idle task, and the restore, stranded.
 
 **Suspend every other periodic interrupt source here too, not just SysTick.**
 WFI wakes on any pending interrupt regardless of masking, so anything else
@@ -745,7 +864,7 @@ HAL headers.
 | `os_main_critical.c` | Critical sections protecting a shared counter |
 | `os_main_mutex.c` | Mutual exclusion with `os_mutex_*` |
 | `os_main_semaphore.c` | Counting semaphore, producer and consumer |
-| `os_main_queue.c` | Message queue, producer and consumer |
+| `os_main_queue.c` | Message queue, producer and consumer, both static (`OS_QUEUE_DEFINE`) and dynamic (`os_queue_create`) storage |
 | `os_main_event.c` | Event group, waiting on multiple bits |
 | `os_main_notify.c` | Task notifications with `os_task_notify_*` |
 | `os_main_timer.c` | One-shot and periodic software timers |
@@ -754,6 +873,7 @@ HAL headers.
 | `os_main_stack_watermark.c` | Worst-case stack headroom |
 | `os_main_cpu_usage.c` | CPU load sampling |
 | `os_main_log.c` | Buffered debug logging (`OS_LOG_*`) |
+| `os_main_atomic.c` | Atomic counters and flags with `os_atomic_*` |
 | `os_main_list.c` | The intrusive list utility |
 
 Each file needs its matching `OS_CONFIG_<FEATURE>_ENABLE` on, and a compile-time

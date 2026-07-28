@@ -44,6 +44,7 @@
     !defined(OS_CONFIG_STACK_WATERMARK_ENABLE) ||                                                      \
     !defined(OS_CONFIG_CPU_USAGE_ENABLE) ||                                                            \
     !defined(OS_CONFIG_ASSERT_ENABLE) || !defined(OS_CONFIG_LOG_ENABLE) ||                             \
+    !defined(OS_CONFIG_ATOMIC_ENABLE) ||                                                               \
     !defined(OS_CONFIG_LOG_LEVEL) || !defined(OS_CONFIG_LOG_BUFFER_SIZE) ||                            \
     !defined(OS_CONFIG_LOG_LINE_MAX) || !defined(OS_CONFIG_LOG_TASK_STACK_SIZE) ||                     \
     !defined(OS_CONFIG_LOG_TASK_PRIORITY) ||                                                           \
@@ -643,9 +644,36 @@ uint32_t os_arch_elapsed_ticks_get(void);
 
 /******************************************************************************************************/
 /**
+ * @brief Atomic compare-and-swap: if *target still holds expected, store desired and report true.
+ *
+ * The single primitive every os_atomic_* operation is built from, so a port only has to get this
+ * one right. Where the ISA provides exclusives (OS_ARCH_HAS_EXCLUSIVES) it is a genuinely
+ * lock-free LDREX/STREX pair that never masks interrupts; ARMv6-M has no exclusives, so that port
+ * falls back to briefly excluding everyone else instead.
+ *
+ * A false return means only that the swap did not happen - either the value had changed, or the
+ * exclusive access was lost to an interrupt or another core. Callers retry in a loop, which is
+ * why every derived operation reads the value again each pass rather than trusting an earlier read.
+ */
+bool os_arch_atomic_cas(__IO int32_t *target, int32_t expected, int32_t desired);
+
+/******************************************************************************************************/
+/**
  * @brief Record low-power entry context for elapsed tick accounting.
  */
 void os_arch_sleep_prepare(uint32_t planned_ticks);
+
+/******************************************************************************************************/
+/**
+ * @brief Close the tickless window opened by os_arch_sleep_prepare, releasing any interrupt mask
+ *        it took. Idempotent, and safe when the port never armed a window.
+ *
+ * Split out of os_arch_elapsed_ticks_get so the kernel can finish accounting for the sleep BEFORE
+ * interrupts come back: between measuring the sleep and calling os_tick_announce, os_tick_count is
+ * still missing the whole sleep duration, and any tick or timer processing that ran in that gap
+ * would decide against a clock several hundred ticks behind reality.
+ */
+void os_arch_sleep_finish(void);
 
 /******************************************************************************************************/
 /**

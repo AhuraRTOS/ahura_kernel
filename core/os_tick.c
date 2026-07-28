@@ -276,60 +276,87 @@ uint32_t os_tickless_max_suppressed_ticks_get(void)
 void os_tickless_idle_process(void)
 {
 #if (OS_CONFIG_TICKLESS_ENABLE == 1U)
-    uint32_t planned_idle_ticks = os_tickless_expected_idle_ticks_get();
-    uint32_t elapsed_ticks      = 0U;
+    uint32_t mask_state;
+    uint32_t planned_idle_ticks;
+    uint32_t elapsed_ticks = 0U;
+
+#if (OS_CONFIG_CORE_COUNT > 1U)
+    /* Core 0 owns the kernel time base, the same rule os_tick_handler enforces. Announcing a
+     * suppressed window from another core would add its idle time to counters core 0's tick
+     * interrupt is already advancing, so every sleep would be counted twice and the clock would
+     * run fast. Other cores still idle, they just do it in a plain WFI without announcing. */
+    if (os_arch_core_id_get() != 0U)
+    {
+        return;
+    }
+#endif
+
+    /* Interrupts off BEFORE deciding how long to sleep, and kept off until the sleep has been
+     * accounted for.
+     *
+     * Every input to that decision - the next timer expiry, the next ready work item, the earliest
+     * sleeping task - is something an ISR can change. Reading them with interrupts live leaves a
+     * window in which an ISR registers a nearer deadline than the one just computed, and the sleep
+     * then runs straight past it. Waking a task in that window is harmless, because that pends
+     * PendSV and a pending exception cuts the WFI short, but starting a timer or submitting
+     * delayed work pends nothing at all: there would be no wake-up event, and the timer would fire
+     * late by the whole remaining window.
+     *
+     * Masking first closes it. A WFI still wakes on a pending interrupt while masked, so anything
+     * arriving from here on shortens the sleep rather than being missed. */
+    mask_state = os_arch_kernel_mask_save();
+
+    planned_idle_ticks = os_tickless_expected_idle_ticks_get();
 
     if (planned_idle_ticks < OS_CONFIG_TICKLESS_MIN_IDLE)
     {
+        os_arch_kernel_mask_restore(mask_state);
         return;
     }
 
     os_tickless_pre_sleep_cb();
 
     OS_ARCH_SLEEP(planned_idle_ticks);
+
+    /* Wake path, in this order for a reason. A suppression-capable port holds the kernel interrupt
+     * mask from os_arch_sleep_prepare all the way to os_arch_sleep_finish, so everything between
+     * the WFI and that call runs with the kernel's own interrupts still masked.
+     *
+     * 1. Measure first, while the counter still holds the sleep. os_arch_elapsed_ticks_get also
+     *    restores the normal tick cadence.
+     * 2. Let the application put its hardware back (clocks, regulator, its own tick source) before
+     *    any kernel work depends on it.
+     * 3. Announce, so os_tick_count, timers, work and task delays all catch up on the sleep.
+     * 4. Only now release the mask.
+     *
+     * Announcing after the release, or before the restore, both break. Between the WFI and step 3
+     * os_tick_count is short by the entire sleep - hundreds of ticks - so any tick or timer
+     * processing let through early decides against a clock far behind reality. And os_tick_announce
+     * can pend a context switch: with interrupts already live it could be taken immediately,
+     * switching away from the idle task before step 2 ever ran and leaving SLEEPDEEP set or the
+     * application's tick source suspended. */
     elapsed_ticks = os_arch_elapsed_ticks_get();
 
     os_tickless_post_sleep_cb();
     os_tick_announce(elapsed_ticks);
+    os_arch_sleep_finish();
+
+    /* Releases the mask taken before the sleep was planned. Nesting is deliberate: the port's own
+     * mask (taken in os_arch_sleep_prepare, released by os_arch_sleep_finish above) sits inside
+     * this one, and both are save/restore rather than unconditional enables, so the interrupt
+     * state the idle task arrived with is what it leaves with. */
+    os_arch_kernel_mask_restore(mask_state);
 #endif
 }
 
-/******************************************************************************************************/
-/**
- * @brief Pre-sleep callback invoked before entering low-power mode.
+/* os_tickless_pre_sleep_cb() and os_tickless_post_sleep_cb() are deliberately NOT defined here.
  *
- * Weak empty default; the application overrides it by defining a function
- * with the same signature (see ahura.h).
+ * They describe the board, not the kernel: which sleep mode to enter, which clocks to gate, which
+ * peripherals must be flushed or quiesced first. A weak empty default in the kernel would let a
+ * project enable OS_CONFIG_TICKLESS_ENABLE and link cleanly while silently doing none of that -
+ * and on a part whose HAL runs its own tick source, an unwritten pre-sleep hook cuts every
+ * suppressed sleep short at that source's period, which looks like tickless idle simply not
+ * working. Requiring real definitions turns that into a link error naming the missing function.
  *
- * @return None.
- */
-OS_WEAK void os_tickless_pre_sleep_cb(void)
-{
-    /* Override in the application to select the sleep mode entered by the
-     * kernel's WFI, for example on a Cortex-M device:
-     *
-     *   - Sleep (default): CPU clock stops, peripherals and SysTick keep
-     *     running; nothing to do here.
-     *   - Deep sleep / STOP: set SLEEPDEEP and the vendor PWR mode bits,
-     *     e.g. SCB->SCR |= SCB_SCR_SLEEPDEEP_Msk; — then pick a wake source
-     *     that keeps counting time (SysTick stops in deep sleep) and clear
-     *     SLEEPDEEP again in os_tickless_post_sleep_cb.
-     *
-     * Gating peripheral clocks or lowering the regulator also belongs here.
-     */
-}
-
-/******************************************************************************************************/
-/**
- * @brief Post-sleep callback invoked after leaving low-power mode.
- *
- * Weak empty default; the application overrides it by defining a function
- * with the same signature (see ahura.h).
- *
- * @return None.
- */
-OS_WEAK void os_tickless_post_sleep_cb(void)
-{
-    /* Override in the application to undo the pre-sleep configuration,
-     * e.g. SCB->SCR &= ~SCB_SCR_SLEEPDEEP_Msk; and restore clocks. */
-}
+ * Write them in the application's callback file (see os_cb_template.c) whenever tickless idle is
+ * enabled. */
