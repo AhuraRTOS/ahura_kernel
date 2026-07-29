@@ -425,149 +425,6 @@ static inline uint32_t os_arch_lowest_bit_get(uint32_t bitmap)
 
 /*
  * ***********************************************************************************************************
- * Multi-core primitives
- * ***********************************************************************************************************
- *
- * Cortex-M has no architectural core-id register and no architectural IPI, so
- * on multi-core builds the SoC layer supplies both through _cb callbacks
- * (e.g. RP2040: SIO CPUID and the inter-core FIFO/doorbell). The spinlock is
- * implemented with LDREX/STREX where the ISA provides them; ARMv6-M SoCs must
- * route it to their hardware spinlocks instead.
-*/
-
-#if (OS_CONFIG_CORE_COUNT > 1U)
-/******************************************************************************************************/
-/**
- * @brief SoC callback: return the index of the calling core (0-based). Weak default returns 0.
- */
-uint32_t os_arch_core_id_get_cb(void);
-
-/******************************************************************************************************/
-/**
- * @brief SoC callback: interrupt another core so it re-evaluates scheduling. Weak default does nothing
- *        (the target core then reacts at its next tick).
- */
-void os_arch_core_ipi_request_cb(uint32_t core_id);
-#endif /* OS_CONFIG_CORE_COUNT > 1U */
-
-typedef struct
-{
-    __IO uint32_t locked;
-
-} os_arch_spinlock_t;
-
-#define OS_ARCH_SPINLOCK_INIT  { 0U }
-
-/******************************************************************************************************/
-/**
- * @brief Index of the calling core; always 0 on single-core builds.
- */
-static inline uint32_t os_arch_core_id_get(void)
-{
-#if (OS_CONFIG_CORE_COUNT > 1U)
-    return os_arch_core_id_get_cb();
-#else
-    return 0U;
-#endif
-}
-
-/*
- * The SoC-callback spinlock backend is used when the core lacks LDREX/STREX
- * (mandatory - ARMv6-M) or when OS_CONFIG_MULTICORE_SPINLOCK_SOC_BACKEND opts
- * out of the built-in LDREX/STREX backend: a core WITH exclusives can still
- * need this when its interconnect implements no GLOBAL exclusive monitor, or
- * the spinlock's memory is not Shareable-mapped - STREX then only excludes
- * within one core and the built-in backend would silently stop locking
- * across cores. See the OS_CONFIG_CORE_COUNT precondition notes in
- * os_config_template.h.
- */
-#define OS_ARCH_SPINLOCK_USE_CB  ((OS_ARCH_HAS_EXCLUSIVES == 0) || (OS_CONFIG_MULTICORE_SPINLOCK_SOC_BACKEND != 0))
-
-#if (OS_CONFIG_CORE_COUNT > 1U) && (OS_ARCH_SPINLOCK_USE_CB)
-/******************************************************************************************************/
-/**
- * @brief SoC callbacks backing the kernel spinlock: mandatory on cores without LDREX/STREX
- *        (ARMv6-M multi-core SoCs, e.g. hardware SIO spinlocks on the RP2040), optional
- *        elsewhere via OS_CONFIG_MULTICORE_SPINLOCK_SOC_BACKEND. No default is provided
- *        on purpose: a missing implementation must fail at link time rather than silently
- *        not lock.
- */
-void os_arch_spinlock_acquire_cb(os_arch_spinlock_t *lock);
-void os_arch_spinlock_release_cb(os_arch_spinlock_t *lock);
-#endif
-
-/******************************************************************************************************/
-/**
- * @brief Acquire an inter-core spinlock (busy-waits; call with interrupts disabled).
- *        Compiles to nothing on single-core builds.
- */
-static inline void os_arch_spinlock_acquire(os_arch_spinlock_t *lock)
-{
-#if (OS_CONFIG_CORE_COUNT == 1U)
-    (void)lock;
-#elif (OS_ARCH_SPINLOCK_USE_CB)
-    os_arch_spinlock_acquire_cb(lock);
-#else
-    uint32_t fail;
-
-    do
-    {
-        uint32_t current;
-
-        do
-        {
-            __asm volatile("ldrex %0, [%1]" : "=r"(current) : "r"(&lock->locked) : "memory");
-        } while (current != 0U);
-
-        __asm volatile("strex %0, %1, [%2]" : "=&r"(fail) : "r"(1U), "r"(&lock->locked) : "memory");
-    } while (fail != 0U);
-
-    OS_ARCH_DSB();
-#endif
-}
-
-/******************************************************************************************************/
-/**
- * @brief Release an inter-core spinlock. Compiles to nothing on single-core builds.
- */
-static inline void os_arch_spinlock_release(os_arch_spinlock_t *lock)
-{
-#if (OS_CONFIG_CORE_COUNT == 1U)
-    (void)lock;
-#elif (OS_ARCH_SPINLOCK_USE_CB)
-    os_arch_spinlock_release_cb(lock);
-#else
-    OS_ARCH_DSB();
-    lock->locked = 0U;
-    OS_ARCH_DSB();
-#endif
-}
-
-/*
- * ***********************************************************************************************************
- * TrustZone callbacks (OS_CONFIG_TRUSTZONE_NON_SECURE only)
- * ***********************************************************************************************************
-*/
-
-#if (OS_CONFIG_TRUSTZONE == OS_CONFIG_TRUSTZONE_NON_SECURE)
-/******************************************************************************************************/
-/**
- * @brief Application callback: bank the secure-side context of the task being switched out.
- *        Called from the context-switch handler; task_id 0 means the idle task (no secure
- *        context). Weak default does nothing.
- */
-void os_arch_tz_context_save_cb(uint32_t task_id);
-
-/******************************************************************************************************/
-/**
- * @brief Application callback: restore the secure-side context of the task being switched in.
- *        Weak default does nothing.
- */
-void os_arch_tz_context_restore_cb(uint32_t task_id);
-#endif /* OS_CONFIG_TRUSTZONE_NON_SECURE */
-
-/*
- * ***********************************************************************************************************
  * CPU clock
  * ***********************************************************************************************************
 */
@@ -685,6 +542,152 @@ void os_arch_sleep_finish(void);
  *        tick count, since it varies with both the platform clock and OS_CONFIG_TICK_HZ.
  */
 uint32_t os_arch_max_suppressed_ticks_get(void);
+
+/*
+ * ***********************************************************************************************************
+ * CONFIGURABLE - Multi-core primitives (OS_CONFIG_CORE_COUNT)
+ * ***********************************************************************************************************
+ *
+ * Cortex-M has no architectural core-id register and no architectural IPI, so
+ * on multi-core builds the SoC layer supplies both through _cb callbacks
+ * (e.g. RP2040: SIO CPUID and the inter-core FIFO/doorbell). The spinlock is
+ * implemented with LDREX/STREX where the ISA provides them; ARMv6-M SoCs must
+ * route it to their hardware spinlocks instead.
+ *
+ * The type and the two inline entry points stay unguarded so os_critical.c can
+ * call them unconditionally - they compile to nothing at OS_CONFIG_CORE_COUNT 1.
+*/
+
+#if (OS_CONFIG_CORE_COUNT > 1U)
+/******************************************************************************************************/
+/**
+ * @brief SoC callback: return the index of the calling core (0-based). Weak default returns 0.
+ */
+uint32_t os_arch_core_id_get_cb(void);
+
+/******************************************************************************************************/
+/**
+ * @brief SoC callback: interrupt another core so it re-evaluates scheduling. Weak default does nothing
+ *        (the target core then reacts at its next tick).
+ */
+void os_arch_core_ipi_request_cb(uint32_t core_id);
+#endif /* OS_CONFIG_CORE_COUNT > 1U */
+
+typedef struct
+{
+    __IO uint32_t locked;
+
+} os_arch_spinlock_t;
+
+#define OS_ARCH_SPINLOCK_INIT  { 0U }
+
+/******************************************************************************************************/
+/**
+ * @brief Index of the calling core; always 0 on single-core builds.
+ */
+static inline uint32_t os_arch_core_id_get(void)
+{
+#if (OS_CONFIG_CORE_COUNT > 1U)
+    return os_arch_core_id_get_cb();
+#else
+    return 0U;
+#endif
+}
+
+/*
+ * The SoC-callback spinlock backend is used when the core lacks LDREX/STREX
+ * (mandatory - ARMv6-M) or when OS_CONFIG_MULTICORE_SPINLOCK_SOC_BACKEND opts
+ * out of the built-in LDREX/STREX backend: a core WITH exclusives can still
+ * need this when its interconnect implements no GLOBAL exclusive monitor, or
+ * the spinlock's memory is not Shareable-mapped - STREX then only excludes
+ * within one core and the built-in backend would silently stop locking
+ * across cores. See the OS_CONFIG_CORE_COUNT precondition notes in
+ * os_config_template.h.
+ */
+#define OS_ARCH_SPINLOCK_USE_CB  ((OS_ARCH_HAS_EXCLUSIVES == 0) || (OS_CONFIG_MULTICORE_SPINLOCK_SOC_BACKEND != 0))
+
+#if (OS_CONFIG_CORE_COUNT > 1U) && (OS_ARCH_SPINLOCK_USE_CB)
+/******************************************************************************************************/
+/**
+ * @brief SoC callbacks backing the kernel spinlock: mandatory on cores without LDREX/STREX
+ *        (ARMv6-M multi-core SoCs, e.g. hardware SIO spinlocks on the RP2040), optional
+ *        elsewhere via OS_CONFIG_MULTICORE_SPINLOCK_SOC_BACKEND. No default is provided
+ *        on purpose: a missing implementation must fail at link time rather than silently
+ *        not lock.
+ */
+void os_arch_spinlock_acquire_cb(os_arch_spinlock_t *lock);
+void os_arch_spinlock_release_cb(os_arch_spinlock_t *lock);
+#endif
+
+/******************************************************************************************************/
+/**
+ * @brief Acquire an inter-core spinlock (busy-waits; call with interrupts disabled).
+ *        Compiles to nothing on single-core builds.
+ */
+static inline void os_arch_spinlock_acquire(os_arch_spinlock_t *lock)
+{
+#if (OS_CONFIG_CORE_COUNT == 1U)
+    (void)lock;
+#elif (OS_ARCH_SPINLOCK_USE_CB)
+    os_arch_spinlock_acquire_cb(lock);
+#else
+    uint32_t fail;
+
+    do
+    {
+        uint32_t current;
+
+        do
+        {
+            __asm volatile("ldrex %0, [%1]" : "=r"(current) : "r"(&lock->locked) : "memory");
+        } while (current != 0U);
+
+        __asm volatile("strex %0, %1, [%2]" : "=&r"(fail) : "r"(1U), "r"(&lock->locked) : "memory");
+    } while (fail != 0U);
+
+    OS_ARCH_DSB();
+#endif
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Release an inter-core spinlock. Compiles to nothing on single-core builds.
+ */
+static inline void os_arch_spinlock_release(os_arch_spinlock_t *lock)
+{
+#if (OS_CONFIG_CORE_COUNT == 1U)
+    (void)lock;
+#elif (OS_ARCH_SPINLOCK_USE_CB)
+    os_arch_spinlock_release_cb(lock);
+#else
+    OS_ARCH_DSB();
+    lock->locked = 0U;
+    OS_ARCH_DSB();
+#endif
+}
+
+/*
+ * ***********************************************************************************************************
+ * CONFIGURABLE - TrustZone callbacks (OS_CONFIG_TRUSTZONE_NON_SECURE only)
+ * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_TRUSTZONE == OS_CONFIG_TRUSTZONE_NON_SECURE)
+/******************************************************************************************************/
+/**
+ * @brief Application callback: bank the secure-side context of the task being switched out.
+ *        Called from the context-switch handler; task_id 0 means the idle task (no secure
+ *        context). Weak default does nothing.
+ */
+void os_arch_tz_context_save_cb(uint32_t task_id);
+
+/******************************************************************************************************/
+/**
+ * @brief Application callback: restore the secure-side context of the task being switched in.
+ *        Weak default does nothing.
+ */
+void os_arch_tz_context_restore_cb(uint32_t task_id);
+#endif /* OS_CONFIG_TRUSTZONE_NON_SECURE */
 
 #ifdef __cplusplus
 }

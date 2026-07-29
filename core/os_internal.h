@@ -217,55 +217,6 @@ void os_tick_announce(uint32_t elapsed_ticks);
 
 /*
  * ***********************************************************************************************************
- * Software timers
- * ***********************************************************************************************************
-*/
-
-/******************************************************************************************************/
-/**
- * @brief Create and start the kernel timer service task (os_timer.c).
- */
-os_status os_timer_system_init(void);
-
-/******************************************************************************************************/
-/**
- * @brief Advance all registered software timers by elapsed ticks (os_timer.c, ISR context).
- */
-void os_timer_tick_process(uint32_t elapsed_ticks);
-
-/******************************************************************************************************/
-/**
- * @brief Return ticks until the next active timer expiry, UINT32_MAX when none (os_timer.c).
- */
-uint32_t os_timer_next_expiry_ticks_get(void);
-
-/*
- * ***********************************************************************************************************
- * Work queue
- * ***********************************************************************************************************
-*/
-
-/******************************************************************************************************/
-/**
- * @brief Create and start the kernel work service task (os_work.c).
- */
-os_status os_work_system_init(void);
-
-/******************************************************************************************************/
-/**
- * @brief Advance delayed work items by elapsed ticks (os_work.c, ISR context).
- */
-void os_work_tick_process(uint32_t elapsed_ticks);
-
-/******************************************************************************************************/
-/**
- * @brief Return ticks until the next delayed work item becomes ready, 0 when one is already
- *        ready, UINT32_MAX when none (os_work.c).
- */
-uint32_t os_work_next_ready_ticks_get(void);
-
-/*
- * ***********************************************************************************************************
  * Internal helpers
  * ***********************************************************************************************************
 */
@@ -356,6 +307,10 @@ static inline uint32_t os_internal_wait_remaining(uint32_t budget_ticks, uint32_
  * ***********************************************************************************************************
  * PART 2 - CONFIGURABLE
  * ***********************************************************************************************************
+ *
+ * Same order as PART 2 of ahura.h and of os_config.h. Every prototype here is
+ * behind the guard of the module that DEFINES it, so a disabled feature cannot
+ * leave a declaration pointing at a symbol that was never compiled.
 */
 
 /*
@@ -391,6 +346,59 @@ void os_task_mutex_owner_unlink_and_reprioritize(os_list_node_t *owner_node);
 
 /*
  * ***********************************************************************************************************
+ * Software timers            - OS_CONFIG_TIMER_ENABLE
+ * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Create and start the kernel timer service task (os_timer.c).
+ */
+os_status os_timer_system_init(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Advance all registered software timers by elapsed ticks (os_timer.c, ISR context).
+ */
+void os_timer_tick_process(uint32_t elapsed_ticks);
+
+/******************************************************************************************************/
+/**
+ * @brief Return ticks until the next active timer expiry, UINT32_MAX when none (os_timer.c).
+ */
+uint32_t os_timer_next_expiry_ticks_get(void);
+#endif /* OS_CONFIG_TIMER_ENABLE */
+
+/*
+ * ***********************************************************************************************************
+ * Work queue                 - OS_CONFIG_WORK_ENABLE
+ * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_WORK_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Create and start the kernel work service task (os_work.c).
+ */
+os_status os_work_system_init(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Advance delayed work items by elapsed ticks (os_work.c, ISR context).
+ */
+void os_work_tick_process(uint32_t elapsed_ticks);
+
+/******************************************************************************************************/
+/**
+ * @brief Return ticks until the next delayed work item becomes ready, 0 when one is already
+ *        ready, UINT32_MAX when none (os_work.c).
+ */
+uint32_t os_work_next_ready_ticks_get(void);
+#endif /* OS_CONFIG_WORK_ENABLE */
+
+/*
+ * ***********************************************************************************************************
  * Buffered logging           - OS_CONFIG_LOG_ENABLE
  * ***********************************************************************************************************
 */
@@ -401,7 +409,7 @@ void os_task_mutex_owner_unlink_and_reprioritize(os_list_node_t *owner_node);
  * @brief Create and start the kernel log service task (os_log.c).
  */
 os_status os_log_system_init(void);
-#endif
+#endif /* OS_CONFIG_LOG_ENABLE */
 
 #ifdef __cplusplus
 }

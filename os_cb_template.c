@@ -10,7 +10,10 @@
  *
  * Functions guarded by configuration (#if blocks) only exist when the
  * matching OS_CONFIG_ option is enabled, so the file compiles cleanly under
- * any configuration.
+ * any configuration. One guard per group, in the same order as PART 2 of
+ * ahura.h and of os_config.h, and each guard is the exact condition under
+ * which the kernel calls the group — see the spinlock note below for why
+ * that matters.
  *
  * @copyright (c) 2026 Ahura Project Contributors
  *            SPDX-License-Identifier: MIT
@@ -99,60 +102,6 @@ void os_log_output_cb(const uint8_t *data, size_t length)
 
 /*
  * ***********************************************************************************************************
- * Tickless idle hooks
- *
- * Both are MANDATORY when OS_CONFIG_TICKLESS_ENABLE is 1: the kernel declares them but defines
- * neither, so a missing one is a link error rather than a silently empty hook. Delete the pair
- * (and this block) when tickless idle is off.
- *
- * A common trap worth checking before leaving pre-sleep empty: if the vendor HAL drives its own
- * periodic tick from a separate timer, that interrupt wakes the WFI at its own period no matter
- * how long the kernel planned to sleep, so every suppressed sleep is cut short. Suspending it here
- * and resuming it in the post-sleep hook is what makes tickless idle actually save power.
- *
- * BOTH hooks run with the kernel's interrupts masked. That is what stops an ISR from moving a
- * deadline after the sleep length has been decided but before the WFI. The consequence for these
- * functions is that polling a hardware flag is fine, but waiting on anything an interrupt has to
- * deliver - a DMA completion callback, an RTOS object, a HAL call that spins on HAL_GetTick() -
- * will hang, because the interrupt that would end the wait cannot run. Keep both short: their
- * duration is added directly to interrupt latency.
- * ***********************************************************************************************************
-*/
-
-#if (OS_CONFIG_TICKLESS_ENABLE == 1U)
-
-/******************************************************************************************************/
-/**
- * @brief Called right before the idle sleep: select the sleep mode (e.g. SLEEPDEEP), gate clocks.
- *
- * Empty body = plain SLEEP (SLEEPDEEP left clear): the CPU clock stops but every peripheral clock -
- * UARTs, timers, DMA - keeps running, so nothing needs saving here and os_tickless_post_sleep_cb()
- * has nothing to restore. If a peripheral's completion must be guaranteed before the CPU naps (e.g.
- * flush a debug UART so the last line is fully transmitted), block on its busy/TX-complete flag
- * here. Selecting a deeper mode (STOP/SLEEPDEEP) instead means gated peripheral and system clocks -
- * restore them (and re-run the clock configuration if PLL/HSE were affected) in
- * os_tickless_post_sleep_cb() before anything relies on them again.
- */
-void os_tickless_pre_sleep_cb(void)
-{
-}
-
-/******************************************************************************************************/
-/**
- * @brief Called right after wakeup: clear SLEEPDEEP, restore clocks.
- *
- * Runs with the kernel's interrupts still masked and before the sleep has been announced, so the
- * kernel clock is still short by the whole sleep duration while this executes. Restore hardware
- * here; do not call kernel APIs that block, delay, or read the tick expecting it to be current.
- * Keep it short for the same reason: everything in here is added to interrupt latency.
- */
-void os_tickless_post_sleep_cb(void)
-{
-}
-#endif /* OS_CONFIG_TICKLESS_ENABLE */
-
-/*
- * ***********************************************************************************************************
  * TrustZone secure-context management (OS_CONFIG_TRUSTZONE_NON_SECURE only)
  * ***********************************************************************************************************
 */
@@ -206,12 +155,19 @@ void os_arch_core_ipi_request_cb(uint32_t core_id)
     (void)core_id;
 }
 
-#if (OS_ARCH_HAS_EXCLUSIVES == 0)
+/* Exactly the condition under which the kernel routes its spinlock through
+ * these callbacks (os_arch_port_common.h), so the two can never disagree:
+ * cores without LDREX/STREX, plus any core where
+ * OS_CONFIG_MULTICORE_SPINLOCK_SOC_BACKEND opts out of the built-in backend.
+ * Testing OS_ARCH_HAS_EXCLUSIVES alone would miss that second case and leave
+ * the opt-out failing at link time. */
+#if (OS_ARCH_SPINLOCK_USE_CB)
 /******************************************************************************************************/
 /**
- * @brief Kernel spinlock backing on cores without LDREX/STREX (ARMv6-M multi-core SoCs).
- *        MANDATORY there — route to the SoC's hardware spinlocks (e.g. RP2040 SIO); the
- *        kernel deliberately ships no default, so leaving these out fails at link time.
+ * @brief Kernel spinlock backing when the built-in LDREX/STREX backend is unavailable or
+ *        opted out of. MANDATORY then — route to the SoC's hardware spinlocks (e.g. RP2040
+ *        SIO); the kernel deliberately ships no default, so leaving these out fails at
+ *        link time.
  */
 void os_arch_spinlock_acquire_cb(os_arch_spinlock_t *lock)
 {
@@ -222,5 +178,59 @@ void os_arch_spinlock_release_cb(os_arch_spinlock_t *lock)
 {
     (void)lock;
 }
-#endif /* OS_ARCH_HAS_EXCLUSIVES == 0 */
+#endif /* OS_ARCH_SPINLOCK_USE_CB */
 #endif /* OS_CONFIG_CORE_COUNT > 1U */
+
+/*
+ * ***********************************************************************************************************
+ * Tickless idle hooks (OS_CONFIG_TICKLESS_ENABLE only)
+ *
+ * Both are MANDATORY when OS_CONFIG_TICKLESS_ENABLE is 1: the kernel declares them but defines
+ * neither, so a missing one is a link error rather than a silently empty hook. Delete the pair
+ * (and this block) when tickless idle is off.
+ *
+ * A common trap worth checking before leaving pre-sleep empty: if the vendor HAL drives its own
+ * periodic tick from a separate timer, that interrupt wakes the WFI at its own period no matter
+ * how long the kernel planned to sleep, so every suppressed sleep is cut short. Suspending it here
+ * and resuming it in the post-sleep hook is what makes tickless idle actually save power.
+ *
+ * BOTH hooks run with the kernel's interrupts masked. That is what stops an ISR from moving a
+ * deadline after the sleep length has been decided but before the WFI. The consequence for these
+ * functions is that polling a hardware flag is fine, but waiting on anything an interrupt has to
+ * deliver - a DMA completion callback, an RTOS object, a HAL call that spins on HAL_GetTick() -
+ * will hang, because the interrupt that would end the wait cannot run. Keep both short: their
+ * duration is added directly to interrupt latency.
+ * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_TICKLESS_ENABLE == 1U)
+
+/******************************************************************************************************/
+/**
+ * @brief Called right before the idle sleep: select the sleep mode (e.g. SLEEPDEEP), gate clocks.
+ *
+ * Empty body = plain SLEEP (SLEEPDEEP left clear): the CPU clock stops but every peripheral clock -
+ * UARTs, timers, DMA - keeps running, so nothing needs saving here and os_tickless_post_sleep_cb()
+ * has nothing to restore. If a peripheral's completion must be guaranteed before the CPU naps (e.g.
+ * flush a debug UART so the last line is fully transmitted), block on its busy/TX-complete flag
+ * here. Selecting a deeper mode (STOP/SLEEPDEEP) instead means gated peripheral and system clocks -
+ * restore them (and re-run the clock configuration if PLL/HSE were affected) in
+ * os_tickless_post_sleep_cb() before anything relies on them again.
+ */
+void os_tickless_pre_sleep_cb(void)
+{
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Called right after wakeup: clear SLEEPDEEP, restore clocks.
+ *
+ * Runs with the kernel's interrupts still masked and before the sleep has been announced, so the
+ * kernel clock is still short by the whole sleep duration while this executes. Restore hardware
+ * here; do not call kernel APIs that block, delay, or read the tick expecting it to be current.
+ * Keep it short for the same reason: everything in here is added to interrupt latency.
+ */
+void os_tickless_post_sleep_cb(void)
+{
+}
+#endif /* OS_CONFIG_TICKLESS_ENABLE */

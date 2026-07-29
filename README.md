@@ -849,6 +849,47 @@ runs on real hardware for any arch or board the kernel supports. Retarget
 > release build. The table says which kind of build produced it, so compare like
 > with like.
 
+#### Stress tests
+
+Beyond the functional checks, the suite runs three tiers of stress, each aimed at
+a different class of bug:
+
+| Tier | What it does |
+|---|---|
+| **Multi-primitive soak** | `test_stress_soak` — 4 tasks at distinct priorities hit a mutex, an under-provisioned semaphore and queue, an event group and the heap *simultaneously* for many iterations, then check hard invariants (exact mutex-protected counter, exact token reconciliation, no leak, no corruption) |
+| **Create/destroy churn** | `test_stress_task_churn`, `test_stress_timer_churn` — one create/run/exit or init/start/stop path cycled 500 times, to shake out slot-reuse and list-corruption bugs |
+| **Per-subsystem stress** | Nine tests, one subsystem each, at high volume with exact accounting (below) |
+
+The per-subsystem tier:
+
+| Test | Invariant it enforces |
+|---|---|
+| `test_stress_queue_dynamic_churn` | 200 `os_queue_create`/use/`os_queue_delete` cycles, geometry varying each time, leak nothing and corrupt no payload |
+| `test_stress_queue_dynamic_concurrent` | 3 producers × 32 items through a heap-allocated queue of capacity 2; every `(producer, sequence)` pair arrives exactly once — a lost send-waiter wakeup is a missing bit, a double delivery an already-set one |
+| `test_stress_heap_fragmentation` | Freeing a block never disturbs a live neighbour; adjacent holes really coalesce; the heap recovers byte-exactly after being driven to exhaustion |
+| `test_stress_semaphore_pingpong` | 1000 round trips (2000 blocking handoffs) through two empty binary semaphores, so every take blocks and every give wakes a waiter — no token is ever already available to mask a lost wakeup |
+| `test_stress_notify_storm` | 1000 notifications to a higher-priority waiter that consumes each before the next is written, so exact 1:1 accounting is meaningful for a last-write-wins mailbox |
+| `test_stress_event_bit_storm` | 4 tasks × 250 iterations of set/wait/clear-on-exit on their own bit of one group; all bits must end clear |
+| `test_stress_work_flood` | Registry oversubscribed 2:1, half the accepted items cancelled; executed + cancelled + refused must reconcile exactly, then 20 more churn rounds |
+| `test_stress_timer_flood` | Every timer slot armed periodically at once, each at its own period; one past capacity refused with `FULL`; a stopped timer never fires again |
+| `test_stress_mutex_convoy` | 4 tasks × 200 acquisitions on one mutex, yielding *inside* the section — exclusivity checked from within, exact total from without, and no task starved |
+
+Every count is exact rather than approximate, deliberately: a check that only
+asserts "roughly the right number of things happened" cannot tell a dropped
+wakeup from scheduling jitter, so it has to be written loose enough to pass
+through the very bug it exists to catch. The one exception is timer fire counts
+over a wall-clock window, where the tolerance is bounded at ±2 rather than left
+open.
+
+The per-subsystem tier costs about 15 KB of flash, most of it the `.rodata` for
+its PASS/FAIL messages. It is therefore compiled in whenever the build is
+optimized at all (`__OPTIMIZE__`, i.e. any `-O` above `-O0`) and skipped
+otherwise, with a run-time `[SKIP]` line naming the reason. That key is the
+optimization level rather than a hand-set switch because that is what actually
+decides whether it fits — an unoptimized build of a 128 KB part may well have no
+room — and because stress timings at `-O0` say little about shipped firmware
+anyway. Define `OS_TEST_STRESS_EXTENDED` to override in either direction.
+
 ### Examples
 
 [`ahura_examples/kernel/`](../ahura_examples/kernel/) has one small, focused
@@ -889,13 +930,17 @@ so copy any of them over the project's `os_main.c` to see it run.
 #### Top-level files
 
 - `ahura.h` is the public umbrella API, and the only header applications
-  include. It declares `os_main()` and `os_test()` as well, even though the
-  kernel defines neither: supplying them is the application's job through its
-  `os_main.c`, or the test library's. Neither carries the `_cb` suffix used
-  elsewhere in this header. That suffix is reserved for callbacks the kernel
-  queries for platform behavior, such as `os_tickless_pre_sleep_cb`, whereas
-  `os_main()` and `os_test()` are where the application's or suite's own code
-  runs.
+  include. It reads in two parts: **PART 1** is everything no option can remove
+  (types, tasks, time, critical sections, the intrusive list), so anything found
+  there can be used unconditionally; **PART 2** is one group per `OS_CONFIG_`
+  option, each behind a single guard covering its types, macros and functions
+  together, in the same order as `os_config.h`. It declares `os_main()` and
+  `os_test()` as well, even though the kernel defines neither: supplying them is
+  the application's job through its `os_main.c`, or the test library's. Neither
+  carries the `_cb` suffix used elsewhere in this header. That suffix is
+  reserved for callbacks the kernel queries for platform behavior, such as
+  `os_tickless_pre_sleep_cb`, whereas `os_main()` and `os_test()` are where the
+  application's or suite's own code runs.
 - `os_config_template.h` is the template for the application's `os_config.h`. It
   lists every build-time option at its default value: tick rate, task and timer
   limits, stack sizes, heap size, TrustZone mode, core count, and the per-feature
@@ -908,6 +953,16 @@ so copy any of them over the project's `os_main.c` to see it run.
   [Configuration](#configuration). Disabling a feature compiles out its code and
   API, and disabling timer, work, the default task, or the self-test task also
   removes the corresponding kernel service task and its stack.
+
+  It reads in three parts, most important first: **PART 1** the core options
+  that always apply (tick rate, task table, default task, interrupt mask);
+  **PART 2** one section per optional feature, each holding its `_ENABLE` switch
+  next to the sizing that switch controls, so turning a feature off shows
+  exactly which values stop mattering — `OS_CONFIG_MAX_TIMERS` and
+  `OS_CONFIG_TIMER_STACK_SIZE` sit under the timer switch, the log sizing under
+  `OS_CONFIG_LOG_ENABLE`, and so on; **PART 3** the platform properties
+  (TrustZone, core count, tickless). The option *set* is fixed regardless — the
+  kernel still rejects an `os_config.h` that is missing any of them.
 - `os_cb_template.c` is the template for the application-side callbacks, and is
   deliberately not compiled into the kernel. See [Application
   callbacks](#application-callbacks).

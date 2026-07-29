@@ -2,6 +2,16 @@
  * @file ahura.h
  * @brief Ahura kernel umbrella public API.
  *
+ * Laid out in two parts, most important first:
+ *
+ *   PART 1  ALWAYS AVAILABLE - types, task/time/critical-section API and the
+ *           intrusive list. No configuration option removes any of it, so
+ *           anything declared here can be used unconditionally.
+ *   PART 2  CONFIGURABLE - one group per OS_CONFIG_ option, in the same order
+ *           the options appear in os_config.h. Each group sits behind exactly
+ *           one guard covering its types, macros and functions together, so a
+ *           disabled feature takes its whole API surface with it.
+ *
  * @copyright (c) 2026 Ahura Project Contributors
  *            SPDX-License-Identifier: MIT
  *            See LICENSE.md in the project root for the full license text.
@@ -102,7 +112,7 @@ typedef struct
 
 /*
  * ***********************************************************************************************************
- * Task priorities and core affinity
+ * Timeouts, task priorities and core affinity
  * ***********************************************************************************************************
 */
 
@@ -174,17 +184,6 @@ typedef enum
 /** Core affinity: the task may run only on core n. Combine with | for a set
  *  of allowed cores: OS_TASK_CORE(0) | OS_TASK_CORE(2). */
 #define OS_TASK_CORE(n)         (1UL << (n))
-
-/** Check a condition that must hold if the program is correct, and halt at the
- *  point of failure when it does not (see OS_CONFIG_ASSERT_ENABLE).
- *
- *  Assertions only ADD checks: the kernel still returns the same status codes
- *  either way, so a build with assertions off behaves exactly as one with them
- *  on, minus the halt. Use them for programming errors (a bad handle, blocking
- *  from an ISR), never for conditions that can legitimately happen at runtime.
- *
- *  The expression is not evaluated at all when assertions are compiled out, so
- *  it must be free of side effects. */
 
 /*
  * ***********************************************************************************************************
@@ -282,6 +281,12 @@ void os_start(void);
 
 /******************************************************************************************************/
 /**
+ * @brief Return true once the scheduler has been started.
+ */
+bool os_kernel_is_running(void);
+
+/******************************************************************************************************/
+/**
  * @brief Default application task body (see OS_CONFIG_MAIN_TASK_* in os_config.h). os_init()
  *        creates and starts this task automatically, so the application must define it: copy
  *        os_main_template.c into the project as os_main.c (see README "Default application
@@ -299,12 +304,6 @@ void os_main(void);
  * Tasks
  * ***********************************************************************************************************
 */
-
-/******************************************************************************************************/
-/**
- * @brief Return true once the scheduler has been started.
- */
-bool os_kernel_is_running(void);
 
 /******************************************************************************************************/
 /**
@@ -374,17 +373,16 @@ os_status os_delay_us(uint32_t microseconds);
  */
 os_status os_delay_s(uint32_t seconds);
 
-/******************************************************************************************************/
-/**
- * @brief Enter a critical section (disables interrupts, supports nesting).
- */
-
 /*
  * ***********************************************************************************************************
  * Critical sections
  * ***********************************************************************************************************
 */
 
+/******************************************************************************************************/
+/**
+ * @brief Enter a critical section (disables interrupts, supports nesting).
+ */
 void os_critical_enter(void);
 
 /******************************************************************************************************/
@@ -395,43 +393,17 @@ void os_critical_exit(void);
 
 /*
  * ***********************************************************************************************************
- * Tickless idle
- * ***********************************************************************************************************
-*/
-
-/******************************************************************************************************/
-/**
- * @brief Execute one tickless-idle pass: suppress ticking for the next known-idle duration,
- *        sleep, and announce the real elapsed time on wake.
- */
-void os_tickless_idle_process(void);
-
-/******************************************************************************************************/
-/**
- * @brief Ticks the kernel would plan to suppress right now, bounded by the earliest kernel
- *        time source (timer expiry, ready work item, finite-delay sleeper).
- */
-uint32_t os_tickless_expected_idle_ticks_get(void);
-
-/******************************************************************************************************/
-/**
- * @brief Maximum ticks the active arch port can suppress in one tickless window, given the
- *        platform clock and OS_CONFIG_TICK_HZ (not a fixed constant).
- */
-uint32_t os_tickless_max_suppressed_ticks_get(void);
-
-/*
- * ***********************************************************************************************************
  * Intrusive list
  * ***********************************************************************************************************
+ *
+ * Always available: the scheduler and the blocking primitives run on these
+ * lists, so the list module cannot be configured out. Declared before PART 2
+ * because the kernel objects there embed waiter lists.
 */
 
 /******************************************************************************************************/
 /**
- * @brief Intrusive list node object. Always available: the scheduler and the
- *        blocking primitives run on these lists, so the list module cannot
- *        be configured out. Declared before the kernel objects because they
- *        embed waiter lists.
+ * @brief Intrusive list node object.
  */
 typedef struct os_list_node
 {
@@ -489,9 +461,443 @@ void os_list_insert_before(os_list_t *list, os_list_node_t *position, os_list_no
 
 /*
  * ***********************************************************************************************************
+ * Tickless idle control
+ * ***********************************************************************************************************
+ *
+ * Always declared, unlike the two application hooks in PART 2: these three are
+ * compiled into every build and simply do nothing (returning 0) when
+ * OS_CONFIG_TICKLESS_ENABLE is 0, so a diagnostic or test may call them without
+ * a guard of its own.
+*/
+
+/******************************************************************************************************/
+/**
+ * @brief Execute one tickless-idle pass: suppress ticking for the next known-idle duration,
+ *        sleep, and announce the real elapsed time on wake.
+ */
+void os_tickless_idle_process(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Ticks the kernel would plan to suppress right now, bounded by the earliest kernel
+ *        time source (timer expiry, ready work item, finite-delay sleeper).
+ */
+uint32_t os_tickless_expected_idle_ticks_get(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Maximum ticks the active arch port can suppress in one tickless window, given the
+ *        platform clock and OS_CONFIG_TICK_HZ (not a fixed constant).
+ */
+uint32_t os_tickless_max_suppressed_ticks_get(void);
+
+/*
+ * ***********************************************************************************************************
  * PART 2 - CONFIGURABLE (each group compiles away with its OS_CONFIG_ option)
  * ***********************************************************************************************************
+ *
+ * Same order as the option list in os_config.h, one guard per group.
 */
+
+/*
+ * ***********************************************************************************************************
+ * Mutex              - OS_CONFIG_MUTEX_ENABLE
+ * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+
+/******************************************************************************************************/
+/**
+ * @brief Mutex object.
+ */
+typedef struct
+{
+    bool           locked;     /**< True while held.                                  */
+    uint32_t       owner_id;   /**< Task id of the holder, 0 when free/unknown owner. */
+    os_list_t      waiters;    /**< Tasks blocked waiting for the mutex.              */
+    os_list_node_t owner_node; /**< Links into the owner's owned-mutex list (priority inheritance). */
+
+} os_mutex_t;
+
+/******************************************************************************************************/
+/**
+ * @brief Initialize a mutex object.
+ */
+os_status os_mutex_init(os_mutex_t *mutex);
+
+/******************************************************************************************************/
+/**
+ * @brief Acquire a mutex, waiting up to timeout_ms when contended.
+ */
+os_status os_mutex_lock(os_mutex_t *mutex, uint32_t timeout_ms);
+
+/******************************************************************************************************/
+/**
+ * @brief Attempt to acquire a mutex without blocking.
+ */
+os_status os_mutex_try_lock(os_mutex_t *mutex);
+
+/******************************************************************************************************/
+/**
+ * @brief Release a mutex object (only the owner may unlock).
+ */
+os_status os_mutex_unlock(os_mutex_t *mutex);
+
+#endif /* OS_CONFIG_MUTEX_ENABLE */
+
+/*
+ * ***********************************************************************************************************
+ * Semaphore          - OS_CONFIG_SEMAPHORE_ENABLE
+ * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_SEMAPHORE_ENABLE == 1U)
+
+/******************************************************************************************************/
+/**
+ * @brief Semaphore object.
+ */
+typedef struct
+{
+    uint32_t  count;
+    uint32_t  max_count;
+    os_list_t waiters; /**< Tasks blocked waiting for a token. */
+
+} os_semaphore_t;
+
+/******************************************************************************************************/
+/**
+ * @brief Initialize a semaphore object.
+ */
+os_status os_semaphore_init(os_semaphore_t *semaphore, uint32_t initial_count, uint32_t max_count);
+
+/******************************************************************************************************/
+/**
+ * @brief Give one token to semaphore (ISR-safe, never blocks).
+ */
+os_status os_semaphore_give(os_semaphore_t *semaphore);
+
+/******************************************************************************************************/
+/**
+ * @brief Take one token from semaphore, waiting up to timeout_ms when empty.
+ */
+os_status os_semaphore_take(os_semaphore_t *semaphore, uint32_t timeout_ms);
+
+#endif /* OS_CONFIG_SEMAPHORE_ENABLE */
+
+/*
+ * ***********************************************************************************************************
+ * Queue              - OS_CONFIG_QUEUE_ENABLE
+ * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_QUEUE_ENABLE == 1U)
+
+/******************************************************************************************************/
+/**
+ * @brief Queue object.
+ */
+typedef struct
+{
+    uint8_t   *buffer;
+    size_t    item_size;
+    size_t    capacity;
+    size_t    head;
+    size_t    tail;
+    size_t    count;
+    os_list_t send_waiters;    /**< Tasks blocked because the queue is full.  */
+    os_list_t receive_waiters; /**< Tasks blocked because the queue is empty. */
+    bool      buffer_owned;    /**< Buffer came from os_queue_create and must be freed on delete. */
+
+} os_queue_t;
+
+/** Define a statically stored queue and its item buffer: the queue object is declared as plain
+ *  "name" (what every other os_queue_* call references), and the backing storage gets the
+ *  decorated "name_BUFFER", touched only by OS_QUEUE_INIT below and never by hand.
+ *
+ *  "type" is the item type, so the buffer is typed rather than a byte blob and the compiler
+ *  checks it. Pair it with OS_QUEUE_INIT, which derives item size and capacity from the array
+ *  itself - that pairing is the point of the macro, since passing os_queue_init an item_size or
+ *  capacity that disagrees with the real buffer is otherwise an easy and silent way to read or
+ *  write past it.
+ *
+ *      OS_QUEUE_DEFINE(sensor_q, sensor_sample_t, 8);
+ *      ...
+ *      status = OS_QUEUE_INIT(sensor_q);
+ *      status = os_queue_send(&sensor_q, &sample, 10U);
+ *
+ *  Both objects are static, so this belongs at file scope. For a queue whose size is not known
+ *  until run time, use os_queue_create/os_queue_delete instead. */
+#define OS_QUEUE_DEFINE(name, type, capacity) \
+    static type       name##_BUFFER[(capacity)]; \
+    static os_queue_t name
+
+/** Initialize a queue declared with OS_QUEUE_DEFINE, deriving the item size and capacity from
+ *  the buffer so the two can never disagree. Evaluates to the os_status of os_queue_init. */
+#define OS_QUEUE_INIT(name)                                          \
+    os_queue_init(&(name), (name##_BUFFER), sizeof((name##_BUFFER)[0]), \
+                  (sizeof(name##_BUFFER) / sizeof((name##_BUFFER)[0])))
+
+/******************************************************************************************************/
+/**
+ * @brief Initialize a queue object over caller-provided storage.
+ */
+os_status os_queue_init(os_queue_t *queue, void *buffer, size_t item_size, size_t capacity);
+
+/******************************************************************************************************/
+/**
+ * @brief Send one item into queue, waiting up to timeout_ms when full.
+ */
+os_status os_queue_send(os_queue_t *queue, const void *item, uint32_t timeout_ms);
+
+/******************************************************************************************************/
+/**
+ * @brief Receive one item from queue, waiting up to timeout_ms when empty.
+ */
+os_status os_queue_receive(os_queue_t *queue, void *item_out, uint32_t timeout_ms);
+
+/******************************************************************************************************/
+/**
+ * @brief Get current queue item count.
+ */
+size_t os_queue_count_get(const os_queue_t *queue);
+
+#if (OS_CONFIG_ALLOC_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Create a queue whose item buffer is allocated from the kernel heap.
+ */
+os_status os_queue_create(os_queue_t *queue, size_t item_size, size_t capacity);
+
+/******************************************************************************************************/
+/**
+ * @brief Tear down a queue, freeing the buffer only if os_queue_create allocated it.
+ */
+os_status os_queue_delete(os_queue_t *queue);
+#endif /* OS_CONFIG_ALLOC_ENABLE */
+
+#endif /* OS_CONFIG_QUEUE_ENABLE */
+
+/*
+ * ***********************************************************************************************************
+ * Event group        - OS_CONFIG_EVENT_ENABLE
+ * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_EVENT_ENABLE == 1U)
+
+/******************************************************************************************************/
+/**
+ * @brief Event group object.
+ */
+typedef struct
+{
+    uint32_t  flags;
+    os_list_t waiters; /**< Tasks blocked waiting for bits to match. */
+
+} os_event_group_t;
+
+/******************************************************************************************************/
+/**
+ * @brief Initialize an event group object.
+ */
+os_status os_event_group_init(os_event_group_t *group);
+
+/******************************************************************************************************/
+/**
+ * @brief Set event bits in the group (ISR-safe).
+ */
+os_status os_event_group_set_bits(os_event_group_t *group, uint32_t bits);
+
+/******************************************************************************************************/
+/**
+ * @brief Clear event bits in the group (ISR-safe).
+ */
+os_status os_event_group_clear_bits(os_event_group_t *group, uint32_t bits);
+
+/******************************************************************************************************/
+/**
+ * @brief Wait for event bits, waiting up to timeout_ms until they match. clear_on_exit true
+ *        consumes the requested bits atomically with the match (no lost set between the
+ *        wait returning and a separate manual clear).
+ */
+os_status os_event_group_wait_bits(os_event_group_t *group, uint32_t bits, bool wait_all, bool clear_on_exit, uint32_t *matched_bits, uint32_t timeout_ms);
+
+#endif /* OS_CONFIG_EVENT_ENABLE */
+
+/*
+ * ***********************************************************************************************************
+ * Software timer     - OS_CONFIG_TIMER_ENABLE
+ * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
+
+/******************************************************************************************************/
+/**
+ * @brief Timer operating mode.
+ */
+typedef enum
+{
+    OS_TIMER_MODE_ONE_SHOT = 0, /**< Fires once, then stops.            */
+    OS_TIMER_MODE_PERIODIC = 1, /**< Reloads and fires every period.    */
+
+} os_timer_mode_t;
+
+/******************************************************************************************************/
+/**
+ * @brief Timer callback signature.
+ */
+typedef void (*os_timer_callback_t)(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief Software timer object.
+ */
+typedef struct
+{
+    uint32_t            period_ticks;
+    uint32_t            remaining_ticks;
+    os_timer_mode_t     mode;
+    bool                active;
+    bool                expired; /**< Expiry noted by the tick, callback not yet run. */
+    os_timer_callback_t callback;
+    void                *context;
+
+} os_timer_t;
+
+/******************************************************************************************************/
+/**
+ * @brief Initialize a software timer as one-shot or periodic.
+ */
+os_status os_timer_init(os_timer_t *timer, uint32_t period_ticks, os_timer_mode_t mode, os_timer_callback_t callback, void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief Start a software timer (callback runs on the kernel timer task).
+ */
+os_status os_timer_start(os_timer_t *timer);
+
+/******************************************************************************************************/
+/**
+ * @brief Stop a software timer.
+ */
+os_status os_timer_stop(os_timer_t *timer);
+
+#endif /* OS_CONFIG_TIMER_ENABLE */
+
+/*
+ * ***********************************************************************************************************
+ * Work queue         - OS_CONFIG_WORK_ENABLE
+ * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_WORK_ENABLE == 1U)
+
+/******************************************************************************************************/
+/**
+ * @brief Work handler signature; context is the pointer given at os_work_init.
+ */
+typedef void (*os_work_handler_t)(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief Deferrable work item, executed by the kernel work task.
+ */
+typedef struct
+{
+    os_work_handler_t handler;
+    void              *context;
+    uint32_t          delay_ticks; /**< Remaining ticks until the item becomes ready. */
+    bool              pending;     /**< Submitted, waiting for its delay to elapse.   */
+    bool              ready;       /**< Delay elapsed, awaiting execution.            */
+
+} os_work_t;
+
+/******************************************************************************************************/
+/**
+ * @brief Initialize a work item with its handler and user-data pointer.
+ */
+os_status os_work_init(os_work_t *work, os_work_handler_t handler, void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief Submit work to run after delay_ms on the kernel work task (0 = as soon as possible; ISR-safe).
+ */
+os_status os_work_submit(os_work_t *work, uint32_t delay_ms);
+
+/******************************************************************************************************/
+/**
+ * @brief Cancel submitted work that has not started executing yet (ISR-safe).
+ */
+os_status os_work_cancel(os_work_t *work);
+
+/******************************************************************************************************/
+/**
+ * @brief Check whether a work item is submitted and not yet executed.
+ */
+bool os_work_is_pending(const os_work_t *work);
+
+#endif /* OS_CONFIG_WORK_ENABLE */
+
+/*
+ * ***********************************************************************************************************
+ * Task notifications - OS_CONFIG_TASK_NOTIFY_ENABLE
+ * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_TASK_NOTIFY_ENABLE == 1U)
+
+/******************************************************************************************************/
+/**
+ * @brief Deliver a value to a task's notification mailbox (overwrite: last write wins), waking
+ *        it if it is currently blocked in os_task_notify_wait; ISR-safe.
+ */
+os_status os_task_notify_give(os_task_t *task, uint32_t value);
+
+/******************************************************************************************************/
+/**
+ * @brief Wait for this task's notification mailbox, up to timeout_ms. Task-only (like
+ *        os_mutex_lock, an ISR has no task identity of its own to wait as).
+ */
+os_status os_task_notify_wait(uint32_t timeout_ms, uint32_t *value_out);
+
+#endif /* OS_CONFIG_TASK_NOTIFY_ENABLE */
+
+/*
+ * ***********************************************************************************************************
+ * Kernel heap        - OS_CONFIG_ALLOC_ENABLE
+ * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_ALLOC_ENABLE == 1U)
+
+/******************************************************************************************************/
+/**
+ * @brief Allocate memory from the kernel heap (8-byte aligned; NULL when exhausted).
+ */
+void* os_mem_alloc(size_t size);
+
+/******************************************************************************************************/
+/**
+ * @brief Return memory obtained from os_mem_alloc to the kernel heap (NULL is ignored).
+ */
+void os_mem_free(void *memory);
+
+/******************************************************************************************************/
+/**
+ * @brief Get the number of bytes currently free in the kernel heap.
+ */
+size_t os_mem_free_get(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Get the smallest amount of free heap ever observed (worst case since boot).
+ */
+size_t os_mem_watermark_get(void);
+
+#endif /* OS_CONFIG_ALLOC_ENABLE */
 
 /*
  * ***********************************************************************************************************
@@ -636,403 +1042,8 @@ void os_atomic_clear_bit(os_atomic_t *target, uint32_t bit);
  * @brief Set one bit to the given state.
  */
 void os_atomic_set_bit_to(os_atomic_t *target, uint32_t bit, bool value);
+
 #endif /* OS_CONFIG_ATOMIC_ENABLE */
-
-/*
- * ***********************************************************************************************************
- * Queue              - OS_CONFIG_QUEUE_ENABLE
- * ***********************************************************************************************************
-*/
-
-#if (OS_CONFIG_QUEUE_ENABLE == 1U)
-/******************************************************************************************************/
-/**
- * @brief Queue object.
- */
-typedef struct
-{
-    uint8_t   *buffer;
-    size_t    item_size;
-    size_t    capacity;
-    size_t    head;
-    size_t    tail;
-    size_t    count;
-    os_list_t send_waiters;    /**< Tasks blocked because the queue is full.  */
-    os_list_t receive_waiters; /**< Tasks blocked because the queue is empty. */
-    bool      buffer_owned;    /**< Buffer came from os_queue_create and must be freed on delete. */
-
-} os_queue_t;
-#endif /* OS_CONFIG_QUEUE_ENABLE */
-
-#if (OS_CONFIG_QUEUE_ENABLE == 1U)
-/** Define a statically stored queue and its item buffer: the queue object is declared as plain
- *  "name" (what every other os_queue_* call references), and the backing storage gets the
- *  decorated "name_BUFFER", touched only by OS_QUEUE_INIT below and never by hand.
- *
- *  "type" is the item type, so the buffer is typed rather than a byte blob and the compiler
- *  checks it. Pair it with OS_QUEUE_INIT, which derives item size and capacity from the array
- *  itself - that pairing is the point of the macro, since passing os_queue_init an item_size or
- *  capacity that disagrees with the real buffer is otherwise an easy and silent way to read or
- *  write past it.
- *
- *      OS_QUEUE_DEFINE(sensor_q, sensor_sample_t, 8);
- *      ...
- *      status = OS_QUEUE_INIT(sensor_q);
- *      status = os_queue_send(&sensor_q, &sample, 10U);
- *
- *  Both objects are static, so this belongs at file scope. For a queue whose size is not known
- *  until run time, use os_queue_create/os_queue_delete instead. */
-#define OS_QUEUE_DEFINE(name, type, capacity) \
-    static type       name##_BUFFER[(capacity)]; \
-    static os_queue_t name
-
-/** Initialize a queue declared with OS_QUEUE_DEFINE, deriving the item size and capacity from
- *  the buffer so the two can never disagree. Evaluates to the os_status of os_queue_init. */
-#define OS_QUEUE_INIT(name)                                          \
-    os_queue_init(&(name), (name##_BUFFER), sizeof((name##_BUFFER)[0]), \
-                  (sizeof(name##_BUFFER) / sizeof((name##_BUFFER)[0])))
-
-/******************************************************************************************************/
-/**
- * @brief Initialize a queue object over caller-provided storage.
- */
-os_status os_queue_init(os_queue_t *queue, void *buffer, size_t item_size, size_t capacity);
-
-#if (OS_CONFIG_ALLOC_ENABLE == 1U)
-/******************************************************************************************************/
-/**
- * @brief Create a queue whose item buffer is allocated from the kernel heap.
- */
-os_status os_queue_create(os_queue_t *queue, size_t item_size, size_t capacity);
-
-/******************************************************************************************************/
-/**
- * @brief Tear down a queue, freeing the buffer only if os_queue_create allocated it.
- */
-os_status os_queue_delete(os_queue_t *queue);
-#endif /* OS_CONFIG_ALLOC_ENABLE */
-
-/******************************************************************************************************/
-/**
- * @brief Send one item into queue, waiting up to timeout_ms when full.
- */
-os_status os_queue_send(os_queue_t *queue, const void *item, uint32_t timeout_ms);
-
-/******************************************************************************************************/
-/**
- * @brief Receive one item from queue, waiting up to timeout_ms when empty.
- */
-os_status os_queue_receive(os_queue_t *queue, void *item_out, uint32_t timeout_ms);
-
-/******************************************************************************************************/
-/**
- * @brief Get current queue item count.
- */
-size_t os_queue_count_get(const os_queue_t *queue);
-#endif /* OS_CONFIG_QUEUE_ENABLE */
-
-/*
- * ***********************************************************************************************************
- * Mutex              - OS_CONFIG_MUTEX_ENABLE
- * ***********************************************************************************************************
-*/
-
-#if (OS_CONFIG_MUTEX_ENABLE == 1U)
-/******************************************************************************************************/
-/**
- * @brief Mutex object.
- */
-typedef struct
-{
-    bool           locked;     /**< True while held.                                  */
-    uint32_t       owner_id;   /**< Task id of the holder, 0 when free/unknown owner. */
-    os_list_t      waiters;    /**< Tasks blocked waiting for the mutex.              */
-    os_list_node_t owner_node; /**< Links into the owner's owned-mutex list (priority inheritance). */
-
-} os_mutex_t;
-#endif /* OS_CONFIG_MUTEX_ENABLE */
-
-#if (OS_CONFIG_MUTEX_ENABLE == 1U)
-/******************************************************************************************************/
-/**
- * @brief Initialize a mutex object.
- */
-os_status os_mutex_init(os_mutex_t *mutex);
-
-/******************************************************************************************************/
-/**
- * @brief Acquire a mutex, waiting up to timeout_ms when contended.
- */
-os_status os_mutex_lock(os_mutex_t *mutex, uint32_t timeout_ms);
-
-/******************************************************************************************************/
-/**
- * @brief Attempt to acquire a mutex without blocking.
- */
-os_status os_mutex_try_lock(os_mutex_t *mutex);
-
-/******************************************************************************************************/
-/**
- * @brief Release a mutex object (only the owner may unlock).
- */
-os_status os_mutex_unlock(os_mutex_t *mutex);
-#endif /* OS_CONFIG_MUTEX_ENABLE */
-
-/*
- * ***********************************************************************************************************
- * Semaphore          - OS_CONFIG_SEMAPHORE_ENABLE
- * ***********************************************************************************************************
-*/
-
-#if (OS_CONFIG_SEMAPHORE_ENABLE == 1U)
-/******************************************************************************************************/
-/**
- * @brief Semaphore object.
- */
-typedef struct
-{
-    uint32_t  count;
-    uint32_t  max_count;
-    os_list_t waiters; /**< Tasks blocked waiting for a token. */
-
-} os_semaphore_t;
-#endif /* OS_CONFIG_SEMAPHORE_ENABLE */
-
-#if (OS_CONFIG_SEMAPHORE_ENABLE == 1U)
-/******************************************************************************************************/
-/**
- * @brief Initialize a semaphore object.
- */
-os_status os_semaphore_init(os_semaphore_t *semaphore, uint32_t initial_count, uint32_t max_count);
-
-/******************************************************************************************************/
-/**
- * @brief Give one token to semaphore (ISR-safe, never blocks).
- */
-os_status os_semaphore_give(os_semaphore_t *semaphore);
-
-/******************************************************************************************************/
-/**
- * @brief Take one token from semaphore, waiting up to timeout_ms when empty.
- */
-os_status os_semaphore_take(os_semaphore_t *semaphore, uint32_t timeout_ms);
-#endif /* OS_CONFIG_SEMAPHORE_ENABLE */
-
-/*
- * ***********************************************************************************************************
- * Event group        - OS_CONFIG_EVENT_ENABLE
- * ***********************************************************************************************************
-*/
-
-#if (OS_CONFIG_EVENT_ENABLE == 1U)
-/******************************************************************************************************/
-/**
- * @brief Event group object.
- */
-typedef struct
-{
-    uint32_t  flags;
-    os_list_t waiters; /**< Tasks blocked waiting for bits to match. */
-
-} os_event_group_t;
-#endif /* OS_CONFIG_EVENT_ENABLE */
-
-#if (OS_CONFIG_EVENT_ENABLE == 1U)
-/******************************************************************************************************/
-/**
- * @brief Initialize an event group object.
- */
-os_status os_event_group_init(os_event_group_t *group);
-
-/******************************************************************************************************/
-/**
- * @brief Set event bits in the group (ISR-safe).
- */
-os_status os_event_group_set_bits(os_event_group_t *group, uint32_t bits);
-
-/******************************************************************************************************/
-/**
- * @brief Clear event bits in the group (ISR-safe).
- */
-os_status os_event_group_clear_bits(os_event_group_t *group, uint32_t bits);
-
-/******************************************************************************************************/
-/**
- * @brief Wait for event bits, waiting up to timeout_ms until they match. clear_on_exit true
- *        consumes the requested bits atomically with the match (no lost set between the
- *        wait returning and a separate manual clear).
- */
-os_status os_event_group_wait_bits(os_event_group_t *group, uint32_t bits, bool wait_all, bool clear_on_exit, uint32_t *matched_bits, uint32_t timeout_ms);
-#endif /* OS_CONFIG_EVENT_ENABLE */
-
-/*
- * ***********************************************************************************************************
- * Software timer     - OS_CONFIG_TIMER_ENABLE
- * ***********************************************************************************************************
-*/
-
-#if (OS_CONFIG_TIMER_ENABLE == 1U)
-/******************************************************************************************************/
-/**
- * @brief Timer operating mode.
- */
-typedef enum
-{
-    OS_TIMER_MODE_ONE_SHOT = 0, /**< Fires once, then stops.            */
-    OS_TIMER_MODE_PERIODIC = 1, /**< Reloads and fires every period.    */
-
-} os_timer_mode_t;
-
-/******************************************************************************************************/
-/**
- * @brief Timer callback signature.
- */
-typedef void (*os_timer_callback_t)(void *context);
-
-/******************************************************************************************************/
-/**
- * @brief Software timer object.
- */
-typedef struct
-{
-    uint32_t            period_ticks;
-    uint32_t            remaining_ticks;
-    os_timer_mode_t     mode;
-    bool                active;
-    bool                expired; /**< Expiry noted by the tick, callback not yet run. */
-    os_timer_callback_t callback;
-    void                *context;
-
-} os_timer_t;
-#endif /* OS_CONFIG_TIMER_ENABLE */
-
-#if (OS_CONFIG_TIMER_ENABLE == 1U)
-/******************************************************************************************************/
-/**
- * @brief Initialize a software timer as one-shot or periodic.
- */
-os_status os_timer_init(os_timer_t *timer, uint32_t period_ticks, os_timer_mode_t mode, os_timer_callback_t callback, void *context);
-
-/******************************************************************************************************/
-/**
- * @brief Start a software timer (callback runs on the kernel timer task).
- */
-os_status os_timer_start(os_timer_t *timer);
-
-/******************************************************************************************************/
-/**
- * @brief Stop a software timer.
- */
-os_status os_timer_stop(os_timer_t *timer);
-#endif /* OS_CONFIG_TIMER_ENABLE */
-
-/*
- * ***********************************************************************************************************
- * Work queue         - OS_CONFIG_WORK_ENABLE
- * ***********************************************************************************************************
-*/
-
-#if (OS_CONFIG_WORK_ENABLE == 1U)
-/******************************************************************************************************/
-/**
- * @brief Work handler signature; context is the pointer given at os_work_init.
- */
-typedef void (*os_work_handler_t)(void *context);
-
-/******************************************************************************************************/
-/**
- * @brief Deferrable work item, executed by the kernel work task.
- */
-typedef struct
-{
-    os_work_handler_t handler;
-    void              *context;
-    uint32_t          delay_ticks; /**< Remaining ticks until the item becomes ready. */
-    bool              pending;     /**< Submitted, waiting for its delay to elapse.   */
-    bool              ready;       /**< Delay elapsed, awaiting execution.            */
-
-} os_work_t;
-#endif /* OS_CONFIG_WORK_ENABLE */
-
-#if (OS_CONFIG_WORK_ENABLE == 1U)
-/******************************************************************************************************/
-/**
- * @brief Initialize a work item with its handler and user-data pointer.
- */
-os_status os_work_init(os_work_t *work, os_work_handler_t handler, void *context);
-
-/******************************************************************************************************/
-/**
- * @brief Submit work to run after delay_ms on the kernel work task (0 = as soon as possible; ISR-safe).
- */
-os_status os_work_submit(os_work_t *work, uint32_t delay_ms);
-
-/******************************************************************************************************/
-/**
- * @brief Cancel submitted work that has not started executing yet (ISR-safe).
- */
-os_status os_work_cancel(os_work_t *work);
-
-/******************************************************************************************************/
-/**
- * @brief Check whether a work item is submitted and not yet executed.
- */
-bool os_work_is_pending(const os_work_t *work);
-#endif /* OS_CONFIG_WORK_ENABLE */
-
-/*
- * ***********************************************************************************************************
- * Kernel heap        - OS_CONFIG_ALLOC_ENABLE
- * ***********************************************************************************************************
-*/
-
-#if (OS_CONFIG_ALLOC_ENABLE == 1U)
-/******************************************************************************************************/
-/**
- * @brief Allocate memory from the kernel heap (8-byte aligned; NULL when exhausted).
- */
-void* os_mem_alloc(size_t size);
-
-/******************************************************************************************************/
-/**
- * @brief Return memory obtained from os_mem_alloc to the kernel heap (NULL is ignored).
- */
-void os_mem_free(void *memory);
-
-/******************************************************************************************************/
-/**
- * @brief Get the number of bytes currently free in the kernel heap.
- */
-size_t os_mem_free_get(void);
-
-/******************************************************************************************************/
-/**
- * @brief Get the smallest amount of free heap ever observed (worst case since boot).
- */
-size_t os_mem_watermark_get(void);
-#endif /* OS_CONFIG_ALLOC_ENABLE */
-
-/*
- * ***********************************************************************************************************
- * Task notifications - OS_CONFIG_TASK_NOTIFY_ENABLE
- * ***********************************************************************************************************
-*/
-
-#if (OS_CONFIG_TASK_NOTIFY_ENABLE == 1U)
-/******************************************************************************************************/
-/**
- * @brief Deliver a value to a task's notification mailbox (overwrite: last write wins), waking
- *        it if it is currently blocked in os_task_notify_wait; ISR-safe.
- */
-os_status os_task_notify_give(os_task_t *task, uint32_t value);
-
-/******************************************************************************************************/
-/**
- * @brief Wait for this task's notification mailbox, up to timeout_ms. Task-only (like
- *        os_mutex_lock, an ISR has no task identity of its own to wait as).
- */
-os_status os_task_notify_wait(uint32_t timeout_ms, uint32_t *value_out);
-#endif /* OS_CONFIG_TASK_NOTIFY_ENABLE */
 
 /*
  * ***********************************************************************************************************
@@ -1069,7 +1080,18 @@ uint32_t os_cpu_usage_get(void);
  * ***********************************************************************************************************
 */
 
+/** OS_ASSERT(expr) checks a condition that must hold if the program is correct, and halts at the
+ *  point of failure when it does not.
+ *
+ *  Assertions only ADD checks: the kernel still returns the same status codes either way, so a
+ *  build with assertions off behaves exactly as one with them on, minus the halt. Use them for
+ *  programming errors (a bad handle, blocking from an ISR), never for conditions that can
+ *  legitimately happen at runtime.
+ *
+ *  The expression is not evaluated at all when assertions are compiled out, so it must be free
+ *  of side effects. */
 #if (OS_CONFIG_ASSERT_ENABLE == 1U)
+
 #define OS_ASSERT(expr)                                                       \
     do {                                                                      \
         if (!(expr))                                                          \
@@ -1077,11 +1099,7 @@ uint32_t os_cpu_usage_get(void);
             os_assert_failed(__FILE__, (uint32_t)__LINE__);                   \
         }                                                                     \
     } while (0)
-#else
-#define OS_ASSERT(expr)         ((void)0)
-#endif
 
-#if (OS_CONFIG_ASSERT_ENABLE == 1U)
 /******************************************************************************************************/
 /**
  * @brief Report a failed OS_ASSERT and halt. Calls os_assert_failed_cb, then parks the core
@@ -1098,6 +1116,11 @@ void os_assert_failed(const char *file, uint32_t line);
  *        to return from the assertion.
  */
 void os_assert_failed_cb(const char *file, uint32_t line);
+
+#else /* OS_CONFIG_ASSERT_ENABLE == 0U */
+
+#define OS_ASSERT(expr)         ((void)0)
+
 #endif /* OS_CONFIG_ASSERT_ENABLE */
 
 /*
@@ -1106,11 +1129,10 @@ void os_assert_failed_cb(const char *file, uint32_t line);
  * ***********************************************************************************************************
 */
 
-/** Severity values for OS_CONFIG_LOG_LEVEL. An os_config.h selects one by name
- *  even though it is read before this header: a macro body is only expanded
- *  where it is used, and every comparison against these lives below. They are
- *  compared numerically in #if, so the increasing order is part of the
- *  contract, not just a convention. */
+/** Severity values for OS_CONFIG_LOG_LEVEL, outside the guard below because an os_config.h
+ *  selects one by name even though it is read before this header: a macro body is only expanded
+ *  where it is used, and every comparison against these lives below. They are compared
+ *  numerically in #if, so the increasing order is part of the contract, not just a convention. */
 #define OS_LOG_LEVEL_NONE       0U
 #define OS_LOG_LEVEL_ERROR      1U
 #define OS_LOG_LEVEL_WARN       2U
@@ -1121,31 +1143,32 @@ void os_assert_failed_cb(const char *file, uint32_t line);
  *  formats like printf, returns immediately, and is safe from tasks and ISRs.
  *  Calls above the configured level expand to nothing, arguments included, so
  *  a disabled OS_LOG_DEBUG costs neither code nor the cost of its arguments. */
-#if (OS_CONFIG_LOG_ENABLE == 1U) && (OS_CONFIG_LOG_LEVEL >= OS_LOG_LEVEL_ERROR)
+#if (OS_CONFIG_LOG_ENABLE == 1U)
+
+#if (OS_CONFIG_LOG_LEVEL >= OS_LOG_LEVEL_ERROR)
 #define OS_LOG_ERROR(...)       os_log_write(OS_LOG_LEVEL_ERROR, __VA_ARGS__)
 #else
 #define OS_LOG_ERROR(...)       ((void)0)
 #endif
 
-#if (OS_CONFIG_LOG_ENABLE == 1U) && (OS_CONFIG_LOG_LEVEL >= OS_LOG_LEVEL_WARN)
+#if (OS_CONFIG_LOG_LEVEL >= OS_LOG_LEVEL_WARN)
 #define OS_LOG_WARN(...)        os_log_write(OS_LOG_LEVEL_WARN, __VA_ARGS__)
 #else
 #define OS_LOG_WARN(...)        ((void)0)
 #endif
 
-#if (OS_CONFIG_LOG_ENABLE == 1U) && (OS_CONFIG_LOG_LEVEL >= OS_LOG_LEVEL_INFO)
+#if (OS_CONFIG_LOG_LEVEL >= OS_LOG_LEVEL_INFO)
 #define OS_LOG_INFO(...)        os_log_write(OS_LOG_LEVEL_INFO, __VA_ARGS__)
 #else
 #define OS_LOG_INFO(...)        ((void)0)
 #endif
 
-#if (OS_CONFIG_LOG_ENABLE == 1U) && (OS_CONFIG_LOG_LEVEL >= OS_LOG_LEVEL_DEBUG)
+#if (OS_CONFIG_LOG_LEVEL >= OS_LOG_LEVEL_DEBUG)
 #define OS_LOG_DEBUG(...)       os_log_write(OS_LOG_LEVEL_DEBUG, __VA_ARGS__)
 #else
 #define OS_LOG_DEBUG(...)       ((void)0)
 #endif
 
-#if (OS_CONFIG_LOG_ENABLE == 1U)
 /******************************************************************************************************/
 /**
  * @brief Format a log line and queue it for transmission. Prefer the OS_LOG_ERROR/WARN/INFO/
@@ -1174,72 +1197,42 @@ uint32_t os_log_dropped_get(void);
  * @param[in] length  Number of bytes.
  */
 void os_log_output_cb(const uint8_t *data, size_t length);
+
+#else /* OS_CONFIG_LOG_ENABLE == 0U */
+
+#define OS_LOG_ERROR(...)       ((void)0)
+#define OS_LOG_WARN(...)        ((void)0)
+#define OS_LOG_INFO(...)        ((void)0)
+#define OS_LOG_DEBUG(...)       ((void)0)
+
 #endif /* OS_CONFIG_LOG_ENABLE */
 
 /*
  * ***********************************************************************************************************
- * Tickless hooks     - OS_CONFIG_TICKLESS_ENABLE
+ * Self-test          - OS_CONFIG_TEST_ENABLE
  * ***********************************************************************************************************
 */
 
-#if (OS_CONFIG_TICKLESS_ENABLE == 1U)
+#if (OS_CONFIG_TEST_ENABLE == 1U)
 /******************************************************************************************************/
 /**
- * @brief Pre-sleep callback invoked before entering low-power mode. The application must define
- *        it; the kernel provides no default.
+ * @brief Kernel self-test suite entry point (see OS_CONFIG_TEST_* in os_config.h). os_init()
+ *        creates and starts a task that calls this automatically, so link the ahura_kernel/test
+ *        library (CMake target "os_test") to supply it (see README "Self-test suite"). The
+ *        kernel ships no stub, which is what lets a plain static-library link pull the suite in
+ *        and turns "forgot to link it" into a link error. Not a "_cb" hook, same reasoning as
+ *        os_main().
  */
-void os_tickless_pre_sleep_cb(void);
-
-/******************************************************************************************************/
-/**
- * @brief Post-sleep callback invoked after leaving low-power mode, before the kernel accounts for
- *        the sleep. The application must define it; the kernel provides no default.
- */
-void os_tickless_post_sleep_cb(void);
-#endif /* OS_CONFIG_TICKLESS_ENABLE */
-
-/*
- * ***********************************************************************************************************
- * Multi-core         - OS_CONFIG_CORE_COUNT > 1
- * ***********************************************************************************************************
-*/
-
-#if (OS_CONFIG_CORE_COUNT > 1U)
-/******************************************************************************************************/
-/**
- * @brief Enter the scheduler on a secondary core. Call after os_start() is running on core 0,
- *        from the secondary core, once the SoC layer has booted it with a vector table routing
- *        SVC/PendSV/SysTick to the kernel handlers. Does not return.
- */
-void os_core_start(void);
-
-/******************************************************************************************************/
-/**
- * @brief Change which cores a task may run on (bitmask, OS_TASK_CORE_ANY = any core).
- */
-os_status os_task_core_affinity_set(os_task_t *task, uint32_t core_affinity);
-#endif /* OS_CONFIG_CORE_COUNT > 1U */
-
-#if (OS_CONFIG_CORE_COUNT > 1U)
-/******************************************************************************************************/
-/**
- * @brief Multi-core SoC callback: return the index of the calling core (0-based).
- *        Weak default returns 0.
- */
-uint32_t os_arch_core_id_get_cb(void);
-
-/******************************************************************************************************/
-/**
- * @brief Multi-core SoC callback: interrupt another core so it re-evaluates scheduling.
- *        Weak default does nothing (the core then reacts at its next tick).
- */
-void os_arch_core_ipi_request_cb(uint32_t core_id);
-#endif /* OS_CONFIG_CORE_COUNT > 1U */
+void os_test(void);
+#endif /* OS_CONFIG_TEST_ENABLE */
 
 /*
  * ***********************************************************************************************************
  * TrustZone          - OS_CONFIG_TRUSTZONE
  * ***********************************************************************************************************
+ *
+ * Also declared by the arch port (os_arch_port_common.h), which calls them from
+ * the context-switch path; repeated here because they are application-provided.
 */
 
 #if (OS_CONFIG_TRUSTZONE == OS_CONFIG_TRUSTZONE_NON_SECURE)
@@ -1260,22 +1253,70 @@ void os_arch_tz_context_restore_cb(uint32_t task_id);
 
 /*
  * ***********************************************************************************************************
- * Self-test          - OS_CONFIG_TEST_ENABLE
+ * Multi-core         - OS_CONFIG_CORE_COUNT > 1
  * ***********************************************************************************************************
 */
 
-#if (OS_CONFIG_TEST_ENABLE == 1U)
+#if (OS_CONFIG_CORE_COUNT > 1U)
+
 /******************************************************************************************************/
 /**
- * @brief Kernel self-test suite entry point (see OS_CONFIG_TEST_* in os_config.h). os_init()
- *        creates and starts a task that calls this automatically, so link the ahura_kernel/test
- *        library (CMake target "os_test") to supply it (see README "Self-test suite"). The
- *        kernel ships no stub, which is what lets a plain static-library link pull the suite in
- *        and turns "forgot to link it" into a link error. Not a "_cb" hook, same reasoning as
- *        os_main().
+ * @brief Enter the scheduler on a secondary core. Call after os_start() is running on core 0,
+ *        from the secondary core, once the SoC layer has booted it with a vector table routing
+ *        SVC/PendSV/SysTick to the kernel handlers. Does not return.
  */
-void os_test(void);
-#endif /* OS_CONFIG_TEST_ENABLE */
+void os_core_start(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Change which cores a task may run on (bitmask, OS_TASK_CORE_ANY = any core).
+ */
+os_status os_task_core_affinity_set(os_task_t *task, uint32_t core_affinity);
+
+/* The two SoC callbacks below are also declared by the arch port
+ * (os_arch_port_common.h), which calls them; repeated here because they are
+ * application-provided. */
+
+/******************************************************************************************************/
+/**
+ * @brief Multi-core SoC callback: return the index of the calling core (0-based).
+ *        Weak default returns 0.
+ */
+uint32_t os_arch_core_id_get_cb(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Multi-core SoC callback: interrupt another core so it re-evaluates scheduling.
+ *        Weak default does nothing (the core then reacts at its next tick).
+ */
+void os_arch_core_ipi_request_cb(uint32_t core_id);
+
+#endif /* OS_CONFIG_CORE_COUNT > 1U */
+
+/*
+ * ***********************************************************************************************************
+ * Tickless hooks     - OS_CONFIG_TICKLESS_ENABLE
+ * ***********************************************************************************************************
+ *
+ * The tickless control functions themselves are always available: see
+ * "Tickless idle control" at the end of PART 1.
+*/
+
+#if (OS_CONFIG_TICKLESS_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Pre-sleep callback invoked before entering low-power mode. The application must define
+ *        it; the kernel provides no default.
+ */
+void os_tickless_pre_sleep_cb(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Post-sleep callback invoked after leaving low-power mode, before the kernel accounts for
+ *        the sleep. The application must define it; the kernel provides no default.
+ */
+void os_tickless_post_sleep_cb(void);
+#endif /* OS_CONFIG_TICKLESS_ENABLE */
 
 #ifdef __cplusplus
 }

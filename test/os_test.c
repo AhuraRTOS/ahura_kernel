@@ -231,7 +231,11 @@ typedef struct
 
 } helper_ctx_t;
 
+#if TEST_HELPER_NEEDED
+/* Only test_spawn_helper writes it and only test_helper_entry reads it, so it follows their guard
+ * (an unused static is a -Werror build failure; the two typedefs above are harmless either way). */
 static helper_ctx_t g_helper_ctx;
+#endif
 
 /*
  * ***********************************************************************************************************
@@ -352,8 +356,8 @@ static uint32_t          g_stress_queue_buf[OS_TEST_STRESS_QUEUE_CAPACITY];
 static bool      test_wait_inactive(const os_task_t *task, uint32_t timeout_ms);
 static void      test_worker_entry(void *context);
 static void      test_self_pause_worker_entry(void *context);
-static void      test_helper_entry(void *context);
 #if TEST_HELPER_NEEDED
+static void      test_helper_entry(void *context);
 static os_status test_spawn_helper(helper_role_t role, uint32_t hold_ms, uint32_t bits, uint32_t value);
 #endif
 
@@ -608,10 +612,15 @@ static void test_self_pause_worker_entry(void *context)
     g_worker_counter = 42U;
 }
 
+#if TEST_HELPER_NEEDED
 /******************************************************************************************************/
 /**
  * @brief Generic helper task body: reads g_helper_ctx (set by test_spawn_helper before create)
  *        to decide what to do, then returns - the port auto-deletes the task on return.
+ *
+ * Guarded like test_spawn_helper, its only caller: with every one of mutex/semaphore/queue/event
+ * compiled out, all four of its cases vanish and nothing references it, so an unguarded definition
+ * is an unused function - which a -Werror build rejects.
  */
 static void test_helper_entry(void *context)
 {
@@ -653,6 +662,7 @@ static void test_helper_entry(void *context)
         break;
     }
 }
+#endif /* TEST_HELPER_NEEDED */
 
 #if TEST_HELPER_NEEDED
 /******************************************************************************************************/
@@ -2911,6 +2921,983 @@ static void test_stress_timer_churn(void)
 
 /*
  * ***********************************************************************************************************
+ * Extended per-subsystem stress tests - OS_TEST_STRESS_EXTENDED
+ * ***********************************************************************************************************
+ *
+ * These cost roughly 15 KB of flash, most of it the .rodata for their PASS/FAIL messages, which is
+ * more than an unoptimized build of this project has left over: -O0 already sits at ~97% of the
+ * STM32H503's 128 KB, so linking them there overflows. They are therefore compiled in whenever the
+ * build is optimized at all (__OPTIMIZE__, i.e. any -O above -O0) and left out otherwise, with a
+ * SKIP line naming the reason at run time.
+ *
+ * Keyed on the optimization level rather than on a hand-set switch because that is the thing that
+ * actually decides whether they fit, and because a stress test is close to meaningless at -O0
+ * anyway: every timing margin and every contention window is distorted by unoptimized code, so a
+ * -O0 run would report numbers that say nothing about the firmware anyone ships. Define
+ * OS_TEST_STRESS_EXTENDED explicitly to override in either direction - to 0 to reclaim the flash
+ * in an optimized build, or to 1 at -O0 on a part with room to spare.
+*/
+
+#ifndef OS_TEST_STRESS_EXTENDED
+#if defined(__OPTIMIZE__)
+#define OS_TEST_STRESS_EXTENDED 1U
+#else
+#define OS_TEST_STRESS_EXTENDED 0U
+#endif
+#endif
+
+#if (OS_TEST_STRESS_EXTENDED == 1U)
+
+/*
+ * These sit between the two kinds of stress test above. test_stress_soak() contends several
+ * DIFFERENT primitives from several tasks at once; the churn tests cycle ONE create/destroy path
+ * repeatedly from a single task. Each test below drives one subsystem at high volume AND checks an
+ * invariant strong enough to fail on a lost wakeup, a dropped or duplicated item, a leaked
+ * registry slot, or a heap block handed out twice - failures a low-repetition functional check
+ * cannot see, because the one interleaving it happens to produce is usually the easy one.
+ *
+ * Every count here is exact, not approximate: a test that only asserts "roughly the right number
+ * of things happened" cannot distinguish a real dropped wakeup from scheduling jitter, so it would
+ * have to be written loose enough to pass through the very bug it exists to catch. Where the
+ * hardware genuinely cannot be pinned down (timer fire counts over a wall-clock window), the
+ * tolerance is stated and bounded rather than left open.
+ *
+ * The multi-worker tests below start and join their tasks through g_stress_tasks[] rather than
+ * repeating four near-identical lines each: one format string covers every worker, which keeps
+ * per-worker failure attribution while costing a fraction of the .rodata that matters on a part
+ * this close to full (see OS_TEST_STRESS_EXTENDED below).
+*/
+
+/* The two helpers below drive the queue-producer, event-bit-storm and mutex-convoy tests, so they
+ * have to exist whenever ANY of those is compiled in: guarding them on a single feature would leave
+ * the others calling an undeclared function, and leaving them unguarded breaks an
+ * all-features-off build on -Wunused-function. Same reasoning as TEST_HELPER_NEEDED above. */
+#define TEST_STRESS_WORKERS_NEEDED                                        \
+    ((OS_CONFIG_MUTEX_ENABLE == 1U) || (OS_CONFIG_EVENT_ENABLE == 1U) ||  \
+     ((OS_CONFIG_QUEUE_ENABLE == 1U) && (OS_CONFIG_ALLOC_ENABLE == 1U)))
+
+#if TEST_STRESS_WORKERS_NEEDED
+
+/* The four concurrent task slots the multi-worker stress tests share, in priority order. */
+static os_task_t *const g_stress_tasks[4] = { &worker, &helper, &helper2, &helper3 };
+
+/******************************************************************************************************/
+/**
+ * @brief Start `count` of the shared task slots on the same entry point, each with its own context
+ *        and a distinct priority (3, 4, 5, ...), and report how many actually started.
+ */
+static uint32_t test_stress_start_workers(os_task_entry_t entry, void *contexts, size_t context_size,
+                                          uint32_t count)
+{
+    uint32_t started = 0U;
+    uint32_t i;
+
+    for (i = 0U; i < count; i++)
+    {
+        os_task_config_t config;
+
+        config.name          = "stress";
+        config.entry         = entry;
+        config.context       = (void *)((uint8_t *)contexts + (i * context_size));
+        config.priority      = 3U + i;
+        config.stack_memory  = NULL; /* filled in below from the slot's own OS_TASK_DEFINE stack */
+        config.stack_bytes   = 0U;
+        config.core_affinity = OS_TASK_CORE_ANY;
+
+        /* The stacks belong to the OS_TASK_DEFINE'd slots, so they are named here rather than
+         * carried in the array - OS_TASK_DEFINE deliberately keeps the buffer's name private to
+         * the macro pair, and there is no portable way to reach it through the handle. */
+        switch (i)
+        {
+            case 0U:  config.stack_memory = worker_STACK;  config.stack_bytes = sizeof(worker_STACK);  break;
+            case 1U:  config.stack_memory = helper_STACK;  config.stack_bytes = sizeof(helper_STACK);  break;
+            case 2U:  config.stack_memory = helper2_STACK; config.stack_bytes = sizeof(helper2_STACK); break;
+            default:  config.stack_memory = helper3_STACK; config.stack_bytes = sizeof(helper3_STACK); break;
+        }
+
+        if (os_task_create(g_stress_tasks[i], &config) != OS_STATUS_OK) { break; }
+        if (os_task_start(g_stress_tasks[i]) != OS_STATUS_OK)           { break; }
+
+        started++;
+    }
+
+    return started;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Join `count` shared task slots, checking each one individually so a hang is attributed to
+ *        the worker that hung rather than to the group.
+ */
+static void test_stress_join_workers(uint32_t count, uint32_t timeout_ms)
+{
+    uint32_t i;
+
+    for (i = 0U; i < count; i++)
+    {
+        AHURA_TEST_CHECK(test_wait_inactive(g_stress_tasks[i], timeout_ms),
+                          "stress worker %lu terminated cleanly (no deadlock/hang)", (unsigned long)i);
+    }
+}
+#endif /* TEST_STRESS_WORKERS_NEEDED */
+
+#if (OS_CONFIG_QUEUE_ENABLE == 1U) && (OS_CONFIG_ALLOC_ENABLE == 1U)
+
+#define OS_TEST_QCHURN_ITERATIONS 200U
+
+/******************************************************************************************************/
+/**
+ * @brief Creates, uses and deletes a HEAP-allocated queue back-to-back, with a different geometry
+ *        every cycle. test_queue_define_and_dynamic() proves one create/delete pair is correct;
+ *        this proves the pair stays correct 200 times running, which is what actually catches a
+ *        per-cycle leak or an allocator that mis-splits a reused hole.
+ */
+static void test_stress_queue_dynamic_churn(void)
+{
+    size_t   heap_before = os_mem_free_get();
+    size_t   worst_free  = heap_before;
+    uint32_t completed   = 0U;
+    bool     all_ok      = true;
+    bool     data_ok     = true;
+    uint32_t i;
+
+    test_print_section("Stress: dynamic queue create/use/delete churn");
+
+    for (i = 0U; i < OS_TEST_QCHURN_ITERATIONS; i++)
+    {
+        os_queue_t q         = { 0 };
+        size_t     capacity  = 1U + (i % 8U);
+        size_t     item_size = sizeof(uint32_t) * (1U + (i % 3U));
+        uint32_t   sent[3];
+        uint32_t   got[3]    = { 0U, 0U, 0U };
+        size_t     free_now;
+
+        /* The geometry deliberately changes every cycle. A fixed size would hand back the same
+         * hole each time and never exercise splitting or coalescing against differently sized
+         * neighbours - the case where an off-by-one in the allocator actually shows up. */
+        if (os_queue_create(&q, item_size, capacity) != OS_STATUS_OK)
+        {
+            all_ok = false;
+            break;
+        }
+
+        free_now = os_mem_free_get();
+        if (free_now < worst_free) { worst_free = free_now; }
+
+        sent[0] = 0xA5A50000UL | (i & 0xFFFFU);
+        sent[1] = i;
+        sent[2] = ~i;
+
+        if (os_queue_send(&q, sent, OS_WAIT_NOTHING) != OS_STATUS_OK)
+        {
+            all_ok = false;
+        }
+        else if (os_queue_receive(&q, got, OS_WAIT_NOTHING) != OS_STATUS_OK)
+        {
+            all_ok = false;
+        }
+        else
+        {
+            /* Only the words the item is actually wide enough to carry are compared: the rest of
+             * got[] was never written, so checking them would fail on a correct kernel. */
+            if (got[0] != sent[0])                                                 { data_ok = false; }
+            if ((item_size > sizeof(uint32_t)) && (got[1] != sent[1]))              { data_ok = false; }
+            if ((item_size > (2U * sizeof(uint32_t))) && (got[2] != sent[2]))       { data_ok = false; }
+        }
+
+        if (os_queue_delete(&q) != OS_STATUS_OK) { all_ok = false; }
+
+        if (!all_ok) { break; }
+
+        completed++;
+    }
+
+    AHURA_TEST_CHECK(all_ok && (completed == OS_TEST_QCHURN_ITERATIONS),
+                      "create/send/receive/delete succeeded on all %u cycles (%lu completed)",
+                      (unsigned)OS_TEST_QCHURN_ITERATIONS, (unsigned long)completed);
+    AHURA_TEST_CHECK(data_ok, "every cycle's item came back with its full payload intact");
+    AHURA_TEST_CHECK(worst_free < heap_before,
+                      "the buffers really came off the heap (low water %lu vs %lu bytes free)",
+                      (unsigned long)worst_free, (unsigned long)heap_before);
+    AHURA_TEST_CHECK(os_mem_free_get() == heap_before,
+                      "%u create/delete cycles leaked nothing (%lu bytes free, unchanged)",
+                      (unsigned)OS_TEST_QCHURN_ITERATIONS, (unsigned long)os_mem_free_get());
+}
+
+#define OS_TEST_QPROD_COUNT 3U
+#define OS_TEST_QPROD_ITEMS 32U   /* 32 so one uint32_t mask tracks a producer's whole run */
+
+typedef struct
+{
+    uint32_t id;
+
+} test_qprod_ctx_t;
+
+static test_qprod_ctx_t g_qprod_ctx[OS_TEST_QPROD_COUNT];
+static os_queue_t       g_qprod_queue;
+static __IO uint32_t    g_qprod_sent[OS_TEST_QPROD_COUNT];
+
+/******************************************************************************************************/
+static void test_qprod_entry(void *context)
+{
+    test_qprod_ctx_t *ctx = (test_qprod_ctx_t *)context;
+    uint32_t          seq;
+
+    for (seq = 0U; seq < OS_TEST_QPROD_ITEMS; seq++)
+    {
+        uint32_t tag = (ctx->id << 16) | seq;
+
+        if (os_queue_send(&g_qprod_queue, &tag, 500U) == OS_STATUS_OK)
+        {
+            g_qprod_sent[ctx->id]++;
+        }
+    }
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Three producers hammer a heap-allocated queue whose capacity is smaller than the producer
+ *        count, so nearly every send goes through the blocking path. The consumer then accounts for
+ *        every (producer, sequence) pair individually: a lost send-waiter wakeup shows up as a
+ *        missing bit, and a double delivery as an already-set one. The existing pipeline test
+ *        covers a STATIC queue with a handful of items; this covers the dynamic one at volume.
+ */
+static void test_stress_queue_dynamic_concurrent(void)
+{
+    uint32_t seen[OS_TEST_QPROD_COUNT];
+    uint32_t received   = 0U;
+    uint32_t total_sent = 0U;
+    uint32_t expected   = OS_TEST_QPROD_COUNT * OS_TEST_QPROD_ITEMS;
+    bool     duplicate  = false;
+    bool     malformed  = false;
+    bool     all_seen   = true;
+    size_t   heap_before;
+    uint32_t i;
+
+    test_print_section("Stress: 3 producers on a heap-allocated queue, exact item accounting");
+
+    heap_before = os_mem_free_get();
+
+    AHURA_TEST_CHECK(os_queue_create(&g_qprod_queue, sizeof(uint32_t), 2U) == OS_STATUS_OK,
+                      "dynamic queue created (capacity 2, deliberately < %u producers)",
+                      (unsigned)OS_TEST_QPROD_COUNT);
+
+    for (i = 0U; i < OS_TEST_QPROD_COUNT; i++)
+    {
+        g_qprod_ctx[i].id = i;
+        g_qprod_sent[i]   = 0U;
+        seen[i]           = 0U;
+    }
+
+    AHURA_TEST_CHECK(test_stress_start_workers(test_qprod_entry, g_qprod_ctx, sizeof(g_qprod_ctx[0]),
+                                               OS_TEST_QPROD_COUNT) == OS_TEST_QPROD_COUNT,
+                      "all %u producers created and started", (unsigned)OS_TEST_QPROD_COUNT);
+
+    /* This task sits below every producer, so it only gets the CPU once they are all blocked on a
+     * full queue - which is exactly the interleaving a missed send-waiter wakeup would deadlock. */
+    while (received < expected)
+    {
+        uint32_t tag;
+        uint32_t producer;
+        uint32_t seq;
+
+        if (os_queue_receive(&g_qprod_queue, &tag, 500U) != OS_STATUS_OK) { break; }
+
+        producer = tag >> 16;
+        seq      = tag & 0xFFFFU;
+
+        if ((producer >= OS_TEST_QPROD_COUNT) || (seq >= OS_TEST_QPROD_ITEMS))
+        {
+            malformed = true;
+        }
+        else if ((seen[producer] & (1UL << seq)) != 0U)
+        {
+            duplicate = true;
+        }
+        else
+        {
+            seen[producer] |= (1UL << seq);
+        }
+
+        received++;
+    }
+
+    test_stress_join_workers(OS_TEST_QPROD_COUNT, 2000U);
+
+    for (i = 0U; i < OS_TEST_QPROD_COUNT; i++)
+    {
+        total_sent += g_qprod_sent[i];
+        if (seen[i] != 0xFFFFFFFFUL) { all_seen = false; }
+    }
+
+    AHURA_TEST_CHECK(total_sent == expected, "every producer placed all its items (%lu of %lu)",
+                      (unsigned long)total_sent, (unsigned long)expected);
+    AHURA_TEST_CHECK(received == expected, "the consumer took exactly as many as were sent (%lu of %lu)",
+                      (unsigned long)received, (unsigned long)expected);
+    AHURA_TEST_CHECK(!malformed, "no delivered item decoded to an impossible producer/sequence");
+    AHURA_TEST_CHECK(!duplicate, "no item was delivered twice");
+    AHURA_TEST_CHECK(all_seen, "each producer's %u sequence numbers arrived exactly once each",
+                      (unsigned)OS_TEST_QPROD_ITEMS);
+
+    AHURA_TEST_CHECK(os_queue_count_get(&g_qprod_queue) == 0U, "the queue ended empty");
+    AHURA_TEST_CHECK(os_queue_delete(&g_qprod_queue) == OS_STATUS_OK, "the dynamic queue deletes cleanly");
+    AHURA_TEST_CHECK(os_mem_free_get() == heap_before, "and returned its buffer to the heap");
+}
+#endif /* OS_CONFIG_QUEUE_ENABLE && OS_CONFIG_ALLOC_ENABLE */
+
+#if (OS_CONFIG_ALLOC_ENABLE == 1U)
+
+#define OS_TEST_FRAG_BLOCKS 24U
+#define OS_TEST_FRAG_SIZE   32U
+
+/******************************************************************************************************/
+/**
+ * @brief Fragments the heap deliberately, then checks the three things test_alloc() cannot: that
+ *        freeing a block never disturbs a live neighbour, that adjacent holes really do coalesce
+ *        back into one usable run, and that the heap recovers exactly after being driven to
+ *        exhaustion. A first-fit allocator with a coalescing bug passes a handful of alloc/free
+ *        calls easily and only misbehaves once the free list has holes on both sides of a block.
+ */
+static void test_stress_heap_fragmentation(void)
+{
+    void     *blocks[OS_TEST_FRAG_BLOCKS];
+    size_t   heap_before = os_mem_free_get();
+    uint32_t allocated   = 0U;
+    bool     pattern_ok  = true;
+    void     *big;
+    uint32_t i;
+
+    test_print_section("Stress: heap fragmentation, coalescing and exhaustion recovery");
+
+    for (i = 0U; i < OS_TEST_FRAG_BLOCKS; i++)
+    {
+        blocks[i] = os_mem_alloc(OS_TEST_FRAG_SIZE);
+        if (blocks[i] == NULL) { break; }
+
+        memset(blocks[i], (int)(0x40U + i), OS_TEST_FRAG_SIZE);
+        allocated++;
+    }
+
+    AHURA_TEST_CHECK(allocated == OS_TEST_FRAG_BLOCKS,
+                      "%u blocks of %u bytes allocated (%lu succeeded)",
+                      (unsigned)OS_TEST_FRAG_BLOCKS, (unsigned)OS_TEST_FRAG_SIZE, (unsigned long)allocated);
+
+    /* Free every other block, leaving the heap checkerboarded. The survivors are the real test: an
+     * allocator that merged a freed hole into a LIVE neighbour corrupts them right here, and a
+     * status-code-only check would sail straight past it. */
+    for (i = 1U; i < allocated; i += 2U)
+    {
+        os_mem_free(blocks[i]);
+        blocks[i] = NULL;
+    }
+
+    for (i = 0U; i < allocated; i += 2U)
+    {
+        const uint8_t *bytes = (const uint8_t *)blocks[i];
+        uint32_t       j;
+
+        for (j = 0U; j < OS_TEST_FRAG_SIZE; j++)
+        {
+            if (bytes[j] != (uint8_t)(0x40U + i)) { pattern_ok = false; }
+        }
+    }
+
+    AHURA_TEST_CHECK(pattern_ok, "every surviving block kept its contents through the interleaved frees");
+
+    for (i = 0U; i < allocated; i += 2U)
+    {
+        os_mem_free(blocks[i]);
+        blocks[i] = NULL;
+    }
+
+    AHURA_TEST_CHECK(os_mem_free_get() == heap_before,
+                      "freeing all of it restored the heap exactly (%lu bytes free)",
+                      (unsigned long)os_mem_free_get());
+
+    /* Coalescing proof: this is many times larger than any single block just freed, so it can only
+     * be satisfied if the neighbouring holes were merged back into one contiguous run. */
+    big = os_mem_alloc((OS_TEST_FRAG_BLOCKS * OS_TEST_FRAG_SIZE) / 2U);
+    AHURA_TEST_CHECK(big != NULL,
+                      "a single %u-byte block still fits afterwards, so the holes coalesced",
+                      (unsigned)((OS_TEST_FRAG_BLOCKS * OS_TEST_FRAG_SIZE) / 2U));
+    os_mem_free(big);
+
+    /* Exhaustion and recovery: take large blocks until the heap refuses, then give them all back
+     * and confirm not one byte went missing along the way. */
+    allocated = 0U;
+    for (i = 0U; i < OS_TEST_FRAG_BLOCKS; i++)
+    {
+        blocks[i] = os_mem_alloc(OS_CONFIG_HEAP_SIZE / 8U);
+        if (blocks[i] == NULL) { break; }
+
+        allocated++;
+    }
+
+    AHURA_TEST_CHECK(os_mem_alloc(OS_CONFIG_HEAP_SIZE) == NULL,
+                      "a request past the remaining heap returns NULL, not a short block");
+
+    for (i = 0U; i < allocated; i++) { os_mem_free(blocks[i]); }
+
+    AHURA_TEST_CHECK(os_mem_free_get() == heap_before,
+                      "the heap recovers fully after exhaustion (%lu bytes free)",
+                      (unsigned long)os_mem_free_get());
+
+    printf("  [INFO] heap held %lu blocks of %lu bytes before refusing; all-time low %lu bytes free\r\n",
+           (unsigned long)allocated, (unsigned long)(OS_CONFIG_HEAP_SIZE / 8U),
+           (unsigned long)os_mem_watermark_get());
+}
+#endif /* OS_CONFIG_ALLOC_ENABLE */
+
+#if (OS_CONFIG_SEMAPHORE_ENABLE == 1U)
+
+#define OS_TEST_PINGPONG_ROUNDS 1000U
+
+static os_semaphore_t g_pp_ping;
+static os_semaphore_t g_pp_pong;
+static __IO uint32_t  g_pp_partner_rounds = 0U;
+
+/******************************************************************************************************/
+static void test_pp_entry(void *context)
+{
+    (void)context;
+
+    while (g_pp_partner_rounds < OS_TEST_PINGPONG_ROUNDS)
+    {
+        if (os_semaphore_take(&g_pp_ping, 500U) != OS_STATUS_OK) { break; }
+
+        g_pp_partner_rounds++;
+        (void)os_semaphore_give(&g_pp_pong);
+    }
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Two tasks hand a token back and forth through a pair of binary semaphores, 1000 round
+ *        trips - 2000 blocking handoffs. Both semaphores start empty and the partner runs above
+ *        this task, so every single take genuinely blocks and every give genuinely wakes a waiter:
+ *        there is no already-available token to paper over a lost wakeup. One dropped wake stalls
+ *        the loop instead of quietly reducing a count.
+ */
+static void test_stress_semaphore_pingpong(void)
+{
+    uint32_t completed = 0U;
+    uint32_t elapsed;
+    uint32_t t0;
+    uint32_t i;
+
+    test_print_section("Stress: binary-semaphore ping-pong handoffs");
+
+    g_pp_partner_rounds = 0U;
+
+    AHURA_TEST_CHECK(os_semaphore_init(&g_pp_ping, 0U, 1U) == OS_STATUS_OK, "ping semaphore initialized (binary, empty)");
+    AHURA_TEST_CHECK(os_semaphore_init(&g_pp_pong, 0U, 1U) == OS_STATUS_OK, "pong semaphore initialized (binary, empty)");
+
+    if (os_task_create(&worker, OS_TASK_CONFIG(worker, test_pp_entry, NULL, TEST_PRIO_HIGH)) != OS_STATUS_OK)
+    {
+        printf("  [SKIP] could not create the ping-pong partner task\r\n");
+        return;
+    }
+    (void)os_task_start(&worker);
+
+    t0 = os_tick_get();
+
+    for (i = 0U; i < OS_TEST_PINGPONG_ROUNDS; i++)
+    {
+        if (os_semaphore_give(&g_pp_ping) != OS_STATUS_OK)       { break; }
+        if (os_semaphore_take(&g_pp_pong, 500U) != OS_STATUS_OK) { break; }
+
+        completed++;
+    }
+
+    elapsed = os_tick_get() - t0;
+
+    AHURA_TEST_CHECK(completed == OS_TEST_PINGPONG_ROUNDS,
+                      "all %u round trips completed, none stalled on a lost wakeup (%lu)",
+                      (unsigned)OS_TEST_PINGPONG_ROUNDS, (unsigned long)completed);
+    AHURA_TEST_CHECK(g_pp_partner_rounds == OS_TEST_PINGPONG_ROUNDS,
+                      "the partner counted exactly the same number of tokens (%lu)",
+                      (unsigned long)g_pp_partner_rounds);
+    AHURA_TEST_CHECK(test_wait_inactive(&worker, 1000U), "the partner task terminated cleanly");
+    AHURA_TEST_CHECK(os_semaphore_take(&g_pp_ping, OS_WAIT_NOTHING) == OS_STATUS_EMPTY,
+                      "no stray ping token was left behind");
+    AHURA_TEST_CHECK(os_semaphore_take(&g_pp_pong, OS_WAIT_NOTHING) == OS_STATUS_EMPTY,
+                      "no stray pong token was left behind");
+
+    printf("  [INFO] %lu blocking handoffs in %lu ms\r\n",
+           (unsigned long)(2UL * OS_TEST_PINGPONG_ROUNDS), (unsigned long)elapsed);
+}
+#endif /* OS_CONFIG_SEMAPHORE_ENABLE */
+
+#if (OS_CONFIG_TASK_NOTIFY_ENABLE == 1U)
+
+#define OS_TEST_NOTIFY_STORM_COUNT 1000U
+
+static __IO uint32_t g_ns_received = 0U;
+static __IO uint32_t g_ns_last     = 0U;
+static __IO bool     g_ns_order_ok = true;
+static __IO bool     g_ns_run      = true;
+
+/******************************************************************************************************/
+static void test_ns_entry(void *context)
+{
+    (void)context;
+
+    while (g_ns_run)
+    {
+        uint32_t value = 0U;
+
+        if (os_task_notify_wait(50U, &value) == OS_STATUS_OK)
+        {
+            /* Values are sent 1..N in order, so the next one must be exactly one past the count
+             * already taken. Anything else means a notification was lost, delivered twice, or the
+             * mailbox handed back a stale value. */
+            if (value != (g_ns_received + 1U)) { g_ns_order_ok = false; }
+
+            g_ns_received++;
+            g_ns_last = value;
+        }
+    }
+}
+
+/******************************************************************************************************/
+/**
+ * @brief 1000 notifications delivered to a waiter running ABOVE the sender, so it preempts on
+ *        every give and consumes each value before the next is written. That is what makes exact
+ *        1:1 accounting meaningful for a mailbox whose documented behaviour is last-write-wins:
+ *        under this interleaving no overwrite is legitimate, so a missing or repeated value is
+ *        unambiguously a lost or duplicated wakeup rather than the overwrite semantics working.
+ */
+static void test_stress_notify_storm(void)
+{
+    uint32_t delivered = 0U;
+    uint32_t i;
+
+    test_print_section("Stress: task-notification storm");
+
+    g_ns_received = 0U;
+    g_ns_last     = 0U;
+    g_ns_order_ok = true;
+    g_ns_run      = true;
+
+    if (os_task_create(&worker, OS_TASK_CONFIG(worker, test_ns_entry, NULL, TEST_PRIO_HIGH)) != OS_STATUS_OK)
+    {
+        printf("  [SKIP] could not create the notification waiter task\r\n");
+        return;
+    }
+    (void)os_task_start(&worker);
+
+    for (i = 1U; i <= OS_TEST_NOTIFY_STORM_COUNT; i++)
+    {
+        if (os_task_notify_give(&worker, i) != OS_STATUS_OK) { break; }
+
+        delivered++;
+    }
+
+    g_ns_run = false;
+
+    AHURA_TEST_CHECK(test_wait_inactive(&worker, 1000U), "the waiter task terminated cleanly");
+    AHURA_TEST_CHECK(delivered == OS_TEST_NOTIFY_STORM_COUNT,
+                      "all %u notifications were accepted (%lu)",
+                      (unsigned)OS_TEST_NOTIFY_STORM_COUNT, (unsigned long)delivered);
+    AHURA_TEST_CHECK(g_ns_received == OS_TEST_NOTIFY_STORM_COUNT,
+                      "the waiter consumed every one exactly once (%lu of %u)",
+                      (unsigned long)g_ns_received, (unsigned)OS_TEST_NOTIFY_STORM_COUNT);
+    AHURA_TEST_CHECK(g_ns_order_ok, "every value arrived in order, none lost or repeated");
+    AHURA_TEST_CHECK(g_ns_last == OS_TEST_NOTIFY_STORM_COUNT,
+                      "the last value received is the last one sent (%lu)", (unsigned long)g_ns_last);
+}
+#endif /* OS_CONFIG_TASK_NOTIFY_ENABLE */
+
+#if (OS_CONFIG_EVENT_ENABLE == 1U)
+
+#define OS_TEST_EBS_WORKERS 4U
+#define OS_TEST_EBS_ITERS   250U
+
+typedef struct
+{
+    uint32_t id;
+    uint32_t bit;
+
+} test_ebs_ctx_t;
+
+static test_ebs_ctx_t   g_ebs_ctx[OS_TEST_EBS_WORKERS];
+static os_event_group_t g_ebs_event;
+static __IO uint32_t    g_ebs_matched[OS_TEST_EBS_WORKERS];
+
+/******************************************************************************************************/
+static void test_ebs_entry(void *context)
+{
+    test_ebs_ctx_t *ctx = (test_ebs_ctx_t *)context;
+    uint32_t        i;
+
+    for (i = 0U; i < OS_TEST_EBS_ITERS; i++)
+    {
+        uint32_t matched = 0U;
+
+        (void)os_event_group_set_bits(&g_ebs_event, ctx->bit);
+
+        if (os_event_group_wait_bits(&g_ebs_event, ctx->bit, false, true, &matched, 100U) == OS_STATUS_OK)
+        {
+            if ((matched & ctx->bit) != 0U) { g_ebs_matched[ctx->id]++; }
+        }
+    }
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Four tasks each own one bit of the same event group and pound set / wait / clear-on-exit
+ *        on it concurrently, 250 iterations apiece. Because a worker only ever touches its OWN bit
+ *        and consumes it in the same iteration it set it, the group must end with all four bits
+ *        clear - a bit left standing means one set was matched without being cleared, or cleared
+ *        without matching. That end-state invariant is what a single-task functional check cannot
+ *        provide: it needs concurrent set/wait/clear traffic on one group to be worth anything.
+ */
+static void test_stress_event_bit_storm(void)
+{
+    uint32_t all_bits = (1UL << OS_TEST_EBS_WORKERS) - 1UL;
+    uint32_t leftover = 0U;
+    uint32_t total    = 0U;
+    uint32_t i;
+
+    test_print_section("Stress: 4 tasks set/wait/clear their own event bit concurrently");
+
+    AHURA_TEST_CHECK(os_event_group_init(&g_ebs_event) == OS_STATUS_OK, "bit-storm event group initialized");
+
+    for (i = 0U; i < OS_TEST_EBS_WORKERS; i++)
+    {
+        g_ebs_ctx[i].id  = i;
+        g_ebs_ctx[i].bit = 1UL << i;
+        g_ebs_matched[i] = 0U;
+    }
+
+    AHURA_TEST_CHECK(test_stress_start_workers(test_ebs_entry, g_ebs_ctx, sizeof(g_ebs_ctx[0]),
+                                               OS_TEST_EBS_WORKERS) == OS_TEST_EBS_WORKERS,
+                      "all %u bit-storm workers created and started", (unsigned)OS_TEST_EBS_WORKERS);
+
+    test_stress_join_workers(OS_TEST_EBS_WORKERS, 5000U);
+
+    for (i = 0U; i < OS_TEST_EBS_WORKERS; i++) { total += g_ebs_matched[i]; }
+
+    AHURA_TEST_CHECK(total == (OS_TEST_EBS_WORKERS * OS_TEST_EBS_ITERS),
+                      "every set was matched by its owner's wait (%lu of %lu)",
+                      (unsigned long)total, (unsigned long)(OS_TEST_EBS_WORKERS * OS_TEST_EBS_ITERS));
+
+    (void)os_event_group_wait_bits(&g_ebs_event, all_bits, false, false, &leftover, OS_WAIT_NOTHING);
+    AHURA_TEST_CHECK((leftover & all_bits) == 0U,
+                      "no worker's bit was left standing at the end (flags=0x%02lX)",
+                      (unsigned long)(leftover & all_bits));
+}
+#endif /* OS_CONFIG_EVENT_ENABLE */
+
+#if (OS_CONFIG_WORK_ENABLE == 1U)
+
+#define OS_TEST_WFLOOD_ITEMS  (2U * OS_CONFIG_MAX_WORKS)
+#define OS_TEST_WFLOOD_ROUNDS 20U
+
+static os_work_t     g_wflood[OS_TEST_WFLOOD_ITEMS];
+static __IO uint32_t g_wflood_ran = 0U;
+
+/******************************************************************************************************/
+static void test_wflood_handler(void *context)
+{
+    (void)context;
+    g_wflood_ran++;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Oversubscribes the work registry with twice as many items as it has slots, so the FULL
+ *        path is exercised for real rather than hypothesized, then cancels half of what was
+ *        accepted and reconciles all three outcomes exactly: executed + cancelled + refused. A
+ *        registry that wrote past its array, or leaked a slot on cancel, cannot make these totals
+ *        balance. Then it churns the registry 20 more times to prove slots are reused cleanly.
+ */
+static void test_stress_work_flood(void)
+{
+    uint32_t accepted  = 0U;
+    uint32_t refused   = 0U;
+    uint32_t cancelled = 0U;
+    bool     drained   = true;
+    uint32_t round;
+    uint32_t i;
+
+    test_print_section("Stress: work registry oversubscribed, flooded and cancelled");
+
+    for (i = 0U; i < OS_TEST_WFLOOD_ITEMS; i++)
+    {
+        (void)os_work_init(&g_wflood[i], test_wflood_handler, NULL);
+    }
+
+    g_wflood_ran = 0U;
+
+    /* The delay is long enough that nothing can run during the submit loop, which is what makes
+     * the accepted/refused split deterministic: exactly OS_CONFIG_MAX_WORKS slots exist. */
+    for (i = 0U; i < OS_TEST_WFLOOD_ITEMS; i++)
+    {
+        os_status status = os_work_submit(&g_wflood[i], 60U);
+
+        if (status == OS_STATUS_OK)        { accepted++; }
+        else if (status == OS_STATUS_FULL) { refused++; }
+    }
+
+    AHURA_TEST_CHECK(accepted == OS_CONFIG_MAX_WORKS,
+                      "the registry took exactly its %u slots and no more (%lu accepted)",
+                      (unsigned)OS_CONFIG_MAX_WORKS, (unsigned long)accepted);
+    AHURA_TEST_CHECK(refused == (OS_TEST_WFLOOD_ITEMS - OS_CONFIG_MAX_WORKS),
+                      "every submission past capacity was refused with FULL (%lu)", (unsigned long)refused);
+
+    for (i = 0U; i < OS_TEST_WFLOOD_ITEMS; i += 2U)
+    {
+        if (os_work_cancel(&g_wflood[i]) == OS_STATUS_OK) { cancelled++; }
+    }
+
+    (void)os_delay_ms(120U);
+
+    AHURA_TEST_CHECK(g_wflood_ran == (accepted - cancelled),
+                      "exactly the uncancelled items ran (%lu ran = %lu accepted - %lu cancelled)",
+                      (unsigned long)g_wflood_ran, (unsigned long)accepted, (unsigned long)cancelled);
+
+    for (i = 0U; i < OS_TEST_WFLOOD_ITEMS; i++)
+    {
+        if (os_work_is_pending(&g_wflood[i])) { drained = false; }
+    }
+    AHURA_TEST_CHECK(drained, "no work item is left pending once the round completes");
+
+    /* Registry churn: fill it, let it drain, repeat. Each round has to release and reuse its slots
+     * cleanly or the total below cannot come out even. */
+    g_wflood_ran = 0U;
+    accepted     = 0U;
+
+    for (round = 0U; round < OS_TEST_WFLOOD_ROUNDS; round++)
+    {
+        for (i = 0U; i < OS_TEST_WFLOOD_ITEMS; i++)
+        {
+            if (os_work_submit(&g_wflood[i], 0U) == OS_STATUS_OK) { accepted++; }
+        }
+
+        /* Drain before resubmitting: re-submitting a still-registered item re-arms its existing
+         * slot rather than queueing a second run, which would make the total disagree for a
+         * reason that is not a bug. */
+        for (i = 0U; (i < 50U) && (g_wflood_ran < accepted); i++)
+        {
+            (void)os_delay_ms(1U);
+        }
+    }
+
+    AHURA_TEST_CHECK(g_wflood_ran == accepted,
+                      "every accepted item across %u churn rounds ran exactly once (%lu of %lu)",
+                      (unsigned)OS_TEST_WFLOOD_ROUNDS, (unsigned long)g_wflood_ran, (unsigned long)accepted);
+}
+#endif /* OS_CONFIG_WORK_ENABLE */
+
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
+
+#define OS_TEST_TFLOOD_WINDOW 200U
+
+static os_timer_t    g_tflood[OS_CONFIG_MAX_TIMERS];
+static os_timer_t    g_tflood_extra;
+static __IO uint32_t g_tflood_fired[OS_CONFIG_MAX_TIMERS];
+
+/******************************************************************************************************/
+static void test_tflood_cb(void *context)
+{
+    uint32_t index = (uint32_t)(uintptr_t)context;
+
+    if (index < OS_CONFIG_MAX_TIMERS) { g_tflood_fired[index]++; }
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Arms every timer slot periodically at once, each at a different period, and lets them all
+ *        run together for a fixed window. test_timer() runs one timer at a time; this checks the
+ *        registry under a full load of concurrent expiries - that each timer keeps its own period
+ *        rather than inheriting a neighbour's, that one past capacity is refused, and that a
+ *        stopped timer really stops instead of firing once more from a stale registry entry.
+ *
+ * Fire counts are the one thing here that cannot be exact: the callbacks run on the timer task and
+ * the window is measured with os_delay_ms, so a boundary expiry may land on either side. The
+ * tolerance is bounded at +/-2 rather than left open, which is still far tighter than the error a
+ * wrong period would produce.
+ */
+static void test_stress_timer_flood(void)
+{
+    uint32_t snapshot[OS_CONFIG_MAX_TIMERS];
+    uint32_t started      = 0U;
+    bool     all_stopped  = true;
+    bool     counts_ok    = true;
+    bool     still_firing = false;
+    uint32_t i;
+
+    test_print_section("Stress: every timer slot armed periodically at once");
+
+    for (i = 0U; i < OS_CONFIG_MAX_TIMERS; i++)
+    {
+        uint32_t period_ms = 10U + (i * 5U);
+
+        g_tflood_fired[i] = 0U;
+
+        (void)os_timer_init(&g_tflood[i], OS_TICKS_FROM_MS(period_ms), OS_TIMER_MODE_PERIODIC,
+                             test_tflood_cb, (void *)(uintptr_t)i);
+
+        if (os_timer_start(&g_tflood[i]) == OS_STATUS_OK) { started++; }
+    }
+
+    AHURA_TEST_CHECK(started == OS_CONFIG_MAX_TIMERS,
+                      "all %u timer slots armed periodically (%lu started)",
+                      (unsigned)OS_CONFIG_MAX_TIMERS, (unsigned long)started);
+
+    (void)os_timer_init(&g_tflood_extra, OS_TICKS_FROM_MS(10U), OS_TIMER_MODE_PERIODIC,
+                         test_tflood_cb, (void *)(uintptr_t)OS_CONFIG_MAX_TIMERS);
+    AHURA_TEST_CHECK(os_timer_start(&g_tflood_extra) == OS_STATUS_FULL,
+                      "one timer past the registry's capacity is refused with FULL");
+
+    (void)os_delay_ms(OS_TEST_TFLOOD_WINDOW);
+
+    for (i = 0U; i < OS_CONFIG_MAX_TIMERS; i++)
+    {
+        if (os_timer_stop(&g_tflood[i]) != OS_STATUS_OK) { all_stopped = false; }
+
+        snapshot[i] = g_tflood_fired[i];
+    }
+
+    AHURA_TEST_CHECK(all_stopped, "every armed timer stopped cleanly");
+
+    for (i = 0U; i < OS_CONFIG_MAX_TIMERS; i++)
+    {
+        uint32_t period_ms = 10U + (i * 5U);
+        uint32_t expected  = OS_TEST_TFLOOD_WINDOW / period_ms;
+
+        if (((snapshot[i] + 2U) < expected) || (snapshot[i] > (expected + 2U))) { counts_ok = false; }
+
+        printf("  [INFO] timer %lu (period %lu ms): fired %lu times, expected ~%lu\r\n",
+               (unsigned long)i, (unsigned long)period_ms, (unsigned long)snapshot[i],
+               (unsigned long)expected);
+    }
+
+    AHURA_TEST_CHECK(counts_ok,
+                      "each timer fired at its own period over the %u ms window (all within +/-2)",
+                      (unsigned)OS_TEST_TFLOOD_WINDOW);
+
+    /* Long enough for even the slowest of them to have expired again had the stop not taken. */
+    (void)os_delay_ms(80U);
+
+    for (i = 0U; i < OS_CONFIG_MAX_TIMERS; i++)
+    {
+        if (g_tflood_fired[i] != snapshot[i]) { still_firing = true; }
+    }
+
+    AHURA_TEST_CHECK(!still_firing, "no stopped timer fired again afterwards");
+}
+#endif /* OS_CONFIG_TIMER_ENABLE */
+
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+
+#define OS_TEST_CONVOY_WORKERS 4U
+#define OS_TEST_CONVOY_ITERS   200U
+
+typedef struct
+{
+    uint32_t id;
+
+} test_convoy_ctx_t;
+
+static test_convoy_ctx_t g_convoy_ctx[OS_TEST_CONVOY_WORKERS];
+static os_mutex_t        g_convoy_mutex;
+static __IO uint32_t     g_convoy_counter = 0U;
+static __IO uint32_t     g_convoy_locks[OS_TEST_CONVOY_WORKERS];
+static __IO bool         g_convoy_violation = false;
+
+/******************************************************************************************************/
+static void test_convoy_entry(void *context)
+{
+    test_convoy_ctx_t *ctx = (test_convoy_ctx_t *)context;
+    uint32_t           i;
+
+    for (i = 0U; i < OS_TEST_CONVOY_ITERS; i++)
+    {
+        if (os_mutex_lock(&g_convoy_mutex, 1000U) == OS_STATUS_OK)
+        {
+            uint32_t before = g_convoy_counter;
+
+            /* Yielding while holding the mutex is the whole point: with a working mutex nothing
+             * else can be inside the section, so the counter must still read `before` when this
+             * task is scheduled again. A broken lock shows up here as a changed value, not merely
+             * as a wrong total at the end. */
+            os_task_yield();
+
+            if (g_convoy_counter != before) { g_convoy_violation = true; }
+
+            g_convoy_counter = before + 1U;
+            g_convoy_locks[ctx->id]++;
+
+            (void)os_mutex_unlock(&g_convoy_mutex);
+        }
+    }
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Four tasks at four different priorities queue up on a single mutex, 200 acquisitions
+ *        each, yielding inside the critical section every time. Checks exclusivity from inside
+ *        the section (see the worker), the exact total from outside, and that no task was starved
+ *        - priority inheritance is supposed to keep the lowest-priority worker making progress,
+ *        and only a run this long with a per-task tally can show whether it does.
+ */
+static void test_stress_mutex_convoy(void)
+{
+    uint32_t expected   = OS_TEST_CONVOY_WORKERS * OS_TEST_CONVOY_ITERS;
+    uint32_t total      = 0U;
+    bool     no_starve  = true;
+    uint32_t i;
+
+    test_print_section("Stress: 4 tasks convoy on one mutex, yielding inside the section");
+
+    AHURA_TEST_CHECK(os_mutex_init(&g_convoy_mutex) == OS_STATUS_OK, "convoy mutex initialized");
+
+    g_convoy_counter   = 0U;
+    g_convoy_violation = false;
+
+    for (i = 0U; i < OS_TEST_CONVOY_WORKERS; i++)
+    {
+        g_convoy_ctx[i].id = i;
+        g_convoy_locks[i]  = 0U;
+    }
+
+    AHURA_TEST_CHECK(test_stress_start_workers(test_convoy_entry, g_convoy_ctx, sizeof(g_convoy_ctx[0]),
+                                               OS_TEST_CONVOY_WORKERS) == OS_TEST_CONVOY_WORKERS,
+                      "all %u convoy workers created and started", (unsigned)OS_TEST_CONVOY_WORKERS);
+
+    test_stress_join_workers(OS_TEST_CONVOY_WORKERS, 10000U);
+
+    for (i = 0U; i < OS_TEST_CONVOY_WORKERS; i++)
+    {
+        total += g_convoy_locks[i];
+        if (g_convoy_locks[i] == 0U) { no_starve = false; }
+    }
+
+    AHURA_TEST_CHECK(!g_convoy_violation,
+                      "no worker ever observed the counter change while it held the mutex");
+    AHURA_TEST_CHECK(total == expected, "every acquisition succeeded (%lu of %lu)",
+                      (unsigned long)total, (unsigned long)expected);
+    AHURA_TEST_CHECK(g_convoy_counter == total,
+                      "the protected counter equals the acquisition count (%lu vs %lu - a mismatch is a lost update)",
+                      (unsigned long)g_convoy_counter, (unsigned long)total);
+    AHURA_TEST_CHECK(no_starve, "no worker was starved out of the mutex entirely");
+    AHURA_TEST_CHECK(os_mutex_try_lock(&g_convoy_mutex) == OS_STATUS_OK, "the mutex ended unlocked");
+    (void)os_mutex_unlock(&g_convoy_mutex);
+
+    for (i = 0U; i < OS_TEST_CONVOY_WORKERS; i++)
+    {
+        printf("  [INFO] convoy worker %lu (priority %lu): %lu acquisitions\r\n",
+               (unsigned long)i, (unsigned long)(3U + i), (unsigned long)g_convoy_locks[i]);
+    }
+}
+#endif /* OS_CONFIG_MUTEX_ENABLE */
+
+#endif /* OS_TEST_STRESS_EXTENDED */
+
+/*
+ * ***********************************************************************************************************
  * Task / stack footprint and context-switch timing (informational - no "correct" value to assert)
  * ***********************************************************************************************************
 */
@@ -3585,6 +4572,41 @@ void os_test(void)
 #if (OS_CONFIG_TIMER_ENABLE == 1U)
     test_stress_timer_churn();
 #endif
+
+    /* Extended per-subsystem stress: each drives one subsystem at high volume with exact
+     * accounting (see the OS_TEST_STRESS_EXTENDED section header). */
+#if (OS_TEST_STRESS_EXTENDED == 1U)
+#if (OS_CONFIG_QUEUE_ENABLE == 1U) && (OS_CONFIG_ALLOC_ENABLE == 1U)
+    test_stress_queue_dynamic_churn();
+    test_stress_queue_dynamic_concurrent();
+#endif
+#if (OS_CONFIG_ALLOC_ENABLE == 1U)
+    test_stress_heap_fragmentation();
+#endif
+#if (OS_CONFIG_SEMAPHORE_ENABLE == 1U)
+    test_stress_semaphore_pingpong();
+#endif
+#if (OS_CONFIG_TASK_NOTIFY_ENABLE == 1U)
+    test_stress_notify_storm();
+#endif
+#if (OS_CONFIG_EVENT_ENABLE == 1U)
+    test_stress_event_bit_storm();
+#endif
+#if (OS_CONFIG_WORK_ENABLE == 1U)
+    test_stress_work_flood();
+#endif
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
+    test_stress_timer_flood();
+#endif
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+    test_stress_mutex_convoy();
+#endif
+#else
+    test_print_section("Extended per-subsystem stress");
+    printf("  [SKIP] OS_TEST_STRESS_EXTENDED=0: needs ~15 KB of flash this unoptimized build does\r\n"
+           "         not have, and stress timings at -O0 do not reflect shipped firmware.\r\n"
+           "         Build Release (-Os) to run them, or define OS_TEST_STRESS_EXTENDED=1.\r\n");
+#endif /* OS_TEST_STRESS_EXTENDED */
 
     test_task_footprint();
     test_context_switch_timing();
