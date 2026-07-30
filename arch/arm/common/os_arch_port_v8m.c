@@ -565,38 +565,9 @@ static uint64_t os_arch_max_window_ticks_get(void)
     return (uint64_t)(OS_ARCH_SYST_RVR_RELOAD_MSK + 1UL) / (uint64_t)os_arch_tick_reload_cycles;
 }
 
-/******************************************************************************************************/
-/**
- * @brief Atomic compare-and-swap. See os_arch_port_common.h.
- *
- * Lock-free: this core has exclusives, so nothing is masked and an ISR that preempts the sequence
- * simply causes the STREX to fail and the caller to retry.
- *
- * @param[in,out] target    Word to update.
- * @param[in]     expected  Value the caller believes target holds.
- * @param[in]     desired   Value to store if it still does.
- * @return bool  true if desired was stored.
- */
-bool os_arch_atomic_cas(__IO int32_t *target, int32_t expected, int32_t desired)
-{
-    int32_t  current;
-    uint32_t store_failed;
-
-    __asm volatile("ldrex %0, [%1]" : "=r"(current) : "r"(target) : "memory");
-
-    if (current != expected)
-    {
-        /* Drop the exclusive monitor rather than leaving it set on a word this call is walking
-         * away from: a stale reservation can make an unrelated later STREX succeed when it should
-         * not, and the architecture only guarantees one outstanding reservation per core. */
-        __asm volatile("clrex" ::: "memory");
-        return false;
-    }
-
-    __asm volatile("strex %0, %1, [%2]" : "=&r"(store_failed) : "r"(desired), "r"(target) : "memory");
-
-    return (store_failed == 0U);
-}
+/* Every os_arch_atomic_* operation, shared by all three ARM ports; OS_ARCH_HAS_EXCLUSIVES picks
+ * the LDREX/STREX backend for this one. */
+#include "os_arch_atomic.c"
 
 /******************************************************************************************************/
 /**

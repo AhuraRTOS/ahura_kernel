@@ -115,6 +115,22 @@ extern "C"
 #endif
 #endif
 
+/* Inlining the compiler may not decline, including at -O0. Reserved for the few places where a
+ * call would not merely cost cycles but sit somewhere it must not - between an LDREX and its
+ * STREX, where a BL and its stack traffic are exactly the unrelated memory accesses ARM leaves
+ * free to clear the exclusive reservation. */
+#ifndef OS_FORCE_INLINE
+#if defined(__ARMCC_VERSION) && (__ARMCC_VERSION >= 6000000)
+#define OS_FORCE_INLINE static inline __attribute__((always_inline))
+#elif defined(__clang__)
+#define OS_FORCE_INLINE static inline __attribute__((always_inline))
+#elif defined(__GNUC__)
+#define OS_FORCE_INLINE static inline __attribute__((always_inline))
+#else
+#define OS_FORCE_INLINE static inline
+#endif
+#endif
+
 /*
  * Architecture capabilities derived from the compiler target: TrustZone (the
  * ARMv8-M Security Extension) and exclusive load/store (LDREX/STREX, absent
@@ -499,18 +515,74 @@ uint32_t os_arch_cycle_count_get(void);
  */
 uint32_t os_arch_elapsed_ticks_get(void);
 
+/*
+ * ***********************************************************************************************************
+ * Atomics (os_arch_atomic.c, included by each shared port implementation)
+ * ***********************************************************************************************************
+ *
+ * The complete set the portable os_atomic_* API rests on, rather than one primitive it composes
+ * from, because how a word is updated indivisibly is a property of the core: one with exclusives
+ * retries an LDREX/STREX pair and never masks anything, while one without has no way to detect
+ * interference and must take a critical section instead. OS_ARCH_HAS_EXCLUSIVES selects which.
+ *
+ * Every read-modify-write below returns the value the word held BEFORE the operation. All of them
+ * take a pointer to a naturally aligned 32-bit word and are safe from tasks and from ISRs.
+*/
+
+/* Kernel services the port itself calls. Declared here because the port translation unit does not
+ * include ahura.h - it needs these two, on cores whose atomics fall back to a critical section,
+ * and nothing else from the core. */
+void os_critical_enter(void);
+void os_critical_exit(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Read a word indivisibly.
+ *
+ * Inline, and here rather than in os_arch_atomic.c, because on every core this port targets a
+ * single naturally aligned 32-bit load already is indivisible - so the whole operation is one LDR,
+ * and calling across to the port to perform it would cost several times what it does. What the
+ * volatile access adds over reading the variable directly is that the compiler may not reuse a
+ * value it cached before some other code path changed the word.
+ */
+static inline int32_t os_arch_atomic_load(const __IO int32_t *target)
+{
+    return *target;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Store a word indivisibly, returning what it held before.
+ */
+int32_t os_arch_atomic_exchange(__IO int32_t *target, int32_t value);
+
+/******************************************************************************************************/
+/**
+ * @brief Arithmetic read-modify-write, each returning the value held before the operation.
+ *        Overflow wraps: these compute in the unsigned domain, where wrapping is defined.
+ */
+int32_t os_arch_atomic_add(__IO int32_t *target, int32_t value);
+int32_t os_arch_atomic_sub(__IO int32_t *target, int32_t value);
+
+/******************************************************************************************************/
+/**
+ * @brief Bitwise read-modify-write, each returning the value held before the operation.
+ */
+int32_t os_arch_atomic_or(__IO int32_t *target, int32_t value);
+int32_t os_arch_atomic_and(__IO int32_t *target, int32_t value);
+int32_t os_arch_atomic_xor(__IO int32_t *target, int32_t value);
+int32_t os_arch_atomic_nand(__IO int32_t *target, int32_t value);
+
 /******************************************************************************************************/
 /**
  * @brief Atomic compare-and-swap: if *target still holds expected, store desired and report true.
  *
- * The single primitive every os_atomic_* operation is built from, so a port only has to get this
- * one right. Where the ISA provides exclusives (OS_ARCH_HAS_EXCLUSIVES) it is a genuinely
- * lock-free LDREX/STREX pair that never masks interrupts; ARMv6-M has no exclusives, so that port
- * falls back to briefly excluding everyone else instead.
+ * The only operation here that does not retry internally, which is what makes it the building
+ * block for lock-free algorithms the kernel knows nothing about.
  *
- * A false return means only that the swap did not happen - either the value had changed, or the
- * exclusive access was lost to an interrupt or another core. Callers retry in a loop, which is
- * why every derived operation reads the value again each pass rather than trusting an earlier read.
+ * A false return means only that the swap did not happen - either the value had changed, or an
+ * exclusives-based backend lost its reservation to an interrupt or another core. Callers that need
+ * to tell those apart re-read the word; callers that only care about the final state loop.
  */
 bool os_arch_atomic_cas(__IO int32_t *target, int32_t expected, int32_t desired);
 

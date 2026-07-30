@@ -2,17 +2,22 @@
  * @file os_atomic.c
  * @brief Atomic operations on a single word.
  *
- * Everything here is built from one architecture primitive, os_arch_atomic_cas(), so a port only
- * has to provide a correct compare-and-swap and gets the whole API. On cores with LDREX/STREX
- * that primitive is genuinely lock-free and never masks interrupts; on ARMv6-M, which has no
- * exclusives, it briefly excludes interrupts and other cores instead.
+ * Portable half of the atomic API. Nothing here knows how a word is made to update indivisibly -
+ * that is the core's business and lives entirely in the port (arch/arm/common/os_arch_atomic.c),
+ * which is what lets a core with LDREX/STREX stay lock-free while one without pays interrupt
+ * latency instead, with no trace of either choice in this file.
  *
- * Every read-modify-write follows the same shape: read the current value, compute the new one,
- * and try to swap it in, repeating while the swap fails. The read has to happen INSIDE the loop.
- * A CAS can fail either because another writer changed the word or because the exclusive access
- * was lost, and in the first case a value cached from before the loop is already stale - reusing
- * it would write back a result computed from a value nobody holds any more, which is exactly the
- * lost update these functions exist to prevent.
+ * What is left over is genuinely portable: argument validation, and the handful of operations that
+ * are just another one under a different name - increment is an add of 1, clearing a bit is an AND
+ * with its complement. Composing those here rather than in each port keeps the set a port has to
+ * implement small, and keeps their behaviour identical on every core by construction.
+ *
+ * Each function validates and then makes exactly one call into the port, rather than routing
+ * through another os_atomic_* function that would validate the same pointer again. The port is a
+ * separate translation unit, so without link-time optimization nothing here can be inlined into
+ * its caller and every layer is a real branch and stack frame: os_atomic_set_bit built on
+ * os_atomic_test_and_set_bit built on os_atomic_or would be three of them to reach a single
+ * instruction's worth of work. The cost is that the NULL check is written out repeatedly below.
  *
  * All of them return the value the word held BEFORE the operation, not after it.
  *
@@ -40,27 +45,10 @@
 /* Number of bits in an os_atomic_t, and so the exclusive upper bound for every bit index. */
 #define OS_ATOMIC_BITS  32U
 
-/* The operations below index bits and swap whole words, both of which assume this width. */
+/* The operations below index bits and swap whole words, both of which assume this width, and the
+ * port's atomics are declared over a 32-bit word. */
 _Static_assert(sizeof(os_atomic_t) == 4U,
                "the atomic operations assume a 32-bit word");
-
-/*
- * Shared body of every read-modify-write below. Declared as a macro rather than repeated by hand
- * so the retry structure - and in particular the reload of the current value on each pass - is
- * written exactly once.
- */
-#define OS_ATOMIC_FETCH_OP(target, expr)                                       \
-    do {                                                                       \
-        int32_t current;                                                       \
-                                                                               \
-        do                                                                     \
-        {                                                                      \
-            current = *(__IO int32_t *)(target);                           \
-        } while (!os_arch_atomic_cas((__IO int32_t *)(target),             \
-                                     current, (int32_t)(expr)));               \
-                                                                               \
-        return current;                                                        \
-    } while (0)
 
 /*
  * ***********************************************************************************************************
@@ -72,10 +60,6 @@ _Static_assert(sizeof(os_atomic_t) == 4U,
 /**
  * @brief Read the current value.
  *
- * A single aligned 32-bit load is already indivisible on Cortex-M, so there is no retry loop here.
- * What this does add over reading the variable directly is the volatile access, which stops the
- * compiler from reusing a value it cached before some other code path changed it.
- *
  * @param[in] target  Word to read.
  * @return int32_t  Current value, or 0 for a NULL target.
  */
@@ -86,7 +70,7 @@ int32_t os_atomic_get(const os_atomic_t *target)
         return 0;
     }
 
-    return *(__I int32_t *)target;
+    return os_arch_atomic_load((const __IO int32_t *)target);
 }
 
 /******************************************************************************************************/
@@ -106,7 +90,7 @@ int32_t os_atomic_set(os_atomic_t *target, int32_t value)
         return 0;
     }
 
-    OS_ATOMIC_FETCH_OP(target, value);
+    return os_arch_atomic_exchange((__IO int32_t *)target, value);
 }
 
 /******************************************************************************************************/
@@ -118,18 +102,19 @@ int32_t os_atomic_set(os_atomic_t *target, int32_t value)
  */
 int32_t os_atomic_clear(os_atomic_t *target)
 {
-    return os_atomic_set(target, 0);
+    OS_ASSERT(target != NULL);
+
+    if (target == NULL)
+    {
+        return 0;
+    }
+
+    return os_arch_atomic_exchange((__IO int32_t *)target, 0);
 }
 
 /******************************************************************************************************/
 /**
  * @brief Add, returning the previous value.
- *
- * The sum is computed in uint32_t and converted back. Adding in the signed domain would be
- * undefined behaviour the moment a counter ran past INT32_MAX - not merely a negative-looking
- * result, but licence for the compiler to assume it cannot happen and optimise accordingly.
- * Unsigned arithmetic wraps with defined behaviour, and the conversion back reproduces the same
- * two's-complement bit pattern the hardware would have stored anyway.
  *
  * @param[in,out] target  Word to update.
  * @param[in]     value   Amount to add.
@@ -144,15 +129,12 @@ int32_t os_atomic_add(os_atomic_t *target, int32_t value)
         return 0;
     }
 
-    OS_ATOMIC_FETCH_OP(target, (int32_t)((uint32_t)current + (uint32_t)value));
+    return os_arch_atomic_add((__IO int32_t *)target, value);
 }
 
 /******************************************************************************************************/
 /**
  * @brief Subtract, returning the previous value.
- *
- * Computed in uint32_t for the same reason as os_atomic_add: signed underflow past INT32_MIN is
- * undefined behaviour, unsigned wrapping is not.
  *
  * @param[in,out] target  Word to update.
  * @param[in]     value   Amount to subtract.
@@ -167,7 +149,7 @@ int32_t os_atomic_sub(os_atomic_t *target, int32_t value)
         return 0;
     }
 
-    OS_ATOMIC_FETCH_OP(target, (int32_t)((uint32_t)current - (uint32_t)value));
+    return os_arch_atomic_sub((__IO int32_t *)target, value);
 }
 
 /******************************************************************************************************/
@@ -179,7 +161,14 @@ int32_t os_atomic_sub(os_atomic_t *target, int32_t value)
  */
 int32_t os_atomic_inc(os_atomic_t *target)
 {
-    return os_atomic_add(target, 1);
+    OS_ASSERT(target != NULL);
+
+    if (target == NULL)
+    {
+        return 0;
+    }
+
+    return os_arch_atomic_add((__IO int32_t *)target, 1);
 }
 
 /******************************************************************************************************/
@@ -191,7 +180,14 @@ int32_t os_atomic_inc(os_atomic_t *target)
  */
 int32_t os_atomic_dec(os_atomic_t *target)
 {
-    return os_atomic_sub(target, 1);
+    OS_ASSERT(target != NULL);
+
+    if (target == NULL)
+    {
+        return 0;
+    }
+
+    return os_arch_atomic_sub((__IO int32_t *)target, 1);
 }
 
 /******************************************************************************************************/
@@ -211,7 +207,7 @@ int32_t os_atomic_or(os_atomic_t *target, int32_t value)
         return 0;
     }
 
-    OS_ATOMIC_FETCH_OP(target, current | value);
+    return os_arch_atomic_or((__IO int32_t *)target, value);
 }
 
 /******************************************************************************************************/
@@ -231,7 +227,7 @@ int32_t os_atomic_and(os_atomic_t *target, int32_t value)
         return 0;
     }
 
-    OS_ATOMIC_FETCH_OP(target, current & value);
+    return os_arch_atomic_and((__IO int32_t *)target, value);
 }
 
 /******************************************************************************************************/
@@ -251,7 +247,7 @@ int32_t os_atomic_xor(os_atomic_t *target, int32_t value)
         return 0;
     }
 
-    OS_ATOMIC_FETCH_OP(target, current ^ value);
+    return os_arch_atomic_xor((__IO int32_t *)target, value);
 }
 
 /******************************************************************************************************/
@@ -271,7 +267,7 @@ int32_t os_atomic_nand(os_atomic_t *target, int32_t value)
         return 0;
     }
 
-    OS_ATOMIC_FETCH_OP(target, ~(current & value));
+    return os_arch_atomic_nand((__IO int32_t *)target, value);
 }
 
 /******************************************************************************************************/
@@ -301,7 +297,7 @@ bool os_atomic_cas(os_atomic_t *target, int32_t expected, int32_t desired)
         return false;
     }
 
-    return os_arch_atomic_cas((__IO int32_t *)target, (int32_t)expected, (int32_t)desired);
+    return os_arch_atomic_cas((__IO int32_t *)target, expected, desired);
 }
 
 /******************************************************************************************************/
@@ -321,7 +317,7 @@ bool os_atomic_test_bit(const os_atomic_t *target, uint32_t bit)
         return false;
     }
 
-    return ((os_atomic_get(target) & (int32_t)(1UL << bit)) != 0);
+    return ((os_arch_atomic_load((const __IO int32_t *)target) & (int32_t)(1UL << bit)) != 0);
 }
 
 /******************************************************************************************************/
@@ -346,7 +342,7 @@ bool os_atomic_test_and_set_bit(os_atomic_t *target, uint32_t bit)
     }
 
     mask     = (int32_t)(1UL << bit);
-    previous = os_atomic_or(target, mask);
+    previous = os_arch_atomic_or((__IO int32_t *)target, mask);
 
     return ((previous & mask) != 0);
 }
@@ -373,7 +369,7 @@ bool os_atomic_test_and_clear_bit(os_atomic_t *target, uint32_t bit)
     }
 
     mask     = (int32_t)(1UL << bit);
-    previous = os_atomic_and(target, (int32_t)(~mask));
+    previous = os_arch_atomic_and((__IO int32_t *)target, (int32_t)(~mask));
 
     return ((previous & mask) != 0);
 }
@@ -388,7 +384,15 @@ bool os_atomic_test_and_clear_bit(os_atomic_t *target, uint32_t bit)
  */
 void os_atomic_set_bit(os_atomic_t *target, uint32_t bit)
 {
-    (void)os_atomic_test_and_set_bit(target, bit);
+    OS_ASSERT(target != NULL);
+    OS_ASSERT(bit < OS_ATOMIC_BITS);
+
+    if ((target == NULL) || (bit >= OS_ATOMIC_BITS))
+    {
+        return;
+    }
+
+    (void)os_arch_atomic_or((__IO int32_t *)target, (int32_t)(1UL << bit));
 }
 
 /******************************************************************************************************/
@@ -401,7 +405,15 @@ void os_atomic_set_bit(os_atomic_t *target, uint32_t bit)
  */
 void os_atomic_clear_bit(os_atomic_t *target, uint32_t bit)
 {
-    (void)os_atomic_test_and_clear_bit(target, bit);
+    OS_ASSERT(target != NULL);
+    OS_ASSERT(bit < OS_ATOMIC_BITS);
+
+    if ((target == NULL) || (bit >= OS_ATOMIC_BITS))
+    {
+        return;
+    }
+
+    (void)os_arch_atomic_and((__IO int32_t *)target, (int32_t)(~(1UL << bit)));
 }
 
 /******************************************************************************************************/
@@ -415,13 +427,25 @@ void os_atomic_clear_bit(os_atomic_t *target, uint32_t bit)
  */
 void os_atomic_set_bit_to(os_atomic_t *target, uint32_t bit, bool value)
 {
+    int32_t mask;
+
+    OS_ASSERT(target != NULL);
+    OS_ASSERT(bit < OS_ATOMIC_BITS);
+
+    if ((target == NULL) || (bit >= OS_ATOMIC_BITS))
+    {
+        return;
+    }
+
+    mask = (int32_t)(1UL << bit);
+
     if (value)
     {
-        os_atomic_set_bit(target, bit);
+        (void)os_arch_atomic_or((__IO int32_t *)target, mask);
     }
     else
     {
-        os_atomic_clear_bit(target, bit);
+        (void)os_arch_atomic_and((__IO int32_t *)target, (int32_t)(~mask));
     }
 }
 

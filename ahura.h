@@ -461,38 +461,6 @@ void os_list_insert_before(os_list_t *list, os_list_node_t *position, os_list_no
 
 /*
  * ***********************************************************************************************************
- * Tickless idle control
- * ***********************************************************************************************************
- *
- * Always declared, unlike the two application hooks in PART 2: these three are
- * compiled into every build and simply do nothing (returning 0) when
- * OS_CONFIG_TICKLESS_ENABLE is 0, so a diagnostic or test may call them without
- * a guard of its own.
-*/
-
-/******************************************************************************************************/
-/**
- * @brief Execute one tickless-idle pass: suppress ticking for the next known-idle duration,
- *        sleep, and announce the real elapsed time on wake.
- */
-void os_tickless_idle_process(void);
-
-/******************************************************************************************************/
-/**
- * @brief Ticks the kernel would plan to suppress right now, bounded by the earliest kernel
- *        time source (timer expiry, ready work item, finite-delay sleeper).
- */
-uint32_t os_tickless_expected_idle_ticks_get(void);
-
-/******************************************************************************************************/
-/**
- * @brief Maximum ticks the active arch port can suppress in one tickless window, given the
- *        platform clock and OS_CONFIG_TICK_HZ (not a fixed constant).
- */
-uint32_t os_tickless_max_suppressed_ticks_get(void);
-
-/*
- * ***********************************************************************************************************
  * PART 2 - CONFIGURABLE (each group compiles away with its OS_CONFIG_ option)
  * ***********************************************************************************************************
  *
@@ -590,6 +558,20 @@ os_status os_semaphore_take(os_semaphore_t *semaphore, uint32_t timeout_ms);
  * ***********************************************************************************************************
  * Queue              - OS_CONFIG_QUEUE_ENABLE
  * ***********************************************************************************************************
+ *
+ * A queue is an object plus an item buffer. Which macro declares it decides
+ * where that buffer comes from, and that is the only difference between the two
+ * kinds. Declared below in that order: static storage, dynamic storage, storage
+ * you lay out yourself, then the operations they all share.
+ *
+ *   STATIC    OS_QUEUE_DEFINE_STATIC(sensor_q, sample_t, 8);
+ *             / file scope; usable where it stands, nothing to call
+ *
+ *   DYNAMIC   OS_QUEUE_DEFINE_DYNAMIC(rx_q);
+ *             os_queue_init_dynamic(&rx_q, item_size, capacity);
+ *             / file scope declares only the object; the call obtains the buffer
+ *
+ * From there every call is the same for both kinds, teardown included.
 */
 
 #if (OS_CONFIG_QUEUE_ENABLE == 1U)
@@ -608,42 +590,82 @@ typedef struct
     size_t    count;
     os_list_t send_waiters;    /**< Tasks blocked because the queue is full.  */
     os_list_t receive_waiters; /**< Tasks blocked because the queue is empty. */
-    bool      buffer_owned;    /**< Buffer came from os_queue_create and must be freed on delete. */
+    bool      buffer_owned;    /**< Buffer came from os_queue_init_dynamic: os_queue_cleanup frees it. */
 
 } os_queue_t;
 
-/** Define a statically stored queue and its item buffer: the queue object is declared as plain
- *  "name" (what every other os_queue_* call references), and the backing storage gets the
- *  decorated "name_BUFFER", touched only by OS_QUEUE_INIT below and never by hand.
+/* --- Static storage: declared and initialized by the macro ------------------------------------ */
+
+/** Define a queue with statically allocated storage, ready to use where it stands. The queue
+ *  object is declared as plain "name" (what every os_queue_* call takes the address of), the
+ *  backing array gets the decorated "name_BUFFER", and the macro initializes the object over that
+ *  array at compile time.
  *
- *  "type" is the item type, so the buffer is typed rather than a byte blob and the compiler
- *  checks it. Pair it with OS_QUEUE_INIT, which derives item size and capacity from the array
- *  itself - that pairing is the point of the macro, since passing os_queue_init an item_size or
- *  capacity that disagrees with the real buffer is otherwise an easy and silent way to read or
- *  write past it.
+ *  There is deliberately no init call to pair this with. The item size and capacity are taken
+ *  from the declaration itself, so they cannot disagree with the storage that actually exists -
+ *  handing a queue a geometry larger than its buffer is otherwise an easy and silent way to read
+ *  or write past the end of it. "type" is the item type rather than a byte count, so the buffer is
+ *  typed and the compiler checks what goes into it.
  *
- *      OS_QUEUE_DEFINE(sensor_q, sensor_sample_t, 8);
+ *      OS_QUEUE_DEFINE_STATIC(sensor_q, sensor_sample_t, 8);
  *      ...
- *      status = OS_QUEUE_INIT(sensor_q);
  *      status = os_queue_send(&sensor_q, &sample, 10U);
  *
- *  Both objects are static, so this belongs at file scope. For a queue whose size is not known
- *  until run time, use os_queue_create/os_queue_delete instead. */
-#define OS_QUEUE_DEFINE(name, type, capacity) \
-    static type       name##_BUFFER[(capacity)]; \
+ *  Both objects are static, so this belongs at file scope. Everything omitted from the initializer
+ *  - head, tail, count, the two waiter lists, buffer_owned - is zero-initialized by the C rules
+ *  for objects with static storage duration, which is exactly the empty queue with empty waiter
+ *  lists that os_queue_init_buffer would otherwise have to write at run time.
+ *
+ *  The third parameter is item_count and NOT capacity on purpose: a macro parameter named after a
+ *  field would be substituted inside the designated initializer below, turning ".capacity" into
+ *  ".8" and failing to compile. Same reason no parameter here is called buffer or item_size.
+ *
+ *  For a queue whose geometry is not known until run time, use OS_QUEUE_DEFINE_DYNAMIC. */
+#define OS_QUEUE_DEFINE_STATIC(name, type, item_count) \
+    static type       name##_BUFFER[(item_count)];     \
+    static os_queue_t name = {                         \
+        .buffer    = (uint8_t *)(name##_BUFFER),       \
+        .item_size = sizeof(type),                     \
+        .capacity  = (item_count),                     \
+    }
+
+/* --- Dynamic storage: the item buffer comes from the kernel heap ------------------------------ */
+
+/** Define the object for a queue whose item buffer comes from the kernel heap. Only the object is
+ *  declared here - os_queue_init_dynamic(), called in code, is what obtains the buffer - so this
+ *  says at the declaration site which kind of queue "name" is, and keeps the queue object out of
+ *  the allocation so its lifetime stays obvious and a failed init leaves nothing to clean up.
+ *
+ *      OS_QUEUE_DEFINE_DYNAMIC(rx_q);
+ *      ...
+ *      status = os_queue_init_dynamic(&rx_q, sizeof(sample_t), capacity_from_config);
+ *
+ *  Zero-initialized like any static object, which is the state os_queue_init_dynamic() expects. */
+#define OS_QUEUE_DEFINE_DYNAMIC(name) \
     static os_queue_t name
 
-/** Initialize a queue declared with OS_QUEUE_DEFINE, deriving the item size and capacity from
- *  the buffer so the two can never disagree. Evaluates to the os_status of os_queue_init. */
-#define OS_QUEUE_INIT(name)                                          \
-    os_queue_init(&(name), (name##_BUFFER), sizeof((name##_BUFFER)[0]), \
-                  (sizeof(name##_BUFFER) / sizeof((name##_BUFFER)[0])))
+#if (OS_CONFIG_ALLOC_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Initialize a queue over an item buffer allocated from the kernel heap, for a geometry
+ *        not known until run time. Only the buffer is allocated; the queue object itself is the
+ *        caller's, and os_queue_cleanup releases what this obtained.
+ */
+os_status os_queue_init_dynamic(os_queue_t *queue, size_t item_size, size_t capacity);
+#endif /* OS_CONFIG_ALLOC_ENABLE */
+
+/* --- Storage you lay out yourself ------------------------------------------------------------- */
 
 /******************************************************************************************************/
 /**
- * @brief Initialize a queue object over caller-provided storage.
+ * @brief Initialize a queue over an item buffer the caller declares. The escape hatch for storage
+ *        the two macros above cannot express - a named linker section, DMA-capable RAM, a slice of
+ *        an application pool. Nothing derives item_size or capacity here, so they must match the
+ *        buffer exactly; prefer OS_QUEUE_DEFINE_STATIC wherever ordinary static storage will do.
  */
-os_status os_queue_init(os_queue_t *queue, void *buffer, size_t item_size, size_t capacity);
+os_status os_queue_init_buffer(os_queue_t *queue, void *buffer, size_t item_size, size_t capacity);
+
+/* --- Operations: identical for every storage kind --------------------------------------------- */
 
 /******************************************************************************************************/
 /**
@@ -663,19 +685,14 @@ os_status os_queue_receive(os_queue_t *queue, void *item_out, uint32_t timeout_m
  */
 size_t os_queue_count_get(const os_queue_t *queue);
 
-#if (OS_CONFIG_ALLOC_ENABLE == 1U)
 /******************************************************************************************************/
 /**
- * @brief Create a queue whose item buffer is allocated from the kernel heap.
+ * @brief Tear down a queue of any kind: empty it, and release the item buffer only when
+ *        os_queue_init_dynamic allocated it. A queue that owns no buffer keeps its storage and
+ *        stays usable, so a statically defined queue needs no init call after this either.
+ *        Refuses with OS_STATUS_BUSY while tasks are blocked on the queue.
  */
-os_status os_queue_create(os_queue_t *queue, size_t item_size, size_t capacity);
-
-/******************************************************************************************************/
-/**
- * @brief Tear down a queue, freeing the buffer only if os_queue_create allocated it.
- */
-os_status os_queue_delete(os_queue_t *queue);
-#endif /* OS_CONFIG_ALLOC_ENABLE */
+os_status os_queue_cleanup(os_queue_t *queue);
 
 #endif /* OS_CONFIG_QUEUE_ENABLE */
 
@@ -927,10 +944,12 @@ typedef int32_t os_atomic_t;
  * Every read-modify-write returns the value the word held BEFORE the operation, not after it, so
  * os_atomic_inc returning 4 means the counter now reads 5.
  *
- * Lock-free on every core that has LDREX/STREX (ARMv7-M and ARMv8-M), so an atomic update never
- * masks interrupts there. ARMv6-M has no such instructions and briefly excludes interrupts (and,
- * on a multi-core build, the other cores) instead, which is worth knowing before putting one of
- * these in an ARMv6-M hot path.
+ * How the update is made indivisible is the port's business and varies with the core. Where the
+ * instruction set can do it - an exclusive load/store pair - these are lock-free and never mask
+ * interrupts. Where it cannot, the port briefly excludes interrupts (and, on a multi-core build,
+ * the other cores) instead, which makes an atomic operation cost interrupt latency on those cores
+ * and is worth knowing before putting one in a hot path. See the README "Atomics" section for
+ * which cores fall on which side.
  *
  * All of them are safe from tasks and from ISRs.
  */
@@ -1295,14 +1314,38 @@ void os_arch_core_ipi_request_cb(uint32_t core_id);
 
 /*
  * ***********************************************************************************************************
- * Tickless hooks     - OS_CONFIG_TICKLESS_ENABLE
+ * Tickless idle      - OS_CONFIG_TICKLESS_ENABLE
  * ***********************************************************************************************************
  *
- * The tickless control functions themselves are always available: see
- * "Tickless idle control" at the end of PART 1.
+ * Three kernel-provided control functions and two application-provided hooks,
+ * all behind the one guard. Calling any of them with tickless idle disabled is
+ * a compile error naming the function, not a call that silently does nothing.
 */
 
 #if (OS_CONFIG_TICKLESS_ENABLE == 1U)
+
+/******************************************************************************************************/
+/**
+ * @brief Execute one tickless-idle pass: suppress ticking for the next known-idle duration,
+ *        sleep, and announce the real elapsed time on wake.
+ */
+void os_tickless_idle_process(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Ticks the kernel would plan to suppress right now, bounded by the earliest kernel
+ *        time source (timer expiry, ready work item, finite-delay sleeper).
+ */
+uint32_t os_tickless_expected_idle_ticks_get(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Maximum ticks the active arch port can suppress in one tickless window, given the
+ *        platform clock and OS_CONFIG_TICK_HZ (not a fixed constant). Returns 0 when the active
+ *        port does not yet suppress ticking for real (see README "Tickless idle").
+ */
+uint32_t os_tickless_max_suppressed_ticks_get(void);
+
 /******************************************************************************************************/
 /**
  * @brief Pre-sleep callback invoked before entering low-power mode. The application must define
@@ -1316,6 +1359,7 @@ void os_tickless_pre_sleep_cb(void);
  *        the sleep. The application must define it; the kernel provides no default.
  */
 void os_tickless_post_sleep_cb(void);
+
 #endif /* OS_CONFIG_TICKLESS_ENABLE */
 
 #ifdef __cplusplus

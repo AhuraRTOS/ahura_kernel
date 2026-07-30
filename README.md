@@ -171,7 +171,7 @@ compiles away entirely when its `OS_CONFIG_<FEATURE>_ENABLE` is 0.
 | **Atomics** | `os_atomic_get` · `os_atomic_set` · `os_atomic_add` · `os_atomic_sub` · `os_atomic_inc` · `os_atomic_dec` · `os_atomic_or` · `os_atomic_and` · `os_atomic_xor` · `os_atomic_nand` · `os_atomic_clear` · `os_atomic_cas` · `os_atomic_test_bit` · `os_atomic_set_bit` · `os_atomic_clear_bit` · `os_atomic_test_and_set_bit` · `os_atomic_test_and_clear_bit` · `os_atomic_set_bit_to` |
 | **Mutex** | `os_mutex_init` · `os_mutex_lock` · `os_mutex_try_lock` · `os_mutex_unlock` |
 | **Semaphore** | `os_semaphore_init` · `os_semaphore_give` · `os_semaphore_take` |
-| **Queue** | `OS_QUEUE_DEFINE` · `OS_QUEUE_INIT` · `os_queue_init` · `os_queue_create` · `os_queue_delete` · `os_queue_send` · `os_queue_receive` · `os_queue_count_get` |
+| **Queue** | `OS_QUEUE_DEFINE_STATIC` · `OS_QUEUE_DEFINE_DYNAMIC` · `os_queue_init_dynamic` · `os_queue_init_buffer` · `os_queue_send` · `os_queue_receive` · `os_queue_count_get` · `os_queue_cleanup` |
 | **Event group** | `os_event_group_init` · `os_event_group_set_bits` · `os_event_group_clear_bits` · `os_event_group_wait_bits` |
 | **Task notifications** | `os_task_notify_give` · `os_task_notify_wait` |
 | **Software timers** | `os_timer_init` · `os_timer_start` · `os_timer_stop` |
@@ -330,53 +330,81 @@ and it follows the `timeout_ms` convention above.
 
 ### Queues
 
-A queue copies fixed-size items between tasks, or from an ISR to a task. There
-are two ways to give it storage, and they differ only in where the item buffer
-comes from. Everything else, including every send and receive call, is the same.
+A queue copies fixed-size items between tasks, or from an ISR to a task. The
+macro that declares it decides where its item buffer comes from, and that is the
+only difference between the two kinds. Everything else, including every send and
+receive call, is the same.
 
-**Static, when the size is known at compile time.** `OS_QUEUE_DEFINE` declares
-the queue and its buffer together, and `OS_QUEUE_INIT` initializes it:
+| | static | dynamic |
+|---|---|---|
+| declare | `OS_QUEUE_DEFINE_STATIC(name, type, item_count)` | `OS_QUEUE_DEFINE_DYNAMIC(name)` |
+| set up | nothing to call | `os_queue_init_dynamic(&name, item_size, cap)` |
+| tear down | `os_queue_cleanup(&name)` | `os_queue_cleanup(&name)` |
+| needs | nothing | `OS_CONFIG_ALLOC_ENABLE` |
+
+**Static, when the size is known at compile time.** `OS_QUEUE_DEFINE_STATIC`
+declares the queue and its buffer together *and* initializes them, so the queue
+is usable where it stands:
 
 ```c
 typedef struct { uint32_t id; uint8_t payload[6]; } sample_t;
 
-OS_QUEUE_DEFINE(sensor_q, sample_t, 8);   /* file scope: both objects are static */
+OS_QUEUE_DEFINE_STATIC(sensor_q, sample_t, 8);   /* file scope: both objects are static */
 
-os_status status = OS_QUEUE_INIT(sensor_q);
-os_queue_send(&sensor_q, &sample, 10U);
+os_queue_send(&sensor_q, &sample, 10U);          /* no init call, nothing to check */
 ```
 
-The buffer is declared as `sensor_q_BUFFER`, and nothing outside `OS_QUEUE_INIT`
-should touch it. The reason to prefer this pair over calling `os_queue_init`
-by hand is that the item size and capacity are **derived from the array**, so
-they cannot disagree with the storage that actually exists. Passing
-`os_queue_init` an `item_size` or `capacity` that does not match the buffer is
-otherwise easy to do and silently reads or writes past the end of it.
+There is deliberately no init call to pair it with. The item size and capacity
+come from the declaration itself, so they cannot disagree with the storage that
+actually exists — handing a queue a capacity larger than its buffer is otherwise
+easy to do and silently reads or writes past the end of it. The buffer is
+declared as `sensor_q_BUFFER` and should never be named by hand.
 
-**Dynamic, when the size is only known at run time.** `os_queue_create`
-allocates the item buffer from the kernel heap, so it needs
-`OS_CONFIG_ALLOC_ENABLE`:
+Everything the macro leaves out of the initializer — head, tail, count, the
+waiter lists — is zero-initialized under the C rules for static storage, which
+is byte-for-byte the state an init call would have written. The cost is that the
+queue object lands in `.data` rather than `.bss`, so its initializer image
+occupies flash.
+
+**Dynamic, when the size is only known at run time.** `OS_QUEUE_DEFINE_DYNAMIC`
+declares just the object; `os_queue_init_dynamic` allocates the item buffer from
+the kernel heap and initializes the queue over it:
 
 ```c
-static os_queue_t rx_q;   /* the handle is still yours; only the buffer is allocated */
+OS_QUEUE_DEFINE_DYNAMIC(rx_q);   /* the object is still yours; only the buffer is allocated */
 
-os_status status = os_queue_create(&rx_q, item_size, capacity);
+os_status status = os_queue_init_dynamic(&rx_q, item_size, capacity);
 ...
-os_queue_delete(&rx_q);   /* returns the buffer to the heap */
+os_queue_cleanup(&rx_q);         /* returns the buffer to the heap */
 ```
 
-Keeping the handle out of the allocation means its lifetime stays obvious and a
-failed create leaves nothing to clean up. `os_queue_create` returns
+Keeping the queue object out of the allocation means its lifetime stays obvious
+and a failed call leaves nothing to clean up. `os_queue_init_dynamic` returns
 `OS_STATUS_NO_MEMORY` when the heap cannot satisfy the request, and
 `OS_STATUS_INVALID_ARG` for a zero or overflowing geometry rather than wrapping
 it into a small allocation that later sends would index past.
 
-`os_queue_delete` also accepts a statically defined queue and simply resets it,
-freeing only a buffer that `os_queue_create` allocated, so code tearing down a
-mixed set of queues does not need to track which kind each one is. It returns
-`OS_STATUS_BUSY` while any task is still blocked on the queue: freeing
-underneath waiters would leave them parked on list nodes inside memory the heap
-can hand out again. Drain the queue and let the waiters time out first.
+**Storage you lay out yourself.** For a buffer the two macros cannot express — a
+named linker section, DMA-capable RAM, a slice of an application pool — declare
+it by hand and call `os_queue_init_buffer(&q, buffer, item_size, capacity)`.
+Nothing is derived here, so the geometry must match the buffer exactly; prefer
+`OS_QUEUE_DEFINE_STATIC` wherever ordinary static storage will do.
+
+**Teardown is the same call for every kind.** `os_queue_cleanup` empties the
+queue, and what happens to the storage depends on who owns it, so code tearing
+down a mixed set of queues does not need to track which kind each one is:
+
+- A buffer from `os_queue_init_dynamic` goes back to the heap, and the geometry
+  goes with it. Re-use means another `os_queue_init_dynamic`.
+- A buffer from `OS_QUEUE_DEFINE_STATIC` or `os_queue_init_buffer` is not the
+  kernel's to release, so the queue keeps its storage and is left empty and
+  immediately usable — a statically defined queue needs no init call after
+  cleanup either, exactly as it needed none before.
+
+It is not compiled out with the heap, and returns `OS_STATUS_BUSY` while any
+task is still blocked on the queue, because freeing underneath waiters would
+leave them parked on list nodes inside memory the heap can hand out again. Drain
+the queue and let the waiters time out first.
 
 ### Atomics
 
@@ -410,12 +438,30 @@ Two rules worth stating outright:
   value changed. Loop if you only care about the final state; re-read the value
   if you need to know which happened.
 
-**Cost depends on the core.** On ARMv7-M and ARMv8-M these compile to an
-`LDREX`/`STREX` pair and are genuinely lock-free, never masking interrupts.
-ARMv6-M (Cortex-M0, M0+) has no exclusive instructions, so the port briefly
-disables interrupts instead, and on a multi-core build takes a spinlock as well.
-That is worth knowing before putting one in an ARMv6-M interrupt-latency budget.
-All of them are safe to call from tasks and from ISRs.
+**Cost depends on the core**, because the whole operation set is part of the
+port (`arch/arm/common/os_arch_atomic.c`) rather than something portable code
+builds out of one primitive. Which backend a build gets follows the core's
+instruction set, not a configuration option:
+
+| Backend | Cores | Cost |
+|---|---|---|
+| `LDREX`/`STREX`, retried until the store sticks | ARMv7-M, ARMv7E-M, ARMv8-M baseline and mainline (Cortex-M3, M4, M7, M23, M33, M35P, M52, M55, M85) | Lock-free; interrupts stay enabled |
+| `os_critical_enter` / `os_critical_exit` around the update | ARMv6-M (Cortex-M0, M0+, M1) | Adds the update's length to interrupt latency, and can wait on unrelated kernel work on multi-core builds |
+
+The second row exists because those cores have no instruction that can *detect*
+interference, so it has to be prevented instead. Worth knowing before putting an
+atomic in an ARMv6-M interrupt-latency budget. Note that Cortex-M23 is ARMv8-M
+baseline and *does* have exclusives, so it gets the lock-free backend even
+though it shares the rest of its port with ARMv6-M. All of them are safe to call
+from tasks and from ISRs.
+
+Inside the port the split is three layers, each written once: a pure
+`os_arch_atomic_compute()` that says what the new value is, an
+`os_arch_atomic_apply()` per backend that says how it is made indivisible, and
+one-line public operations. Portable code above the port only composes those —
+incrementing is an add of 1, clearing a bit is an AND with its complement — so a
+new port implements nine operations and gets the full API, with no behaviour
+able to drift between cores.
 
 ### Work queue
 
@@ -716,6 +762,12 @@ Config options: `OS_CONFIG_TICKLESS_ENABLE` (default 0),
 `OS_CONFIG_TICKLESS_MIN_IDLE` (the shortest idle worth sleeping for), and
 `OS_CONFIG_MAX_SUPPRESSED_TICKS`.
 
+The whole group compiles away with the option, like every other feature in PART
+2 of `ahura.h`: with `OS_CONFIG_TICKLESS_ENABLE` at 0 the three control
+functions are neither declared nor defined, so calling one is a compile error
+naming it rather than a call that silently does nothing. Guard your own call
+sites the same way the self-test suite does if they must build both ways.
+
 Two application callbacks bracket the sleep window, with prototypes in
 `ahura.h`. Both are **mandatory** whenever `OS_CONFIG_TICKLESS_ENABLE` is 1: the
 kernel declares them and defines neither, so a missing one is a link error
@@ -864,7 +916,7 @@ The per-subsystem tier:
 
 | Test | Invariant it enforces |
 |---|---|
-| `test_stress_queue_dynamic_churn` | 200 `os_queue_create`/use/`os_queue_delete` cycles, geometry varying each time, leak nothing and corrupt no payload |
+| `test_stress_queue_dynamic_churn` | 200 `os_queue_init_dynamic`/use/`os_queue_cleanup` cycles, geometry varying each time, leak nothing and corrupt no payload |
 | `test_stress_queue_dynamic_concurrent` | 3 producers × 32 items through a heap-allocated queue of capacity 2; every `(producer, sequence)` pair arrives exactly once — a lost send-waiter wakeup is a missing bit, a double delivery an already-set one |
 | `test_stress_heap_fragmentation` | Freeing a block never disturbs a live neighbour; adjacent holes really coalesce; the heap recovers byte-exactly after being driven to exhaustion |
 | `test_stress_semaphore_pingpong` | 1000 round trips (2000 blocking handoffs) through two empty binary semaphores, so every take blocks and every give wakes a waiter — no token is ever already available to mask a lost wakeup |
@@ -905,7 +957,7 @@ HAL headers.
 | `os_main_critical.c` | Critical sections protecting a shared counter |
 | `os_main_mutex.c` | Mutual exclusion with `os_mutex_*` |
 | `os_main_semaphore.c` | Counting semaphore, producer and consumer |
-| `os_main_queue.c` | Message queue, producer and consumer, both static (`OS_QUEUE_DEFINE`) and dynamic (`os_queue_create`) storage |
+| `os_main_queue.c` | Message queue, producer and consumer, both static (`OS_QUEUE_DEFINE_STATIC`) and dynamic (`os_queue_init_dynamic`) storage |
 | `os_main_event.c` | Event group, waiting on multiple bits |
 | `os_main_notify.c` | Task notifications with `os_task_notify_*` |
 | `os_main_timer.c` | One-shot and periodic software timers |

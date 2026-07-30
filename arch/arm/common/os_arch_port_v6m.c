@@ -84,11 +84,6 @@
  * ***********************************************************************************************************
 */
 
-/* Backs os_arch_atomic_cas on this port, which has no exclusives to rely on. Separate from the
- * kernel critical section's lock so an atomic operation never waits on unrelated kernel work.
- * One instance for the whole system, which is why it lives here and not in a header. */
-static os_arch_spinlock_t os_arch_atomic_lock = OS_ARCH_SPINLOCK_INIT;
-
 static uint32_t os_arch_sleep_entry_cycles = 0U;
 static uint32_t os_arch_planned_idle_ticks = 0U;
 static uint32_t os_arch_cycle_accum        = 0U;
@@ -435,42 +430,10 @@ void os_arch_sleep_finish(void)
      * enabled in order to wake at all, so there is nothing to hand back. */
 }
 
-/******************************************************************************************************/
-/**
- * @brief Atomic compare-and-swap. See os_arch_port_common.h.
- *
- * ARMv6-M has no LDREX/STREX, so atomicity is bought by excluding everyone else for the handful
- * of instructions the update takes: interrupts are masked, and on a multi-core build the kernel
- * spinlock keeps the other cores out as well. That makes this the one port where an atomic
- * operation costs interrupt latency, which is worth knowing before putting one in a hot path.
- *
- * Never fails spuriously, unlike the exclusives-based ports, but callers still loop because the
- * portable contract allows it.
- *
- * @param[in,out] target    Word to update.
- * @param[in]     expected  Value the caller believes target holds.
- * @param[in]     desired   Value to store if it still does.
- * @return bool  true if desired was stored.
- */
-bool os_arch_atomic_cas(__IO int32_t *target, int32_t expected, int32_t desired)
-{
-    bool     swapped = false;
-    uint32_t mask_state;
-
-    mask_state = os_arch_kernel_mask_save();
-    os_arch_spinlock_acquire(&os_arch_atomic_lock);
-
-    if (*target == expected)
-    {
-        *target = desired;
-        swapped = true;
-    }
-
-    os_arch_spinlock_release(&os_arch_atomic_lock);
-    os_arch_kernel_mask_restore(mask_state);
-
-    return swapped;
-}
+/* Every os_arch_atomic_* operation, shared by all three ARM ports. Which backend it compiles to -
+ * LDREX/STREX or a critical section - follows OS_ARCH_HAS_EXCLUSIVES, so a Cortex-M23 built
+ * through this file gets the lock-free one even though its ARMv6-M siblings cannot. */
+#include "os_arch_atomic.c"
 
 /******************************************************************************************************/
 /**

@@ -211,7 +211,7 @@
 */
 
 /* Kernel heap (os_mem_alloc/os_mem_free): first-fit allocator with coalescing over a
- * static heap of OS_CONFIG_HEAP_SIZE bytes. Also what os_queue_create allocates from. */
+ * static heap of OS_CONFIG_HEAP_SIZE bytes. Also what os_queue_init_dynamic allocates from. */
 #define OS_CONFIG_ALLOC_ENABLE              1U
 #define OS_CONFIG_HEAP_SIZE                 4096U
 

@@ -193,6 +193,8 @@ uint32_t os_cpu_usage_get(void)
 }
 #endif /* OS_CONFIG_CPU_USAGE_ENABLE */
 
+#if (OS_CONFIG_TICKLESS_ENABLE == 1U)
+
 /******************************************************************************************************/
 /**
  * @brief Get expected idle ticks for tickless decision.
@@ -201,11 +203,10 @@ uint32_t os_cpu_usage_get(void)
  * finite-delay task sleeper, and OS_CONFIG_MAX_SUPPRESSED_TICKS - the suppressed window
  * must not overrun any of them. Also public (ahura.h) for diagnostics and tests.
  *
- * @return uint32_t  Expected idle duration in ticks, 0 when OS_CONFIG_TICKLESS_ENABLE is 0.
+ * @return uint32_t  Expected idle duration in ticks.
  */
 uint32_t os_tickless_expected_idle_ticks_get(void)
 {
-#if (OS_CONFIG_TICKLESS_ENABLE == 1U)
     /* The suppressed-tick window must not overrun ANY kernel time source:
      * the earliest software timer expiry, the earliest delayed work item,
      * and the earliest finite-delay task sleeper all bound it. */
@@ -235,9 +236,6 @@ uint32_t os_tickless_expected_idle_ticks_get(void)
     }
 
     return idle_ticks;
-#else
-    return 0U;
-#endif
 }
 
 /******************************************************************************************************/
@@ -249,17 +247,12 @@ uint32_t os_tickless_expected_idle_ticks_get(void)
  * across platforms and clock speeds (tests, demos) derive their sleep horizon from this
  * instead of assuming any particular tick count.
  *
- * @return uint32_t  Maximum suppressible ticks; 0 when OS_CONFIG_TICKLESS_ENABLE is 0 or the
- *                    active port does not yet suppress ticking for real (see README
- *                    "Tickless idle" for which ports currently do).
+ * @return uint32_t  Maximum suppressible ticks; 0 when the active port does not yet suppress
+ *                    ticking for real (see README "Tickless idle" for which ports currently do).
  */
 uint32_t os_tickless_max_suppressed_ticks_get(void)
 {
-#if (OS_CONFIG_TICKLESS_ENABLE == 1U)
     return os_arch_max_suppressed_ticks_get();
-#else
-    return 0U;
-#endif
 }
 
 /******************************************************************************************************/
@@ -269,13 +262,12 @@ uint32_t os_tickless_max_suppressed_ticks_get(void)
  * Suppresses ticking for the planned idle duration, sleeps, then announces the real elapsed
  * time on wake. Not yet called by the idle task (see the README "Tickless idle" section) -
  * public in ahura.h so it can be exercised directly (e.g. by the self-test suite) ahead of
- * that wiring. A no-op when OS_CONFIG_TICKLESS_ENABLE is 0.
+ * that wiring.
  *
  * @return None.
  */
 void os_tickless_idle_process(void)
 {
-#if (OS_CONFIG_TICKLESS_ENABLE == 1U)
     uint32_t mask_state;
     uint32_t planned_idle_ticks;
     uint32_t elapsed_ticks = 0U;
@@ -346,7 +338,6 @@ void os_tickless_idle_process(void)
      * this one, and both are save/restore rather than unconditional enables, so the interrupt
      * state the idle task arrived with is what it leaves with. */
     os_arch_kernel_mask_restore(mask_state);
-#endif
 }
 
 /* os_tickless_pre_sleep_cb() and os_tickless_post_sleep_cb() are deliberately NOT defined here.
@@ -360,3 +351,5 @@ void os_tickless_idle_process(void)
  *
  * Write them in the application's callback file (see os_cb_template.c) whenever tickless idle is
  * enabled. */
+
+#endif /* OS_CONFIG_TICKLESS_ENABLE */

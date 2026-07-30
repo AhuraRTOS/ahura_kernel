@@ -1270,12 +1270,12 @@ typedef struct
 
 } test_queue_item_t;
 
-OS_QUEUE_DEFINE(g_defined_queue, test_queue_item_t, 4);
+OS_QUEUE_DEFINE_STATIC(g_defined_queue, test_queue_item_t, 4);
 
 /******************************************************************************************************/
 /**
- * @brief Covers both ways of getting a queue: OS_QUEUE_DEFINE static storage, and os_queue_create
- *        heap storage, including that delete frees one and not the other.
+ * @brief Covers both ways of getting a queue: OS_QUEUE_DEFINE_STATIC static storage, and
+ *        os_queue_init_dynamic heap storage, including that cleanup frees one and not the other.
  */
 static void test_queue_define_and_dynamic(void)
 {
@@ -1289,50 +1289,54 @@ static void test_queue_define_and_dynamic(void)
 
     test_print_section("Queue Definition (static macro and dynamic allocation)");
 
-    /* --- OS_QUEUE_DEFINE + OS_QUEUE_INIT --- */
+    /* --- OS_QUEUE_DEFINE_STATIC --- */
 
     AHURA_TEST_CHECK(sizeof(g_defined_queue_BUFFER) == (4U * sizeof(test_queue_item_t)),
-                      "OS_QUEUE_DEFINE() sized the buffer for 4 items of the declared type (%u bytes)",
+                      "OS_QUEUE_DEFINE_STATIC() sized the buffer for 4 items of the declared type (%u bytes)",
                       (unsigned)sizeof(g_defined_queue_BUFFER));
 
-    AHURA_TEST_CHECK(OS_QUEUE_INIT(g_defined_queue) == OS_STATUS_OK,
-                      "OS_QUEUE_INIT() initializes the queue declared by OS_QUEUE_DEFINE()");
-
-    /* The geometry the macro derived has to match the declaration, since getting either wrong is
-     * exactly the out-of-bounds bug the macro pair exists to make impossible. */
+    /* Nothing has been called on this queue: every field below was written by the macro at compile
+     * time. The geometry has to match the declaration, since getting either wrong is exactly the
+     * out-of-bounds bug that deriving it from the declaration exists to make impossible. */
     AHURA_TEST_CHECK(g_defined_queue.item_size == sizeof(test_queue_item_t),
-                      "the derived item size matches the declared type (%u bytes)",
+                      "the item size comes from the declared type with no init call (%u bytes)",
                       (unsigned)g_defined_queue.item_size);
     AHURA_TEST_CHECK(g_defined_queue.capacity == 4U,
-                      "the derived capacity matches the declared count (%u)",
+                      "the capacity comes from the declared count (%u)",
                       (unsigned)g_defined_queue.capacity);
     AHURA_TEST_CHECK(g_defined_queue.buffer == (uint8_t *)g_defined_queue_BUFFER,
                       "the queue points at the buffer the macro declared");
+    AHURA_TEST_CHECK((g_defined_queue.count == 0U) && (g_defined_queue.head == 0U) &&
+                      (g_defined_queue.tail == 0U) && !g_defined_queue.buffer_owned &&
+                      (g_defined_queue.send_waiters.head == NULL) &&
+                      (g_defined_queue.receive_waiters.head == NULL),
+                      "and starts empty with empty waiter lists, owning nothing");
 
     sent.id         = 0xA5A5A5A5UL;
     sent.payload[0] = 0x11U;
     sent.payload[5] = 0x99U;
 
     AHURA_TEST_CHECK(os_queue_send(&g_defined_queue, &sent, OS_WAIT_NOTHING) == OS_STATUS_OK,
-                      "a struct item goes into the statically defined queue");
+                      "a struct item goes into the statically defined queue, still with no init call");
     AHURA_TEST_CHECK(os_queue_receive(&g_defined_queue, &got, OS_WAIT_NOTHING) == OS_STATUS_OK,
                       "and comes back out");
     AHURA_TEST_CHECK((got.id == sent.id) && (got.payload[0] == 0x11U) && (got.payload[5] == 0x99U),
                       "the whole struct survived the round trip intact");
 
-    /* --- os_queue_create / os_queue_delete --- */
+    /* --- os_queue_init_dynamic / os_queue_cleanup --- */
 
 #if (OS_CONFIG_ALLOC_ENABLE == 1U)
     heap_before = os_mem_free_get();
 
-    status = os_queue_create(&dynamic, sizeof(uint32_t), 8U);
-    AHURA_TEST_CHECK(status == OS_STATUS_OK, "os_queue_create() allocates an 8-slot uint32 queue");
+    status = os_queue_init_dynamic(&dynamic, sizeof(uint32_t), 8U);
+    AHURA_TEST_CHECK(status == OS_STATUS_OK,
+                      "os_queue_init_dynamic() allocates an 8-slot uint32 queue");
 
     /* Ownership has to be true the moment the queue is usable, not a moment later: it is what
-     * tells os_queue_delete the buffer came from the heap. A create that published the queue
-     * before claiming ownership would leak that buffer to any delete landing in between. */
+     * tells os_queue_cleanup the buffer came from the heap. A call that published the queue
+     * before claiming ownership would leak that buffer to any cleanup landing in between. */
     AHURA_TEST_CHECK(dynamic.buffer_owned,
-                      "a created queue owns its buffer as soon as it is usable");
+                      "an allocated queue owns its buffer as soon as it is usable");
     AHURA_TEST_CHECK(!g_defined_queue.buffer_owned,
                       "a statically defined queue never claims ownership of its buffer");
 
@@ -1349,46 +1353,68 @@ static void test_queue_define_and_dynamic(void)
                       "the dynamic queue returns it");
     AHURA_TEST_CHECK(value == 0xDEADBEEFUL, "with the value intact (0x%08lX)", (unsigned long)value);
 
-    AHURA_TEST_CHECK(os_queue_delete(&dynamic) == OS_STATUS_OK, "os_queue_delete() tears it down");
+    AHURA_TEST_CHECK(os_queue_cleanup(&dynamic) == OS_STATUS_OK, "os_queue_cleanup() tears it down");
     AHURA_TEST_CHECK(os_mem_free_get() == heap_before,
                       "and returned every byte it took to the heap (%u bytes free)",
                       (unsigned)os_mem_free_get());
-    AHURA_TEST_CHECK(dynamic.buffer == NULL, "the deleted queue no longer points at freed memory");
+    AHURA_TEST_CHECK(dynamic.buffer == NULL, "the torn-down queue no longer points at freed memory");
 
     /* A zero or overflowing geometry must be refused rather than wrapped into a small allocation
      * that every later send would index past. */
-    AHURA_TEST_CHECK(os_queue_create(&dynamic, 0U, 4U) == OS_STATUS_INVALID_ARG,
-                      "os_queue_create() rejects a zero item size");
-    AHURA_TEST_CHECK(os_queue_create(&dynamic, 4U, 0U) == OS_STATUS_INVALID_ARG,
-                      "os_queue_create() rejects a zero capacity");
-    AHURA_TEST_CHECK(os_queue_create(&dynamic, SIZE_MAX / 2U, 4U) == OS_STATUS_INVALID_ARG,
-                      "os_queue_create() rejects a geometry whose byte count would overflow");
+    AHURA_TEST_CHECK(os_queue_init_dynamic(&dynamic, 0U, 4U) == OS_STATUS_INVALID_ARG,
+                      "os_queue_init_dynamic() rejects a zero item size");
+    AHURA_TEST_CHECK(os_queue_init_dynamic(&dynamic, 4U, 0U) == OS_STATUS_INVALID_ARG,
+                      "os_queue_init_dynamic() rejects a zero capacity");
+    AHURA_TEST_CHECK(os_queue_init_dynamic(&dynamic, SIZE_MAX / 2U, 4U) == OS_STATUS_INVALID_ARG,
+                      "os_queue_init_dynamic() rejects a geometry whose byte count would overflow");
 
     /* A geometry that is valid but larger than the whole heap has to come back as NO_MEMORY, so a
      * caller can tell "ask for less" apart from "that request was nonsense". */
-    AHURA_TEST_CHECK(os_queue_create(&dynamic, 1U, OS_CONFIG_HEAP_SIZE * 2U) == OS_STATUS_NO_MEMORY,
-                      "os_queue_create() reports NO_MEMORY when the heap cannot cover the request");
+    AHURA_TEST_CHECK(os_queue_init_dynamic(&dynamic, 1U, OS_CONFIG_HEAP_SIZE * 2U) == OS_STATUS_NO_MEMORY,
+                      "os_queue_init_dynamic() reports NO_MEMORY when the heap cannot cover the request");
 
     AHURA_TEST_CHECK(os_mem_free_get() == heap_before,
                       "and none of those rejections leaked heap");
-
-    /* Deleting a statically defined queue is allowed and must NOT hand its storage to the heap. */
-    heap_before = os_mem_free_get();
-    AHURA_TEST_CHECK(os_queue_delete(&g_defined_queue) == OS_STATUS_OK,
-                      "os_queue_delete() also accepts a statically defined queue");
-    AHURA_TEST_CHECK(os_mem_free_get() == heap_before,
-                      "and did not free the static buffer into the kernel heap");
-
-    /* Leave it usable for anything that runs later. */
-    (void)OS_QUEUE_INIT(g_defined_queue);
 #else
     (void)dynamic;
     (void)value;
-    (void)heap_before;
     (void)heap_after;
     (void)status;
-    printf("  [SKIP] os_queue_create()/os_queue_delete() require OS_CONFIG_ALLOC_ENABLE=1\r\n");
+    printf("  [SKIP] os_queue_init_dynamic() requires OS_CONFIG_ALLOC_ENABLE=1\r\n");
 #endif /* OS_CONFIG_ALLOC_ENABLE */
+
+    /* --- os_queue_cleanup on static storage (no heap involved) --- */
+
+    /* Tearing down a statically defined queue is allowed on every build, heapless included, and
+     * must never hand the buffer the application declared to the kernel heap. Because there is
+     * nothing to release, the queue keeps its storage and stays usable - the same promise the
+     * macro makes at declaration: a static queue never needs an init call. */
+    sent.id = 0x5A5A5A5AUL;
+    (void)os_queue_send(&g_defined_queue, &sent, OS_WAIT_NOTHING);
+
+#if (OS_CONFIG_ALLOC_ENABLE == 1U)
+    heap_before = os_mem_free_get();
+#else
+    (void)heap_before;
+#endif
+
+    AHURA_TEST_CHECK(os_queue_cleanup(&g_defined_queue) == OS_STATUS_OK,
+                      "os_queue_cleanup() also accepts a statically defined queue");
+    AHURA_TEST_CHECK(os_queue_count_get(&g_defined_queue) == 0U, "and empties it");
+    AHURA_TEST_CHECK((g_defined_queue.buffer == (uint8_t *)g_defined_queue_BUFFER) &&
+                      (g_defined_queue.item_size == sizeof(test_queue_item_t)) &&
+                      (g_defined_queue.capacity == 4U),
+                      "but keeps the storage it does not own, geometry intact");
+
+#if (OS_CONFIG_ALLOC_ENABLE == 1U)
+    AHURA_TEST_CHECK(os_mem_free_get() == heap_before,
+                      "and did not free the static buffer into the kernel heap");
+#endif
+
+    /* Still usable with nothing called in between, which is the point of keeping the storage. */
+    AHURA_TEST_CHECK(os_queue_send(&g_defined_queue, &sent, OS_WAIT_NOTHING) == OS_STATUS_OK,
+                      "the queue works again straight after cleanup, with no init call");
+    (void)os_queue_receive(&g_defined_queue, &got, OS_WAIT_NOTHING);
 }
 
 static void test_queue(void)
@@ -1404,8 +1430,8 @@ static void test_queue(void)
 
     test_print_section("Queue");
 
-    AHURA_TEST_CHECK(os_queue_init(&g_queue, g_queue_buf, sizeof(uint32_t), 3U) == OS_STATUS_OK,
-                      "os_queue_init() creates a 3-slot uint32 queue");
+    AHURA_TEST_CHECK(os_queue_init_buffer(&g_queue, g_queue_buf, sizeof(uint32_t), 3U) == OS_STATUS_OK,
+                      "os_queue_init_buffer() creates a 3-slot uint32 queue");
     AHURA_TEST_CHECK(os_queue_count_get(&g_queue) == 0U, "a fresh queue reports 0 items");
     AHURA_TEST_CHECK(os_queue_receive(&g_queue, &value, OS_WAIT_NOTHING) == OS_STATUS_EMPTY,
                       "receive on an empty queue with OS_WAIT_NOTHING returns EMPTY");
@@ -2102,7 +2128,7 @@ static void test_pipeline(void)
 
     test_print_section("Combined: Queue + Mutex, 2 producers + 2 consumers");
 
-    AHURA_TEST_CHECK(os_queue_init(&g_queue, g_queue_buf, sizeof(uint32_t), 3U) == OS_STATUS_OK,
+    AHURA_TEST_CHECK(os_queue_init_buffer(&g_queue, g_queue_buf, sizeof(uint32_t), 3U) == OS_STATUS_OK,
                       "pipeline queue initialized (capacity 3, %u items will be produced)",
                       (unsigned)TEST_PIPELINE_TOTAL_ITEMS);
     AHURA_TEST_CHECK(os_mutex_init(&g_pipeline_mutex) == OS_STATUS_OK, "pipeline mutex initialized");
@@ -2450,7 +2476,7 @@ static void test_event_queue_fanin(void)
 
     test_print_section("Combined: Event Group + Queue, fan-out/fan-in across 3 tasks");
 
-    AHURA_TEST_CHECK(os_queue_init(&g_queue, g_queue_buf, sizeof(uint32_t), 3U) == OS_STATUS_OK,
+    AHURA_TEST_CHECK(os_queue_init_buffer(&g_queue, g_queue_buf, sizeof(uint32_t), 3U) == OS_STATUS_OK,
                       "fan-in queue initialized (capacity 3, one slot per worker)");
     AHURA_TEST_CHECK(os_event_group_init(&g_event) == OS_STATUS_OK, "fan-in event group initialized");
 
@@ -2668,7 +2694,7 @@ static void test_stress_soak(void)
                       "stress semaphore initialized (max=%u, deliberately < %u workers)",
                       (unsigned)OS_TEST_STRESS_SEM_MAX, (unsigned)OS_TEST_STRESS_WORKER_COUNT);
     AHURA_TEST_CHECK(os_event_group_init(&g_stress_event) == OS_STATUS_OK, "stress event group initialized");
-    AHURA_TEST_CHECK(os_queue_init(&g_stress_queue, g_stress_queue_buf, sizeof(uint32_t), OS_TEST_STRESS_QUEUE_CAPACITY) == OS_STATUS_OK,
+    AHURA_TEST_CHECK(os_queue_init_buffer(&g_stress_queue, g_stress_queue_buf, sizeof(uint32_t), OS_TEST_STRESS_QUEUE_CAPACITY) == OS_STATUS_OK,
                       "stress queue initialized (capacity=%u, deliberately < %u workers)",
                       (unsigned)OS_TEST_STRESS_QUEUE_CAPACITY, (unsigned)OS_TEST_STRESS_WORKER_COUNT);
 
@@ -3061,7 +3087,7 @@ static void test_stress_queue_dynamic_churn(void)
     bool     data_ok     = true;
     uint32_t i;
 
-    test_print_section("Stress: dynamic queue create/use/delete churn");
+    test_print_section("Stress: dynamic queue alloc/use/cleanup churn");
 
     for (i = 0U; i < OS_TEST_QCHURN_ITERATIONS; i++)
     {
@@ -3075,7 +3101,7 @@ static void test_stress_queue_dynamic_churn(void)
         /* The geometry deliberately changes every cycle. A fixed size would hand back the same
          * hole each time and never exercise splitting or coalescing against differently sized
          * neighbours - the case where an off-by-one in the allocator actually shows up. */
-        if (os_queue_create(&q, item_size, capacity) != OS_STATUS_OK)
+        if (os_queue_init_dynamic(&q, item_size, capacity) != OS_STATUS_OK)
         {
             all_ok = false;
             break;
@@ -3105,7 +3131,7 @@ static void test_stress_queue_dynamic_churn(void)
             if ((item_size > (2U * sizeof(uint32_t))) && (got[2] != sent[2]))       { data_ok = false; }
         }
 
-        if (os_queue_delete(&q) != OS_STATUS_OK) { all_ok = false; }
+        if (os_queue_cleanup(&q) != OS_STATUS_OK) { all_ok = false; }
 
         if (!all_ok) { break; }
 
@@ -3134,7 +3160,7 @@ typedef struct
 } test_qprod_ctx_t;
 
 static test_qprod_ctx_t g_qprod_ctx[OS_TEST_QPROD_COUNT];
-static os_queue_t       g_qprod_queue;
+OS_QUEUE_DEFINE_DYNAMIC(g_qprod_queue);
 static __IO uint32_t    g_qprod_sent[OS_TEST_QPROD_COUNT];
 
 /******************************************************************************************************/
@@ -3178,7 +3204,7 @@ static void test_stress_queue_dynamic_concurrent(void)
 
     heap_before = os_mem_free_get();
 
-    AHURA_TEST_CHECK(os_queue_create(&g_qprod_queue, sizeof(uint32_t), 2U) == OS_STATUS_OK,
+    AHURA_TEST_CHECK(os_queue_init_dynamic(&g_qprod_queue, sizeof(uint32_t), 2U) == OS_STATUS_OK,
                       "dynamic queue created (capacity 2, deliberately < %u producers)",
                       (unsigned)OS_TEST_QPROD_COUNT);
 
@@ -3240,7 +3266,7 @@ static void test_stress_queue_dynamic_concurrent(void)
                       (unsigned)OS_TEST_QPROD_ITEMS);
 
     AHURA_TEST_CHECK(os_queue_count_get(&g_qprod_queue) == 0U, "the queue ended empty");
-    AHURA_TEST_CHECK(os_queue_delete(&g_qprod_queue) == OS_STATUS_OK, "the dynamic queue deletes cleanly");
+    AHURA_TEST_CHECK(os_queue_cleanup(&g_qprod_queue) == OS_STATUS_OK, "the dynamic queue tears down cleanly");
     AHURA_TEST_CHECK(os_mem_free_get() == heap_before, "and returned its buffer to the heap");
 }
 #endif /* OS_CONFIG_QUEUE_ENABLE && OS_CONFIG_ALLOC_ENABLE */
@@ -4349,7 +4375,7 @@ static void test_benchmarks(void)
 #endif
 
 #if (OS_CONFIG_QUEUE_ENABLE == 1U)
-    if (os_queue_init(&g_bench_queue, g_bench_queue_buf, sizeof(g_bench_queue_buf[0]),
+    if (os_queue_init_buffer(&g_bench_queue, g_bench_queue_buf, sizeof(g_bench_queue_buf[0]),
                        sizeof(g_bench_queue_buf) / sizeof(g_bench_queue_buf[0])) == OS_STATUS_OK)
     {
         uint32_t item = 0x5A5A5A5AUL;
