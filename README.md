@@ -439,29 +439,32 @@ Two rules worth stating outright:
   if you need to know which happened.
 
 **Cost depends on the core**, because the whole operation set is part of the
-port (`arch/arm/common/os_arch_atomic.c`) rather than something portable code
-builds out of one primitive. Which backend a build gets follows the core's
-instruction set, not a configuration option:
+port rather than something portable code builds out of one primitive. Each port
+implements all nine operations in whichever way its instruction set allows:
 
-| Backend | Cores | Cost |
-|---|---|---|
-| `LDREX`/`STREX`, retried until the store sticks | ARMv7-M, ARMv7E-M, ARMv8-M baseline and mainline (Cortex-M3, M4, M7, M23, M33, M35P, M52, M55, M85) | Lock-free; interrupts stay enabled |
-| `os_critical_enter` / `os_critical_exit` around the update | ARMv6-M (Cortex-M0, M0+, M1) | Adds the update's length to interrupt latency, and can wait on unrelated kernel work on multi-core builds |
+| Port | Cores | How | Cost |
+|---|---|---|---|
+| `os_arch_port_v7m.c`, `os_arch_port_v8m.c` | Cortex-M3, M4, M7, M33, M35P, M52, M55, M85 | One `LDREX`/`STREX` retry loop per operation, each a single asm block | Lock-free; interrupts stay enabled |
+| `os_arch_port_v6m.c` | Cortex-M0, M0+, M1, M23 | Each operation inside `os_critical_enter`/`os_critical_exit` | Adds the update's length to interrupt latency, and can wait on unrelated kernel work on multi-core builds |
 
-The second row exists because those cores have no instruction that can *detect*
-interference, so it has to be prevented instead. Worth knowing before putting an
-atomic in an ARMv6-M interrupt-latency budget. Note that Cortex-M23 is ARMv8-M
-baseline and *does* have exclusives, so it gets the lock-free backend even
-though it shares the rest of its port with ARMv6-M. All of them are safe to call
-from tasks and from ISRs.
+The second row exists because ARMv6-M has no instruction that can *detect*
+interference mid-update, so it has to be prevented instead. Worth knowing before
+putting an atomic in an ARMv6-M interrupt-latency budget. All of them are safe
+to call from tasks and from ISRs.
 
-Inside the port the split is three layers, each written once: a pure
-`os_arch_atomic_compute()` that says what the new value is, an
-`os_arch_atomic_apply()` per backend that says how it is made indivisible, and
-one-line public operations. Portable code above the port only composes those —
-incrementing is an add of 1, clearing a bit is an AND with its complement — so a
-new port implements nine operations and gets the full API, with no behaviour
-able to drift between cores.
+Writing each operation out per port, instead of sharing one implementation
+behind a selector, is what keeps the emitted code to the five instructions the
+sequence actually is — at `-O0` as well as `-O2`, with nothing needing to fold
+away first — and keeps compiler-generated stack traffic from ever landing
+between an `LDREX` and its `STREX`.
+
+Portable code above the port only composes these: incrementing is an add of 1,
+clearing a bit is an AND with its complement. So a new port implements nine
+operations and gets the full API, with no behaviour able to drift between cores.
+
+> Cortex-M23 is ARMv8-M *baseline*: it has `LDREX`/`STREX`, but it reaches
+> `os_arch_port_v6m.c` for its Thumb-1-compatible context switch and so runs the
+> critical-section atomics today. Correct, just not as fast as that core allows.
 
 ### Work queue
 

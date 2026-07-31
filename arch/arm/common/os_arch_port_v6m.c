@@ -430,10 +430,223 @@ void os_arch_sleep_finish(void)
      * enabled in order to wake at all, so there is nothing to hand back. */
 }
 
-/* Every os_arch_atomic_* operation, shared by all three ARM ports. Which backend it compiles to -
- * LDREX/STREX or a critical section - follows OS_ARCH_HAS_EXCLUSIVES, so a Cortex-M23 built
- * through this file gets the lock-free one even though its ARMv6-M siblings cannot. */
-#include "os_arch_atomic.c"
+#if (OS_CONFIG_ATOMIC_ENABLE == 1U)
+
+/*
+ * ***********************************************************************************************************
+ * Atomics
+ * ***********************************************************************************************************
+ *
+ * ARMv6-M has no LDREX/STREX, so there is no way to DETECT that something else touched the word
+ * mid-update - it has to be PREVENTED. Each operation runs inside os_critical_enter/exit, which
+ * masks this core's kernel interrupts and, on a multi-core build, locks out the other cores.
+ *
+ * Two consequences worth knowing before putting an atomic in a hot path here. It adds the length
+ * of the update to interrupt latency, unlike the exclusives ports where interrupts stay enabled
+ * throughout. And on a multi-core build it can wait on unrelated kernel work holding the same
+ * lock - reusing the kernel's critical section rather than a second private lock is deliberate,
+ * since two independent locks over the same data is how lock-ordering bugs start.
+ *
+ * No retry loop and no second read, unlike the exclusives ports: nothing can interfere while the
+ * section is held, so the value read is still the value in memory when it is written back.
+ *
+ * ADD and SUB compute in the unsigned domain and convert back. Signed overflow is undefined
+ * behaviour the moment a counter runs past INT32_MAX - not merely a negative-looking result, but
+ * licence for the compiler to assume it cannot happen and optimise accordingly. Unsigned
+ * arithmetic wraps with defined behaviour, and the conversion back reproduces the same
+ * two's-complement bit pattern the hardware would have stored anyway.
+ *
+ * Every operation returns the value the word held BEFORE it ran.
+ *
+ * Note for Cortex-M23: ARMv8-M baseline reaches this file for its Thumb-1-compatible context
+ * switch, but unlike ARMv6-M it DOES have LDREX/STREX, so it runs these under a critical section
+ * when it could be lock-free. See os_arch_port_v7m.c for the exclusives form.
+*/
+
+/******************************************************************************************************/
+/**
+ * @brief Atomic store. See os_arch_port_common.h.
+ *
+ * @param[in,out] target  Word to update.
+ * @param[in]     value   Value to store.
+ * @return int32_t  Value held before the store.
+ */
+int32_t os_arch_atomic_exchange(__IO int32_t *target, int32_t value)
+{
+    int32_t current;
+
+    os_critical_enter();
+
+    current = *target;
+    *target = value;
+
+    os_critical_exit();
+
+    return current;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Atomic add. See os_arch_port_common.h.
+ *
+ * @param[in,out] target  Word to update.
+ * @param[in]     value   Amount to add.
+ * @return int32_t  Value held before the addition.
+ */
+int32_t os_arch_atomic_add(__IO int32_t *target, int32_t value)
+{
+    int32_t current;
+
+    os_critical_enter();
+
+    current = *target;
+    *target = (int32_t)((uint32_t)current + (uint32_t)value);
+
+    os_critical_exit();
+
+    return current;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Atomic subtract. See os_arch_port_common.h.
+ *
+ * @param[in,out] target  Word to update.
+ * @param[in]     value   Amount to subtract.
+ * @return int32_t  Value held before the subtraction.
+ */
+int32_t os_arch_atomic_sub(__IO int32_t *target, int32_t value)
+{
+    int32_t current;
+
+    os_critical_enter();
+
+    current = *target;
+    *target = (int32_t)((uint32_t)current - (uint32_t)value);
+
+    os_critical_exit();
+
+    return current;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Atomic bitwise OR. See os_arch_port_common.h.
+ *
+ * @param[in,out] target  Word to update.
+ * @param[in]     value   Bits to set.
+ * @return int32_t  Value held before the operation.
+ */
+int32_t os_arch_atomic_or(__IO int32_t *target, int32_t value)
+{
+    int32_t current;
+
+    os_critical_enter();
+
+    current = *target;
+    *target = current | value;
+
+    os_critical_exit();
+
+    return current;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Atomic bitwise AND. See os_arch_port_common.h.
+ *
+ * @param[in,out] target  Word to update.
+ * @param[in]     value   Mask to keep.
+ * @return int32_t  Value held before the operation.
+ */
+int32_t os_arch_atomic_and(__IO int32_t *target, int32_t value)
+{
+    int32_t current;
+
+    os_critical_enter();
+
+    current = *target;
+    *target = current & value;
+
+    os_critical_exit();
+
+    return current;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Atomic bitwise XOR. See os_arch_port_common.h.
+ *
+ * @param[in,out] target  Word to update.
+ * @param[in]     value   Bits to flip.
+ * @return int32_t  Value held before the operation.
+ */
+int32_t os_arch_atomic_xor(__IO int32_t *target, int32_t value)
+{
+    int32_t current;
+
+    os_critical_enter();
+
+    current = *target;
+    *target = current ^ value;
+
+    os_critical_exit();
+
+    return current;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Atomic bitwise NAND. See os_arch_port_common.h.
+ *
+ * @param[in,out] target  Word to update.
+ * @param[in]     value   Operand.
+ * @return int32_t  Value held before the operation.
+ */
+int32_t os_arch_atomic_nand(__IO int32_t *target, int32_t value)
+{
+    int32_t current;
+
+    os_critical_enter();
+
+    current = *target;
+    *target = ~(current & value);
+
+    os_critical_exit();
+
+    return current;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Atomic compare-and-swap. See os_arch_port_common.h.
+ *
+ * Never fails spuriously on this port - nothing could have interfered - but callers still loop,
+ * because the portable contract is written to the weaker guarantee the exclusives ports give.
+ *
+ * @param[in,out] target    Word to update.
+ * @param[in]     expected  Value the caller believes target holds.
+ * @param[in]     desired   Value to store if it still does.
+ * @return bool  true if desired was stored.
+ */
+bool os_arch_atomic_cas(__IO int32_t *target, int32_t expected, int32_t desired)
+{
+    bool swapped = false;
+
+    os_critical_enter();
+
+    if (*target == expected)
+    {
+        *target = desired;
+        swapped = true;
+    }
+
+    os_critical_exit();
+
+    return swapped;
+}
+
+#endif /* OS_CONFIG_ATOMIC_ENABLE */
 
 /******************************************************************************************************/
 /**

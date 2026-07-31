@@ -3,9 +3,9 @@
  * @brief Atomic operations on a single word.
  *
  * Portable half of the atomic API. Nothing here knows how a word is made to update indivisibly -
- * that is the core's business and lives entirely in the port (arch/arm/common/os_arch_atomic.c),
- * which is what lets a core with LDREX/STREX stay lock-free while one without pays interrupt
- * latency instead, with no trace of either choice in this file.
+ * that is the core's business and lives entirely in the port, which is what lets a core with
+ * LDREX/STREX stay lock-free while one without pays interrupt latency instead, with no trace of
+ * either choice in this file.
  *
  * What is left over is genuinely portable: argument validation, and the handful of operations that
  * are just another one under a different name - increment is an add of 1, clearing a bit is an AND

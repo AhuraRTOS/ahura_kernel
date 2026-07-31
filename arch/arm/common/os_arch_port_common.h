@@ -115,22 +115,6 @@ extern "C"
 #endif
 #endif
 
-/* Inlining the compiler may not decline, including at -O0. Reserved for the few places where a
- * call would not merely cost cycles but sit somewhere it must not - between an LDREX and its
- * STREX, where a BL and its stack traffic are exactly the unrelated memory accesses ARM leaves
- * free to clear the exclusive reservation. */
-#ifndef OS_FORCE_INLINE
-#if defined(__ARMCC_VERSION) && (__ARMCC_VERSION >= 6000000)
-#define OS_FORCE_INLINE static inline __attribute__((always_inline))
-#elif defined(__clang__)
-#define OS_FORCE_INLINE static inline __attribute__((always_inline))
-#elif defined(__GNUC__)
-#define OS_FORCE_INLINE static inline __attribute__((always_inline))
-#else
-#define OS_FORCE_INLINE static inline
-#endif
-#endif
-
 /*
  * Architecture capabilities derived from the compiler target: TrustZone (the
  * ARMv8-M Security Extension) and exclusive load/store (LDREX/STREX, absent
@@ -517,13 +501,20 @@ uint32_t os_arch_elapsed_ticks_get(void);
 
 /*
  * ***********************************************************************************************************
- * Atomics (os_arch_atomic.c, included by each shared port implementation)
+ * Atomics
  * ***********************************************************************************************************
  *
  * The complete set the portable os_atomic_* API rests on, rather than one primitive it composes
- * from, because how a word is updated indivisibly is a property of the core: one with exclusives
- * retries an LDREX/STREX pair and never masks anything, while one without has no way to detect
- * interference and must take a critical section instead. OS_ARCH_HAS_EXCLUSIVES selects which.
+ * from, because how a word is updated indivisibly is a property of the core. Each port implements
+ * all of them, in whichever way its instruction set allows:
+ *
+ *   os_arch_port_v7m.c / _v8m.c   One LDREX/STREX retry loop per operation, each a single
+ *                                 inline-assembly block. Lock-free; interrupts stay enabled.
+ *   os_arch_port_v6m.c            No exclusives exist, so each operation runs inside
+ *                                 os_critical_enter/exit instead.
+ *
+ * Written out per port rather than shared behind a selector, so each is the instruction sequence
+ * that core actually wants, at every optimization level, with nothing to fold away first.
  *
  * Every read-modify-write below returns the value the word held BEFORE the operation. All of them
  * take a pointer to a naturally aligned 32-bit word and are safe from tasks and from ISRs.
@@ -539,11 +530,12 @@ void os_critical_exit(void);
 /**
  * @brief Read a word indivisibly.
  *
- * Inline, and here rather than in os_arch_atomic.c, because on every core this port targets a
- * single naturally aligned 32-bit load already is indivisible - so the whole operation is one LDR,
- * and calling across to the port to perform it would cost several times what it does. What the
- * volatile access adds over reading the variable directly is that the compiler may not reuse a
- * value it cached before some other code path changed the word.
+ * The one operation that is identical on every ARM core, so it is inline here instead of written
+ * out in each port: a single naturally aligned 32-bit load is already indivisible everywhere this
+ * port runs. That makes the whole operation one LDR, and calling across to the port to perform it
+ * would cost several times what it does. What the volatile access adds over reading the variable
+ * directly is that the compiler may not reuse a value it cached before some other code path
+ * changed the word.
  */
 static inline int32_t os_arch_atomic_load(const __IO int32_t *target)
 {
