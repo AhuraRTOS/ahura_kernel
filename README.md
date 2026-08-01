@@ -171,11 +171,11 @@ compiles away entirely when its `OS_CONFIG_<FEATURE>_ENABLE` is 0.
 | **Atomics** | `os_atomic_get` · `os_atomic_set` · `os_atomic_add` · `os_atomic_sub` · `os_atomic_inc` · `os_atomic_dec` · `os_atomic_or` · `os_atomic_and` · `os_atomic_xor` · `os_atomic_nand` · `os_atomic_clear` · `os_atomic_cas` · `os_atomic_test_bit` · `os_atomic_set_bit` · `os_atomic_clear_bit` · `os_atomic_test_and_set_bit` · `os_atomic_test_and_clear_bit` · `os_atomic_set_bit_to` |
 | **Mutex** | `os_mutex_init` · `os_mutex_lock` · `os_mutex_try_lock` · `os_mutex_unlock` |
 | **Semaphore** | `os_semaphore_init` · `os_semaphore_give` · `os_semaphore_take` |
-| **Queue** | `OS_QUEUE_DEFINE_STATIC` · `OS_QUEUE_DEFINE_DYNAMIC` · `os_queue_init_dynamic` · `os_queue_init_buffer` · `os_queue_send` · `os_queue_receive` · `os_queue_count_get` · `os_queue_cleanup` |
+| **Queue** | `OS_QUEUE_DEFINE_STATIC` · `OS_QUEUE_DEFINE_BUFFER` · `OS_QUEUE_DEFINE_DYNAMIC` · `os_queue_init_dynamic` · `os_queue_send` · `os_queue_receive` · `os_queue_count_get` · `os_queue_cleanup` |
 | **Event group** | `os_event_group_init` · `os_event_group_set_bits` · `os_event_group_clear_bits` · `os_event_group_wait_bits` |
 | **Task notifications** | `os_task_notify_give` · `os_task_notify_wait` |
-| **Software timers** | `os_timer_init` · `os_timer_start` · `os_timer_stop` |
-| **Work queue** | `os_work_init` · `os_work_submit` · `os_work_cancel` · `os_work_is_pending` |
+| **Software timers** | `os_timer_init` · `os_timer_start` · `os_timer_restart` · `os_timer_pause` · `os_timer_stop` · `os_timer_delete` |
+| **Work queue** | `os_work_submit` |
 | **Kernel heap** | `os_mem_alloc` · `os_mem_free` · `os_mem_free_get` · `os_mem_watermark_get` |
 | **Diagnostics** | `os_task_stack_watermark_get` · `os_cpu_usage_get` |
 | **Debugging** | `OS_ASSERT` · `os_assert_failed_cb` · `OS_LOG_ERROR` / `OS_LOG_WARN` / `OS_LOG_INFO` / `OS_LOG_DEBUG` · `os_log_write` · `os_log_dropped_get` · `os_log_output_cb` |
@@ -183,21 +183,34 @@ compiles away entirely when its `OS_CONFIG_<FEATURE>_ENABLE` is 0.
 | **Tickless idle** | `os_tickless_idle_process` · `os_tickless_expected_idle_ticks_get` · `os_tickless_max_suppressed_ticks_get` |
 | **Application-provided** | `os_main` · `os_test` · `os_tickless_pre_sleep_cb` · `os_tickless_post_sleep_cb` · `os_arch_tz_context_save_cb` · `os_arch_tz_context_restore_cb` · `os_arch_core_id_get_cb` · `os_arch_core_ipi_request_cb` |
 
-Helper macros: `OS_TASK_DEFINE` (stack and handle), `OS_TASK_CONFIG` (task
-parameters), `OS_TICKS_FROM_MS`, `OS_WAIT_NOTHING`, and `OS_WAIT_FOREVER`.
+Helper macros: `OS_TASK_DEFINE` (name, stack and handle), `OS_TASK_CONFIG` (what
+the task does), `OS_TICKS_FROM_MS`, `OS_WAIT_NOTHING`, and `OS_WAIT_FOREVER`.
 
-`OS_TASK_CONFIG` follows the core count. On a single-core build it takes
-`(name, entry, context, priority)`, because there is nothing to place a task on.
-On a multi-core build it takes a fifth `core_affinity` argument, and it is
-required rather than defaulted, so every task states where it may run:
+A task is declared once and created once, and its name appears only in the
+declaration:
 
 ```c
-/* OS_CONFIG_CORE_COUNT == 1 */
-os_task_create(&worker, OS_TASK_CONFIG(worker, worker_entry, NULL, OS_TASK_PRIO_3));
+OS_TASK_DEFINE(worker, 512U);   /* file scope: name, stack, handle */
 
+os_task_create(&worker, OS_TASK_CONFIG(worker_entry, NULL, OS_TASK_PRIO_3));
+os_task_start(&worker);
+```
+
+`OS_TASK_DEFINE` records what the task is called and where its stack lives, and
+binds both to the handle at compile time. `OS_TASK_CONFIG` carries only what the
+task *does* — entry, context, priority — so there is no name to repeat and no
+stack to match up. Giving one task another task's stack is not something the API
+can express.
+
+`OS_TASK_CONFIG` follows the core count. On a single-core build it takes
+`(entry, context, priority)`, because there is nothing to place a task on. On a
+multi-core build it takes a fourth `core_affinity` argument, required rather
+than defaulted, so every task states where it may run:
+
+```c
 /* OS_CONFIG_CORE_COUNT > 1 */
-os_task_create(&worker, OS_TASK_CONFIG(worker, worker_entry, NULL, OS_TASK_PRIO_3,
-                                        OS_TASK_CORE(1) | OS_TASK_CORE(2)));
+os_task_create(&worker, OS_TASK_CONFIG(worker_entry, NULL, OS_TASK_PRIO_3,
+                                       OS_TASK_CORE(1) | OS_TASK_CORE(2)));
 ```
 
 ### Default application task
@@ -335,12 +348,17 @@ macro that declares it decides where its item buffer comes from, and that is the
 only difference between the two kinds. Everything else, including every send and
 receive call, is the same.
 
-| | static | dynamic |
-|---|---|---|
-| declare | `OS_QUEUE_DEFINE_STATIC(name, type, item_count)` | `OS_QUEUE_DEFINE_DYNAMIC(name)` |
-| set up | nothing to call | `os_queue_init_dynamic(&name, item_size, cap)` |
-| tear down | `os_queue_cleanup(&name)` | `os_queue_cleanup(&name)` |
-| needs | nothing | `OS_CONFIG_ALLOC_ENABLE` |
+| | static | your own buffer | dynamic |
+|---|---|---|---|
+| declare | `OS_QUEUE_DEFINE_STATIC(name, type, item_count)` | `OS_QUEUE_DEFINE_BUFFER(name, array)` | `OS_QUEUE_DEFINE_DYNAMIC(name)` |
+| set up | nothing to call | nothing to call | `os_queue_init_dynamic(&name, item_size, cap)` |
+| tear down | `os_queue_cleanup(&name)` | `os_queue_cleanup(&name)` | `os_queue_cleanup(&name)` |
+| needs | nothing | nothing | `OS_CONFIG_ALLOC_ENABLE` |
+
+Only the dynamic kind has an init call, because only it has work that cannot
+happen until run time. Neither of the other two takes an item size or a
+capacity: both are read off the array, so they cannot disagree with the storage
+that actually exists.
 
 **Static, when the size is known at compile time.** `OS_QUEUE_DEFINE_STATIC`
 declares the queue and its buffer together *and* initializes them, so the queue
@@ -384,11 +402,24 @@ and a failed call leaves nothing to clean up. `os_queue_init_dynamic` returns
 `OS_STATUS_INVALID_ARG` for a zero or overflowing geometry rather than wrapping
 it into a small allocation that later sends would index past.
 
-**Storage you lay out yourself.** For a buffer the two macros cannot express — a
-named linker section, DMA-capable RAM, a slice of an application pool — declare
-it by hand and call `os_queue_init_buffer(&q, buffer, item_size, capacity)`.
-Nothing is derived here, so the geometry must match the buffer exactly; prefer
-`OS_QUEUE_DEFINE_STATIC` wherever ordinary static storage will do.
+**Storage you lay out yourself.** For a buffer `OS_QUEUE_DEFINE_STATIC` cannot
+express — a named linker section, DMA-capable RAM, a particular alignment —
+declare the array yourself and bind a queue to it. It is initialized at compile
+time exactly like the static kind, so there is still nothing to call:
+
+```c
+static sample_t dma_area[8] __attribute__((section(".dma_buffers")));
+
+OS_QUEUE_DEFINE_BUFFER(rx_q, dma_area);   /* file scope, ready to use */
+
+os_queue_send(&rx_q, &sample, 10U);
+```
+
+Item size and capacity come from the array, so there is nothing to keep in step
+by hand. Passing a *pointer* to the array instead of the array itself is a
+compile error rather than a silently wrong capacity — `sizeof` on a pointer
+would derive nonsense and every send past the first would run off the end of the
+storage.
 
 **Teardown is the same call for every kind.** `os_queue_cleanup` empties the
 queue, and what happens to the storage depends on who owns it, so code tearing
@@ -396,7 +427,7 @@ down a mixed set of queues does not need to track which kind each one is:
 
 - A buffer from `os_queue_init_dynamic` goes back to the heap, and the geometry
   goes with it. Re-use means another `os_queue_init_dynamic`.
-- A buffer from `OS_QUEUE_DEFINE_STATIC` or `os_queue_init_buffer` is not the
+- A buffer from `OS_QUEUE_DEFINE_STATIC` or `OS_QUEUE_DEFINE_BUFFER` is not the
   kernel's to release, so the queue keeps its storage and is left empty and
   immediately usable — a statically defined queue needs no init call after
   cleanup either, exactly as it needed none before.
@@ -468,21 +499,48 @@ operations and gets the full API, with no behaviour able to drift between cores.
 
 ### Work queue
 
-Defer a function to run later on the highest-priority kernel task. This is
-ISR-safe:
+Defer a function to run later on the highest-priority kernel task. One call, and
+it is ISR-safe:
 
 ```c
-static void my_handler(void *context) { /* runs on tsk_work */ }
-static os_work_t my_work;
+static void my_handler(void *data, size_t len) { /* runs on tsk_work */ }
 
-os_work_init(&my_work, my_handler, &my_data);  /* handler + user-data pointer */
-os_work_submit(&my_work, 100U);                /* run after 100 ms (0 = as soon as possible) */
-os_work_cancel(&my_work);                      /* drop it if it has not run yet */
+my_payload_t payload = { ... };                                  /* an ordinary local */
+
+os_work_submit(my_handler, &payload, sizeof(payload), 100U);     /* 0 ms = as soon as possible */
+os_work_submit(my_handler, NULL, 0U, 0U);                        /* or carry no payload at all */
 ```
 
-Re-submitting a pending item reschedules it. Handlers and timer callbacks run in
-task context, so they may use kernel APIs, but they execute at the highest
-priority. Keep them short and do not block in them, or everything else starves.
+There is no work object to declare, initialize or keep alive, and **the payload
+is copied, not referenced**. The kernel takes the handler and the `len` bytes at
+`data` into one of its `OS_CONFIG_MAX_WORKS` slots, then releases the slot as the
+handler starts and hands it the copy. So the buffer above may go out of scope the
+moment `os_work_submit` returns — a submission is complete in itself.
+
+`OS_CONFIG_WORK_PAYLOAD_SIZE` (default 32 bytes) bounds it; anything larger is
+refused with `OS_STATUS_INVALID_ARG` rather than truncated. To hand over
+something bigger, submit a **pointer** to it:
+
+```c
+os_work_submit(my_handler, &object_ptr, sizeof(object_ptr), 0U);
+```
+
+which keeps the fact that the target's lifetime is now yours to manage visible at
+the call site, instead of being the silent default.
+
+Two consequences of having no handle, both deliberate:
+
+- **Each submission is its own call.** Submitting the same handler twice runs it
+  twice; there is no item for the second submission to reschedule.
+- **A submission cannot be cancelled or inspected.** If a handler needs to be
+  able to change its mind, give it a context it re-reads when it runs.
+
+`os_work_submit` returns `OS_STATUS_FULL` when every slot is occupied, so a burst
+larger than `OS_CONFIG_MAX_WORKS` is refused rather than silently dropped.
+
+Handlers and timer callbacks run in task context, so they may use kernel APIs,
+but they execute at the highest priority. Keep them short and do not block in
+them, or everything else starves.
 
 ### Kernel heap
 

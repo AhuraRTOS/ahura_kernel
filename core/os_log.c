@@ -52,8 +52,7 @@
  * ***********************************************************************************************************
 */
 
-static uint8_t   os_log_task_stack[OS_CONFIG_LOG_TASK_STACK_SIZE] OS_STACK_ALIGNED;
-static os_task_t os_log_task_handle;
+OS_TASK_DEFINE(tsk_log, OS_CONFIG_LOG_TASK_STACK_SIZE);
 
 /* Resolved once in os_log_system_init: the log task is never deleted, so every
  * later wake skips the id lookup (same trick os_work.c and os_timer.c use). */
@@ -208,12 +207,9 @@ os_status os_log_system_init(void)
 
     os_task_config_t config =
     {
-        "tsk_log",
         os_log_task_entry,
         NULL,
         OS_CONFIG_LOG_TASK_PRIORITY,
-        (void *)os_log_task_stack,
-        sizeof(os_log_task_stack),
         OS_TASK_CORE_ANY
     };
 
@@ -221,19 +217,19 @@ os_status os_log_system_init(void)
     os_log_tail    = 0U;
     os_log_dropped = 0U;
 
-    status = os_task_create_system(&os_log_task_handle, &config);
+    status = os_task_create_system(&tsk_log, &config);
     if (status != OS_STATUS_OK)
     {
         return status;
     }
 
-    status = os_task_start(&os_log_task_handle);
+    status = os_task_start(&tsk_log);
     if (status != OS_STATUS_OK)
     {
         return status;
     }
 
-    os_log_task_tcb = os_task_tcb_resolve(os_log_task_handle.id);
+    os_log_task_tcb = os_task_tcb_resolve(tsk_log.id);
 
     return OS_STATUS_OK;
 }

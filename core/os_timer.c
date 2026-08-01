@@ -24,8 +24,7 @@
  * ***********************************************************************************************************
 */
 
-static uint8_t              os_timer_task_stack[OS_CONFIG_TIMER_STACK_SIZE] OS_STACK_ALIGNED;
-static os_task_t            os_timer_task_handle;
+OS_TASK_DEFINE(tsk_timer, OS_CONFIG_TIMER_STACK_SIZE);
 
 /* Resolved once in os_timer_system_init: the timer task is never deleted, so
  * this handle stays valid for the kernel's lifetime and the tick-time expiry
@@ -45,8 +44,9 @@ static os_timer_t * __IO    os_timer_registry[OS_CONFIG_MAX_TIMERS];
 */
 
 static void        os_timer_task_entry(void *context);
-static os_timer_t* os_timer_expired_fetch(void);
+static bool        os_timer_expired_fetch(os_timer_callback_t *callback_out, void **context_out);
 static bool        os_timer_expired_exists(void);
+static os_status   os_timer_arm(os_timer_t *timer, bool reload);
 static uint32_t    os_timer_registry_slot_find(const os_timer_t *timer);
 static uint32_t    os_timer_registry_slot_acquire(const os_timer_t *timer);
 
@@ -79,6 +79,7 @@ os_status os_timer_init(os_timer_t *timer, uint32_t period_ticks, os_timer_mode_
     timer->remaining_ticks = period_ticks;
     timer->mode            = mode;
     timer->active          = false;
+    timer->paused          = false;
     timer->expired         = false;
     timer->callback        = callback;
     timer->context         = context;
@@ -88,39 +89,78 @@ os_status os_timer_init(os_timer_t *timer, uint32_t period_ticks, os_timer_mode_
 
 /******************************************************************************************************/
 /**
- * @brief Start a software timer (registers it with the kernel tick).
+ * @brief Start a software timer, or resume one that os_timer_pause halted.
+ *
+ * A paused timer continues with the time it had left, which is the whole point of pausing; any
+ * other timer starts a full period. os_timer_restart is the call that reloads unconditionally.
  *
  * @param[in,out] timer  Timer object (must be initialized).
  * @return os_status  OK on start, FULL when no registry slot is free.
  */
 os_status os_timer_start(os_timer_t *timer)
 {
-    uint32_t slot;
+    return os_timer_arm(timer, false);
+}
 
-    if ((timer == NULL) || (timer->callback == NULL) || (timer->period_ticks == 0U))
+/******************************************************************************************************/
+/**
+ * @brief Restart a software timer from a full period.
+ *
+ * Unlike os_timer_start this ignores whatever the timer was doing: running, paused or stopped, it
+ * ends up counting a whole period from now. This is the call for pushing a deadline back on
+ * activity - a watchdog kick, an inactivity timeout, a debounce - where resuming a part-elapsed
+ * period would be exactly wrong.
+ *
+ * @param[in,out] timer  Timer object (must be initialized).
+ * @return os_status  OK on restart, FULL when no registry slot is free.
+ */
+os_status os_timer_restart(os_timer_t *timer)
+{
+    return os_timer_arm(timer, true);
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Halt a running timer, keeping the time it had left.
+ *
+ * The countdown stops where it is and os_timer_start resumes from there. The registry slot is kept,
+ * so a pause cannot fail for want of one and a resume cannot be refused later - which also means a
+ * paused timer still costs a slot, unlike a stopped one.
+ *
+ * A pause does not cancel an expiry the tick has already noted: that callback is owed and still
+ * runs. Only os_timer_stop discards it. Pausing a timer that is not running reports
+ * OS_STATUS_ERROR rather than quietly doing nothing, since a later os_timer_start would then begin
+ * a full period instead of the resume the caller was expecting.
+ *
+ * @param[in,out] timer  Timer object.
+ * @return os_status  OK when paused (or already paused), OS_STATUS_ERROR when not running.
+ */
+os_status os_timer_pause(os_timer_t *timer)
+{
+    os_status status;
+
+    if (timer == NULL)
     {
         return OS_STATUS_INVALID_ARG;
     }
 
     os_critical_enter();
 
-    /* Single pass: restarting an already-registered timer takes its own
-     * slot rather than a free one, and both the match and the free-slot
-     * fallback are found in one walk instead of two. */
-    slot = os_timer_registry_slot_acquire(timer);
-
-    if (slot >= OS_CONFIG_MAX_TIMERS)
+    if (timer->active)
     {
-        os_critical_exit();
-        return OS_STATUS_FULL;
+        timer->active = false;
+        timer->paused = true;
+        status        = OS_STATUS_OK;
+    }
+    else
+    {
+        /* Already paused is success - the timer is in the state asked for. Anything else (never
+         * started, stopped, or a one-shot that has fired) had no countdown to halt. */
+        status = timer->paused ? OS_STATUS_OK : OS_STATUS_ERROR;
     }
 
-    os_timer_registry[slot] = timer;
-    timer->remaining_ticks  = timer->period_ticks;
-    timer->active           = true;
-
     os_critical_exit();
-    return OS_STATUS_OK;
+    return status;
 }
 
 /******************************************************************************************************/
@@ -142,12 +182,61 @@ os_status os_timer_stop(os_timer_t *timer)
     os_critical_enter();
 
     timer->active  = false;
+    timer->paused  = false;
     timer->expired = false;
     slot           = os_timer_registry_slot_find(timer);
     if (slot < OS_CONFIG_MAX_TIMERS)
     {
         os_timer_registry[slot] = NULL;
     }
+
+    os_critical_exit();
+    return OS_STATUS_OK;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Stop a timer and leave the object needing os_timer_init before it can be used again.
+ *
+ * Everything os_timer_stop does, plus clearing what makes the object a timer at all: period, mode
+ * and callback go, so os_timer_start and os_timer_restart refuse it with OS_STATUS_INVALID_ARG
+ * until it is initialized afresh. That is the whole difference - stop is "not now", delete is
+ * "done with this one" - and it is what turns a use-after-delete from a timer that quietly fires
+ * again into a status code at the call that tried.
+ *
+ * Safe to call while the timer task is delivering this timer's callback: that call took its own
+ * copy of the callback and context before releasing the critical section, so it neither reads nor
+ * writes the object here. It does mean a callback already in delivery still completes - a delete
+ * cancels a pending expiry, not one that is already running.
+ *
+ * @param[in,out] timer  Timer object.
+ * @return os_status  OS_STATUS_OK, or OS_STATUS_INVALID_ARG for NULL.
+ */
+os_status os_timer_delete(os_timer_t *timer)
+{
+    uint32_t slot;
+
+    if (timer == NULL)
+    {
+        return OS_STATUS_INVALID_ARG;
+    }
+
+    os_critical_enter();
+
+    timer->active          = false;
+    timer->paused          = false;
+    timer->expired         = false;
+
+    slot = os_timer_registry_slot_find(timer);
+    if (slot < OS_CONFIG_MAX_TIMERS)
+    {
+        os_timer_registry[slot] = NULL;
+    }
+
+    timer->period_ticks    = 0U;
+    timer->remaining_ticks = 0U;
+    timer->callback        = NULL;
+    timer->context         = NULL;
 
     os_critical_exit();
     return OS_STATUS_OK;
@@ -166,12 +255,9 @@ os_status os_timer_system_init(void)
 
     os_task_config_t config =
     {
-        "tsk_timer",
         os_timer_task_entry,
         NULL,
         OS_TASK_PRIO_MAX,
-        (void *)os_timer_task_stack,
-        sizeof(os_timer_task_stack),
         OS_CONFIG_TIMER_CORE_AFFINITY
     };
 
@@ -180,13 +266,13 @@ os_status os_timer_system_init(void)
         os_timer_registry[slot] = NULL;
     }
 
-    status = os_task_create_system(&os_timer_task_handle, &config);
+    status = os_task_create_system(&tsk_timer, &config);
     if (status != OS_STATUS_OK)
     {
         return status;
     }
 
-    status = os_task_start(&os_timer_task_handle);
+    status = os_task_start(&tsk_timer);
     if (status != OS_STATUS_OK)
     {
         return status;
@@ -194,7 +280,7 @@ os_status os_timer_system_init(void)
 
     /* Resolved once: the timer task is never deleted, so the tick-time
      * expiry wake can skip the id lookup from here on. */
-    os_timer_task_tcb = os_task_tcb_resolve(os_timer_task_handle.id);
+    os_timer_task_tcb = os_task_tcb_resolve(tsk_timer.id);
 
     return OS_STATUS_OK;
 }
@@ -322,11 +408,15 @@ static void os_timer_task_entry(void *context)
 
     while (1)
     {
-        os_timer_t *timer = os_timer_expired_fetch();
+        os_timer_callback_t callback;
+        void                *callback_context;
 
-        if (timer != NULL)
+        /* The callback is invoked through the copies taken inside os_timer_expired_fetch, not
+         * through the timer object: the timer may be stopped, deleted or re-initialized by anyone
+         * the moment that critical section ends, and this call must not depend on it any more. */
+        if (os_timer_expired_fetch(&callback, &callback_context))
         {
-            timer->callback(timer->context);
+            callback(callback_context);
             continue;
         }
 
@@ -346,17 +436,25 @@ static void os_timer_task_entry(void *context)
 
 /******************************************************************************************************/
 /**
- * @brief Take one expired timer out of the pending set.
+ * @brief Take one expired timer out of the pending set, returning what to call.
  *
- * A finished one-shot releases its registry slot before the callback runs,
- * so the callback may safely restart its own timer.
+ * A finished one-shot releases its registry slot before the callback runs, so the callback may
+ * safely restart its own timer.
  *
- * @return os_timer_t*  Expired timer, or NULL when none.
+ * The callback and context are copied out here, inside the critical section, rather than the timer
+ * pointer being handed back for the caller to dereference afterwards. That is what lets
+ * os_timer_delete clear the object at any moment: by the time the critical section is released the
+ * kernel no longer needs the timer, so a delete racing with delivery cannot turn into a call
+ * through a NULL callback.
+ *
+ * @param[out] callback_out  Callback to invoke, written only when true is returned.
+ * @param[out] context_out   Context to pass it, written only when true is returned.
+ * @return bool  true when an expiry was taken.
  */
-static os_timer_t* os_timer_expired_fetch(void)
+static bool os_timer_expired_fetch(os_timer_callback_t *callback_out, void **context_out)
 {
-    os_timer_t *timer = NULL;
-    uint32_t   slot;
+    bool     found = false;
+    uint32_t slot;
 
     os_critical_enter();
 
@@ -373,13 +471,62 @@ static os_timer_t* os_timer_expired_fetch(void)
                 os_timer_registry[slot] = NULL;
             }
 
-            timer = candidate;
+            *callback_out = candidate->callback;
+            *context_out  = candidate->context;
+            found         = true;
             break;
         }
     }
 
     os_critical_exit();
-    return timer;
+    return found;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Put a timer on the registry and set it counting; the body of os_timer_start/_restart.
+ *
+ * @param[in,out] timer   Timer object (must be initialized).
+ * @param[in]     reload  true to count a full period, false to resume a pause where it left off.
+ * @return os_status  OK on start, FULL when no registry slot is free.
+ */
+static os_status os_timer_arm(os_timer_t *timer, bool reload)
+{
+    uint32_t slot;
+
+    if ((timer == NULL) || (timer->callback == NULL) || (timer->period_ticks == 0U))
+    {
+        return OS_STATUS_INVALID_ARG;
+    }
+
+    os_critical_enter();
+
+    /* Single pass: re-arming an already-registered timer takes its own
+     * slot rather than a free one, and both the match and the free-slot
+     * fallback are found in one walk instead of two. */
+    slot = os_timer_registry_slot_acquire(timer);
+
+    if (slot >= OS_CONFIG_MAX_TIMERS)
+    {
+        os_critical_exit();
+        return OS_STATUS_FULL;
+    }
+
+    os_timer_registry[slot] = timer;
+
+    /* Resuming keeps remaining_ticks; everything else counts a whole period. A paused timer is the
+     * only one whose remaining_ticks means anything, which is why the flag rather than the caller
+     * decides what a plain start does. */
+    if (reload || (!timer->paused))
+    {
+        timer->remaining_ticks = timer->period_ticks;
+    }
+
+    timer->paused = false;
+    timer->active = true;
+
+    os_critical_exit();
+    return OS_STATUS_OK;
 }
 
 /******************************************************************************************************/

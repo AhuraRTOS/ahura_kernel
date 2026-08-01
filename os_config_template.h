@@ -188,6 +188,14 @@
 #define OS_CONFIG_MAX_WORKS                 8U
 #define OS_CONFIG_WORK_STACK_SIZE           512U
 
+/* Largest payload os_work_submit may copy into a slot, in bytes. The submitted
+ * data is copied, so nothing the caller owns has to outlive the deferred call;
+ * the cost is OS_CONFIG_MAX_WORKS * this many bytes of RAM, plus this much again
+ * on the work task's stack while a handler runs. A submission larger than this
+ * is refused with OS_STATUS_INVALID_ARG. To hand over something bigger, submit a
+ * POINTER to it (sizeof of the pointer) and keep the target alive yourself. */
+#define OS_CONFIG_WORK_PAYLOAD_SIZE         32U
+
 /* Which cores the work task (and so the work handlers) may run on: a
  * core-affinity bitmask, 0 = any core. Only meaningful when
  * OS_CONFIG_CORE_COUNT (PART 3) > 1; keep 0 on single-core builds. */

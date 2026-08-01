@@ -552,8 +552,13 @@ os_status os_task_notify_give(os_task_t *task, uint32_t value)
  *
  * Task-only, like os_mutex_lock: an ISR has no task identity of its own to wait as.
  *
+ * value_out may be NULL, for the common case of a notification used as a plain "something
+ * happened" signal where the value carries nothing. The notification is consumed either way -
+ * what is discarded is the copy, not the delivery - so a NULL here cannot leave the mailbox full
+ * and make the next wait return at once.
+ *
  * @param[in]  timeout_ms  OS_WAIT_NOTHING, a duration in ms, or OS_WAIT_FOREVER.
- * @param[out] value_out   Set to the delivered value on OS_STATUS_OK.
+ * @param[out] value_out   Set to the delivered value on OS_STATUS_OK; NULL to discard it.
  * @return os_status  OK on delivery, EMPTY when unavailable without waiting, TIMEOUT when the
  *                     wait elapsed, INVALID_ARG from an ISR or before a real task exists.
  */
@@ -565,9 +570,8 @@ os_status os_task_notify_wait(uint32_t timeout_ms, uint32_t *value_out)
 
     /* Task-only, like os_mutex_lock: an ISR has no task identity to wait as. */
     OS_ASSERT(!os_arch_in_isr());
-    OS_ASSERT(value_out != NULL);
 
-    if ((value_out == NULL) || os_arch_in_isr())
+    if (os_arch_in_isr())
     {
         return OS_STATUS_INVALID_ARG;
     }
@@ -598,9 +602,15 @@ os_status os_task_notify_wait(uint32_t timeout_ms, uint32_t *value_out)
 
         if (current->notify_pending)
         {
+            /* Consumed unconditionally: only the copy out is optional. */
             current->notify_pending = false;
-            *value_out             = current->notify_value;
-            current->notify_value  = 0U;
+
+            if (value_out != NULL)
+            {
+                *value_out = current->notify_value;
+            }
+
+            current->notify_value = 0U;
             os_critical_exit();
             return OS_STATUS_OK;
         }
@@ -1498,12 +1508,16 @@ static os_status os_task_create_any(os_task_t *task, const os_task_config_t *con
     uintptr_t stack_addr;
     uint32_t  *stack_ptr;
 
+    /* The stack comes from the handle, not the config: a handle declared any way other than with
+     * OS_TASK_DEFINE has no storage attached and is rejected here rather than being run on
+     * whatever the object happened to contain. */
     if ((task == NULL) ||
+        (task->storage == NULL) ||
         (config == NULL) ||
         (config->entry == (os_task_entry_t)0) ||
         (config->priority > OS_TASK_PRIO_MAX) ||
-        (config->stack_memory == NULL) ||
-        (config->stack_bytes < OS_CONFIG_MIN_STACK_SIZE))
+        (task->storage->stack_memory == NULL) ||
+        (task->storage->stack_bytes < OS_CONFIG_MIN_STACK_SIZE))
     {
         return OS_STATUS_INVALID_ARG;
     }
@@ -1514,21 +1528,23 @@ static os_status os_task_create_any(os_task_t *task, const os_task_config_t *con
         return OS_STATUS_INVALID_ARG;
     }
 
-    stack_addr = (uintptr_t)config->stack_memory;
+    stack_addr = (uintptr_t)task->storage->stack_memory;
     if (((stack_addr % OS_ARCH_STACK_ALIGNMENT_BYTES) != 0U) ||
-        ((config->stack_bytes % OS_ARCH_STACK_ALIGNMENT_BYTES) != 0U))
+        ((task->storage->stack_bytes % OS_ARCH_STACK_ALIGNMENT_BYTES) != 0U))
     {
         return OS_STATUS_INVALID_ARG;
     }
 
 #if (OS_CONFIG_STACK_WATERMARK_ENABLE == 1U)
     /* Pre-fill so os_task_stack_watermark_get can measure peak usage. */
-    os_task_stack_fill((uint8_t *)config->stack_memory, config->stack_bytes);
+    os_task_stack_fill((uint8_t *)task->storage->stack_memory, task->storage->stack_bytes);
 #endif
 
     /* Build the initial frame before taking the critical section: it only
      * touches the caller's stack memory. */
-    stack_ptr = os_arch_task_stack_initialize((uint8_t *)config->stack_memory, config->stack_bytes, config->entry, config->context);
+    stack_ptr = os_arch_task_stack_initialize((uint8_t *)task->storage->stack_memory,
+                                              task->storage->stack_bytes,
+                                              config->entry, config->context);
     if (stack_ptr == NULL)
     {
         return OS_STATUS_ERROR;
@@ -1550,10 +1566,10 @@ static os_status os_task_create_any(os_task_t *task, const os_task_config_t *con
                 os_task_next_id++;
             }
 
-            tcb->name             = config->name;
-            tcb->stack_base       = (uint8_t *)config->stack_memory;
+            tcb->name             = task->storage->name;
+            tcb->stack_base       = (uint8_t *)task->storage->stack_memory;
             tcb->stack_ptr        = stack_ptr;
-            tcb->stack_bytes      = config->stack_bytes;
+            tcb->stack_bytes      = task->storage->stack_bytes;
             tcb->priority         = config->priority;
 #if (OS_CONFIG_MUTEX_ENABLE == 1U)
             tcb->base_priority    = config->priority;

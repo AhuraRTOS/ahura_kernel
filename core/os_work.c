@@ -15,7 +15,13 @@
 
 #include "os_internal.h"
 
+#include <string.h>
+
 #if (OS_CONFIG_WORK_ENABLE == 1U)
+
+#if (OS_CONFIG_WORK_PAYLOAD_SIZE < 1U)
+#error "OS_CONFIG_WORK_PAYLOAD_SIZE must be at least 1; the work registry sizes its payload copy from it."
+#endif
 
 /*
  * ***********************************************************************************************************
@@ -23,19 +29,44 @@
  * ***********************************************************************************************************
 */
 
-static uint8_t             os_work_task_stack[OS_CONFIG_WORK_STACK_SIZE] OS_STACK_ALIGNED;
-static os_task_t           os_work_task_handle;
+OS_TASK_DEFINE(tsk_work, OS_CONFIG_WORK_STACK_SIZE);
 
 /* Resolved once in os_work_system_init: the work task is never deleted, so
  * this handle stays valid for the kernel's lifetime and every later wake
  * (submit and the tick-time expiry path) skips the id lookup. */
 static void                *os_work_task_tcb = NULL;
 
-/* Registry of submitted work items, advanced on every kernel tick. Fixed slots
- * so tick-time iteration stays safe against concurrent submit/cancel. The slot
- * (the pointer itself) is what the ISR and tasks race on, so __IO sits after
- * the '*' to qualify the slot rather than the pointed-to item. */
-static os_work_t * __IO    os_work_registry[OS_CONFIG_MAX_WORKS];
+/* One submitted call: what to run, the payload to run it on, and how long is left before it may.
+ *
+ * The submission lives here rather than in an object the caller owns, which is what lets
+ * os_work_submit take a handler and a payload instead of a work item. A slot is free exactly when
+ * its handler is NULL, so there is no separate in-use flag to keep in step, and "pending" is simply
+ * a slot that is taken but not yet ready.
+ *
+ * The payload is a copy, not a pointer, so a caller may submit from a local buffer and return
+ * immediately. The union is what gives that copy an alignment any type can be read back at: the
+ * handler casts it to its own struct, and a bare uint8_t array would only be byte-aligned. */
+typedef struct
+{
+    os_work_handler_t handler;     /**< NULL marks the slot free.                    */
+    uint32_t          delay_ticks; /**< Remaining ticks until the call becomes ready. */
+    size_t            len;         /**< Payload bytes in use; 0 when there is none.   */
+    bool              ready;       /**< Delay elapsed, awaiting execution.            */
+
+    union
+    {
+        uint64_t alignment;
+        uint8_t  bytes[OS_CONFIG_WORK_PAYLOAD_SIZE];
+
+    } payload;
+
+} os_work_entry_t;
+
+/* Registry of submitted calls, advanced on every kernel tick. Fixed slots so tick-time iteration
+ * stays safe against concurrent submissions. Every field is read and written either inside
+ * os_critical_enter/exit or under the kernel mask and cross-core spinlock that
+ * os_work_tick_process holds, which is what makes plain (non-volatile) access correct here. */
+static os_work_entry_t     os_work_registry[OS_CONFIG_MAX_WORKS];
 
 /*
  * ***********************************************************************************************************
@@ -44,10 +75,9 @@ static os_work_t * __IO    os_work_registry[OS_CONFIG_MAX_WORKS];
 */
 
 static void       os_work_task_entry(void *context);
-static os_work_t* os_work_ready_fetch(void);
+static bool       os_work_ready_fetch(os_work_handler_t *handler_out, void *payload_out, size_t *len_out);
 static bool       os_work_ready_exists(void);
-static uint32_t   os_work_registry_slot_find(const os_work_t *work);
-static uint32_t   os_work_registry_slot_acquire(const os_work_t *work);
+static uint32_t   os_work_registry_slot_free(void);
 
 /*
  * ***********************************************************************************************************
@@ -57,48 +87,37 @@ static uint32_t   os_work_registry_slot_acquire(const os_work_t *work);
 
 /******************************************************************************************************/
 /**
- * @brief Initialize a work item with its handler and user-data pointer.
+ * @brief Submit a function to run after delay_ms on the kernel work task.
  *
- * @param[in,out] work     Work item.
- * @param[in]     handler  Function executed by the kernel work task.
- * @param[in]     context  User data passed to the handler.
- * @return os_status  Status code.
+ * ISR-safe. delay_ms == 0 makes the call ready immediately; because the work task runs at the
+ * highest priority, it preempts any user task as soon as the scheduler is invoked.
+ *
+ * The handler AND the payload are copied into a free registry slot, so the caller owns nothing
+ * that has to stay alive until the call runs - a local buffer may go out of scope the moment this
+ * returns. Each submission is independent: two submissions of the same handler run it twice, and
+ * neither can be cancelled or inspected afterwards.
+ *
+ * The copy happens inside the critical section, so keep payloads small; OS_CONFIG_WORK_PAYLOAD_SIZE
+ * bounds them, and anything larger is refused rather than truncated. Submitting a pointer (and
+ * sizeof that pointer) is the way to hand over more, which puts the lifetime question back in the
+ * caller's hands visibly instead of by default.
+ *
+ * @param[in] handler   Function to run on the kernel work task.
+ * @param[in] data      Payload to copy, or NULL when len is 0.
+ * @param[in] len       Payload size in bytes, at most OS_CONFIG_WORK_PAYLOAD_SIZE.
+ * @param[in] delay_ms  Delay before execution in milliseconds (0 = as soon as possible).
+ * @return os_status  OK on submission; INVALID_ARG for a NULL handler, OS_WAIT_FOREVER, an
+ *                    oversized len, or a NULL data with a nonzero len; FULL when every registry
+ *                    slot is occupied.
  */
-os_status os_work_init(os_work_t *work, os_work_handler_t handler, void *context)
-{
-    if ((work == NULL) || (handler == NULL))
-    {
-        return OS_STATUS_INVALID_ARG;
-    }
-
-    work->handler     = handler;
-    work->context     = context;
-    work->delay_ticks = 0U;
-    work->pending     = false;
-    work->ready       = false;
-
-    return OS_STATUS_OK;
-}
-
-/******************************************************************************************************/
-/**
- * @brief Submit work to run after delay_ms on the kernel work task.
- *
- * ISR-safe. Submitting an already-pending item reschedules it with the new
- * delay. delay_ms == 0 makes the item ready immediately; because the work
- * task runs at the highest priority, it preempts any user task as soon as
- * the scheduler is invoked.
- *
- * @param[in,out] work      Work item (must be initialized).
- * @param[in]     delay_ms  Delay before execution in milliseconds (0 = as soon as possible).
- * @return os_status  OK on submission, FULL when no registry slot is free.
- */
-os_status os_work_submit(os_work_t *work, uint32_t delay_ms)
+os_status os_work_submit(os_work_handler_t handler, const void *data, size_t len, uint32_t delay_ms)
 {
     uint32_t slot;
     uint32_t delay_ticks;
 
-    if ((work == NULL) || (work->handler == NULL) || (delay_ms == OS_WAIT_FOREVER))
+    if ((handler == NULL) || (delay_ms == OS_WAIT_FOREVER) ||
+        (len > OS_CONFIG_WORK_PAYLOAD_SIZE) ||
+        ((len > 0U) && (data == NULL)))
     {
         return OS_STATUS_INVALID_ARG;
     }
@@ -107,12 +126,7 @@ os_status os_work_submit(os_work_t *work, uint32_t delay_ms)
 
     os_critical_enter();
 
-    /* Single pass: an already-registered item (re-submit) takes precedence
-     * over any free slot noticed along the way, so the match and the
-     * free-slot fallback are both found in one walk of the registry - the
-     * common case (item not yet registered) previously paid a full scan
-     * just to learn that, then a second to find a free slot. */
-    slot = os_work_registry_slot_acquire(work);
+    slot = os_work_registry_slot_free();
 
     if (slot >= OS_CONFIG_MAX_WORKS)
     {
@@ -120,88 +134,27 @@ os_status os_work_submit(os_work_t *work, uint32_t delay_ms)
         return OS_STATUS_FULL;
     }
 
-    os_work_registry[slot] = work;
+    os_work_registry[slot].handler     = handler;
+    os_work_registry[slot].delay_ticks = delay_ticks;
+    os_work_registry[slot].len         = len;
+    os_work_registry[slot].ready       = (delay_ticks == 0U);
+
+    if (len > 0U)
+    {
+        (void)memcpy(os_work_registry[slot].payload.bytes, data, len);
+    }
 
     if (delay_ticks == 0U)
     {
-        work->delay_ticks = 0U;
-        work->pending     = false;
-        work->ready       = true;
-
         /* Direct-handle wake: skips the id lookup os_task_wake would do;
          * safe here because os_critical_enter above already holds the
          * kernel mask (and, on multi-core builds, the same spinlock
          * os_task_wake_tcb requires the caller to hold). */
         os_task_wake_tcb(os_work_task_tcb);
     }
-    else
-    {
-        work->delay_ticks = delay_ticks;
-        work->pending     = true;
-        work->ready       = false;
-    }
 
     os_critical_exit();
     return OS_STATUS_OK;
-}
-
-/******************************************************************************************************/
-/**
- * @brief Cancel submitted work that has not started executing yet.
- *
- * ISR-safe. Work whose handler is already running cannot be stopped.
- *
- * @param[in,out] work  Work item.
- * @return os_status  OK when a submission was cancelled, EMPTY when none was pending.
- */
-os_status os_work_cancel(os_work_t *work)
-{
-    uint32_t slot;
-    bool     was_submitted;
-
-    if (work == NULL)
-    {
-        return OS_STATUS_INVALID_ARG;
-    }
-
-    os_critical_enter();
-
-    was_submitted     = (work->pending || work->ready);
-    work->delay_ticks = 0U;
-    work->pending     = false;
-    work->ready       = false;
-
-    slot = os_work_registry_slot_find(work);
-    if (slot < OS_CONFIG_MAX_WORKS)
-    {
-        os_work_registry[slot] = NULL;
-    }
-
-    os_critical_exit();
-    return was_submitted ? OS_STATUS_OK : OS_STATUS_EMPTY;
-}
-
-/******************************************************************************************************/
-/**
- * @brief Check whether a work item is submitted and not yet executed.
- *
- * @param[in] work  Work item.
- * @return bool  True while the item is waiting for its delay or for execution.
- */
-bool os_work_is_pending(const os_work_t *work)
-{
-    bool is_pending;
-
-    if (work == NULL)
-    {
-        return false;
-    }
-
-    os_critical_enter();
-    is_pending = (work->pending || work->ready);
-    os_critical_exit();
-
-    return is_pending;
 }
 
 /******************************************************************************************************/
@@ -217,27 +170,27 @@ os_status os_work_system_init(void)
 
     os_task_config_t config =
     {
-        "tsk_work",
         os_work_task_entry,
         NULL,
         OS_TASK_PRIO_MAX,
-        (void *)os_work_task_stack,
-        sizeof(os_work_task_stack),
         OS_CONFIG_WORK_CORE_AFFINITY
     };
 
     for (slot = 0U; slot < OS_CONFIG_MAX_WORKS; slot++)
     {
-        os_work_registry[slot] = NULL;
+        os_work_registry[slot].handler     = NULL;
+        os_work_registry[slot].delay_ticks = 0U;
+        os_work_registry[slot].len         = 0U;
+        os_work_registry[slot].ready       = false;
     }
 
-    status = os_task_create_system(&os_work_task_handle, &config);
+    status = os_task_create_system(&tsk_work, &config);
     if (status != OS_STATUS_OK)
     {
         return status;
     }
 
-    status = os_task_start(&os_work_task_handle);
+    status = os_task_start(&tsk_work);
     if (status != OS_STATUS_OK)
     {
         return status;
@@ -245,7 +198,7 @@ os_status os_work_system_init(void)
 
     /* Resolved once: the work task is never deleted, so every later wake
      * (submit and the tick-time expiry path) can skip the id lookup. */
-    os_work_task_tcb = os_task_tcb_resolve(os_work_task_handle.id);
+    os_work_task_tcb = os_task_tcb_resolve(tsk_work.id);
 
     return OS_STATUS_OK;
 }
@@ -273,7 +226,7 @@ void os_work_tick_process(uint32_t elapsed_ticks)
      * (a cancel landing in between would be silently undone). Also covers
      * the tickless announce path, which calls this from task context. On
      * multi-core builds the cross-core spinlock additionally excludes the
-     * other cores' os_work_submit/os_work_cancel callers, who hold it via
+     * other cores' os_work_submit callers, who hold it via
      * os_critical_enter - the local mask alone only stops this core's own
      * interrupts. Released before os_task_wake below, which acquires the
      * same lock itself (never hold both at once - not recursive). */
@@ -282,23 +235,23 @@ void os_work_tick_process(uint32_t elapsed_ticks)
 
     for (slot = 0U; slot < OS_CONFIG_MAX_WORKS; slot++)
     {
-        os_work_t *work = os_work_registry[slot];
+        os_work_entry_t *entry = &os_work_registry[slot];
 
-        if ((work == NULL) || (!work->pending))
+        /* Taken but not yet ready is exactly what "pending" used to mean. */
+        if ((entry->handler == NULL) || entry->ready)
         {
             continue;
         }
 
-        if (work->delay_ticks > elapsed_ticks)
+        if (entry->delay_ticks > elapsed_ticks)
         {
-            work->delay_ticks -= elapsed_ticks;
+            entry->delay_ticks -= elapsed_ticks;
         }
         else
         {
-            work->delay_ticks = 0U;
-            work->pending     = false;
-            work->ready       = true;
-            wake_needed       = true;
+            entry->delay_ticks = 0U;
+            entry->ready       = true;
+            wake_needed        = true;
         }
     }
 
@@ -332,22 +285,22 @@ uint32_t os_work_next_ready_ticks_get(void)
 
     for (slot = 0U; slot < OS_CONFIG_MAX_WORKS; slot++)
     {
-        const os_work_t *work = os_work_registry[slot];
+        const os_work_entry_t *entry = &os_work_registry[slot];
 
-        if (work == NULL)
+        if (entry->handler == NULL)
         {
             continue;
         }
 
-        if (work->ready)
+        if (entry->ready)
         {
             minimum = 0U;
             break;
         }
 
-        if (work->pending && (work->delay_ticks < minimum))
+        if (entry->delay_ticks < minimum)
         {
-            minimum = work->delay_ticks;
+            minimum = entry->delay_ticks;
         }
     }
 
@@ -372,13 +325,24 @@ static void os_work_task_entry(void *context)
 {
     (void)context;
 
+    /* The payload is delivered on this task's own stack, which is why the slot can be released
+     * before the handler runs: the handler reads this copy, not the registry. Sized by
+     * OS_CONFIG_WORK_PAYLOAD_SIZE, so OS_CONFIG_WORK_STACK_SIZE has to allow for it. */
+    union
+    {
+        uint64_t alignment;
+        uint8_t  bytes[OS_CONFIG_WORK_PAYLOAD_SIZE];
+
+    } payload;
+
     while (1)
     {
-        os_work_t *work = os_work_ready_fetch();
+        os_work_handler_t handler;
+        size_t            len;
 
-        if (work != NULL)
+        if (os_work_ready_fetch(&handler, payload.bytes, &len))
         {
-            work->handler(work->context);
+            handler((len > 0U) ? (void *)payload.bytes : NULL, len);
             continue;
         }
 
@@ -398,42 +362,58 @@ static void os_work_task_entry(void *context)
 
 /******************************************************************************************************/
 /**
- * @brief Take one ready work item out of the registry.
+ * @brief Take one ready submission out of the registry, returning what to call and its payload.
  *
- * The slot is released before the handler runs so the handler may safely
- * re-submit its own item.
+ * The payload is copied OUT to the caller's buffer before the slot is freed, and the slot is freed
+ * before the handler runs. Both halves of that matter: freeing early means a handler may submit
+ * again without needing the registry to have spare capacity, and copying first means the handler
+ * is not reading a slot that the very next submission is free to overwrite.
  *
- * @return os_work_t*  Ready work item, or NULL when none.
+ * @param[out] handler_out  Handler to invoke, written only when true is returned.
+ * @param[out] payload_out  Buffer of at least OS_CONFIG_WORK_PAYLOAD_SIZE bytes to copy into.
+ * @param[out] len_out      Payload bytes copied, written only when true is returned.
+ * @return bool  true when a ready submission was taken.
  */
-static os_work_t* os_work_ready_fetch(void)
+static bool os_work_ready_fetch(os_work_handler_t *handler_out, void *payload_out, size_t *len_out)
 {
-    os_work_t *work = NULL;
-    uint32_t  slot;
+    bool     found = false;
+    uint32_t slot;
 
     os_critical_enter();
 
     for (slot = 0U; slot < OS_CONFIG_MAX_WORKS; slot++)
     {
-        os_work_t* candidate = os_work_registry[slot];
+        os_work_entry_t *entry = &os_work_registry[slot];
 
-        if ((candidate != NULL) && candidate->ready)
+        if ((entry->handler != NULL) && entry->ready)
         {
-            candidate->ready    = false;
-            os_work_registry[slot] = NULL;
-            work                = candidate;
+            *handler_out = entry->handler;
+            *len_out     = entry->len;
+
+            if (entry->len > 0U)
+            {
+                (void)memcpy(payload_out, entry->payload.bytes, entry->len);
+            }
+
+            entry->handler     = NULL; /* frees the slot */
+            entry->delay_ticks = 0U;
+            entry->len         = 0U;
+            entry->ready       = false;
+
+            found = true;
             break;
         }
     }
 
     os_critical_exit();
-    return work;
+    return found;
 }
 
 /******************************************************************************************************/
 /**
- * @brief Check whether any registered work item is ready. Caller holds the critical section.
+ * @brief Check whether any submission is ready to run. Caller holds the critical section.
  *
- * @return bool  True when at least one item awaits execution.
+ * @return bool  True when at least one awaits execution.
  */
 static bool os_work_ready_exists(void)
 {
@@ -441,7 +421,7 @@ static bool os_work_ready_exists(void)
 
     for (slot = 0U; slot < OS_CONFIG_MAX_WORKS; slot++)
     {
-        if ((os_work_registry[slot] != NULL) && os_work_registry[slot]->ready)
+        if ((os_work_registry[slot].handler != NULL) && os_work_registry[slot].ready)
         {
             return true;
         }
@@ -452,57 +432,27 @@ static bool os_work_ready_exists(void)
 
 /******************************************************************************************************/
 /**
- * @brief Find the registry slot holding the given work pointer (NULL finds a free slot).
+ * @brief Find the first free registry slot. Caller holds the critical section.
  *
- * @param[in] work  Work pointer to search for, or NULL.
- * @return uint32_t  Slot index, or OS_CONFIG_MAX_WORKS when not found.
+ * One pass and one condition, where a handle-based API needed two - a scan for the item's own slot
+ * so a re-submission rescheduled in place, plus a fallback to a free one. Without a handle there is
+ * nothing to match: every submission is new, so the first slot with no handler will do.
+ *
+ * @return uint32_t  Slot index, or OS_CONFIG_MAX_WORKS when the registry is full.
  */
-static uint32_t os_work_registry_slot_find(const os_work_t *work)
+static uint32_t os_work_registry_slot_free(void)
 {
     uint32_t slot;
 
     for (slot = 0U; slot < OS_CONFIG_MAX_WORKS; slot++)
     {
-        if (os_work_registry[slot] == work)
+        if (os_work_registry[slot].handler == NULL)
         {
             return slot;
         }
     }
 
     return OS_CONFIG_MAX_WORKS;
-}
-
-/******************************************************************************************************/
-/**
- * @brief Find work's existing slot, or the first free slot if it has none - in one pass.
- *
- * Used by os_work_submit, where re-submitting an already-registered item must take that
- * item's own slot rather than a free one; a match found mid-scan still wins even if a free
- * slot was noticed earlier, since the loop keeps searching for it until either the match is
- * found or the whole registry has been seen.
- *
- * @param[in] work  Work pointer to search for.
- * @return uint32_t  work's existing slot, else the first free slot, else OS_CONFIG_MAX_WORKS.
- */
-static uint32_t os_work_registry_slot_acquire(const os_work_t *work)
-{
-    uint32_t free_slot = OS_CONFIG_MAX_WORKS;
-    uint32_t slot;
-
-    for (slot = 0U; slot < OS_CONFIG_MAX_WORKS; slot++)
-    {
-        if (os_work_registry[slot] == work)
-        {
-            return slot;
-        }
-
-        if ((os_work_registry[slot] == NULL) && (free_slot >= OS_CONFIG_MAX_WORKS))
-        {
-            free_slot = slot;
-        }
-    }
-
-    return free_slot;
 }
 
 #endif /* OS_CONFIG_WORK_ENABLE */

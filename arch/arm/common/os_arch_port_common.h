@@ -53,6 +53,7 @@
     !defined(OS_CONFIG_HEAP_SIZE) ||                                                                   \
     !defined(OS_CONFIG_MAX_TASKS) ||                                                                   \
     !defined(OS_CONFIG_MAX_TIMERS) || !defined(OS_CONFIG_MAX_WORKS) ||                                 \
+    !defined(OS_CONFIG_WORK_PAYLOAD_SIZE) ||                                                           \
     !defined(OS_CONFIG_MIN_STACK_SIZE) || !defined(OS_CONFIG_WORK_STACK_SIZE) ||                       \
     !defined(OS_CONFIG_TIMER_STACK_SIZE) || !defined(OS_CONFIG_WORK_CORE_AFFINITY) ||                  \
     !defined(OS_CONFIG_TIMER_CORE_AFFINITY) ||                                                         \

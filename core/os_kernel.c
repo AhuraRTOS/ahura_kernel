@@ -40,13 +40,11 @@ static void      os_test_task_entry(void *context);
 static __IO bool os_kernel_running = false;
 
 #if (OS_CONFIG_TEST_ENABLE == 0U)
-static uint8_t   os_main_task_stack[OS_CONFIG_MAIN_TASK_STACK_SIZE] OS_STACK_ALIGNED;
-static os_task_t os_main_task_handle;
+OS_TASK_DEFINE(tsk_main, OS_CONFIG_MAIN_TASK_STACK_SIZE);
 #endif
 
 #if (OS_CONFIG_TEST_ENABLE == 1U)
-static uint8_t   os_test_task_stack[OS_CONFIG_TEST_STACK_SIZE] OS_STACK_ALIGNED;
-static os_task_t os_test_task_handle;
+OS_TASK_DEFINE(tsk_test, OS_CONFIG_TEST_STACK_SIZE);
 #endif
 
 /*
@@ -229,22 +227,19 @@ static os_status os_main_system_init(void)
 
     os_task_config_t config =
     {
-        "tsk_main",
         os_main_task_entry,
         NULL,
         OS_CONFIG_MAIN_TASK_PRIORITY,
-        (void *)os_main_task_stack,
-        sizeof(os_main_task_stack),
         OS_TASK_CORE_ANY
     };
 
-    status = os_task_create(&os_main_task_handle, &config);
+    status = os_task_create(&tsk_main, &config);
     if (status != OS_STATUS_OK)
     {
         return status;
     }
 
-    return os_task_start(&os_main_task_handle);
+    return os_task_start(&tsk_main);
 }
 
 /******************************************************************************************************/
@@ -275,22 +270,19 @@ static os_status os_test_system_init(void)
 
     os_task_config_t config =
     {
-        "tsk_test",
         os_test_task_entry,
         NULL,
         OS_CONFIG_TEST_PRIORITY,
-        (void *)os_test_task_stack,
-        sizeof(os_test_task_stack),
         OS_TASK_CORE_ANY
     };
 
-    status = os_task_create(&os_test_task_handle, &config);
+    status = os_task_create(&tsk_test, &config);
     if (status != OS_STATUS_OK)
     {
         return status;
     }
 
-    return os_task_start(&os_test_task_handle);
+    return os_task_start(&tsk_test);
 }
 
 /******************************************************************************************************/

@@ -19,20 +19,27 @@
 
 #if (OS_CONFIG_QUEUE_ENABLE == 1U)
 
+#if (OS_CONFIG_ALLOC_ENABLE == 1U)
+
 /*
  * ***********************************************************************************************************
- * Public function implementations
+ * Private function implementations
  * ***********************************************************************************************************
 */
 
 /******************************************************************************************************/
 /**
- * @brief Initialize a queue over an item buffer the caller declares.
+ * @brief Bind a queue to an item buffer at run time.
  *
- * The escape hatch for storage OS_QUEUE_DEFINE_STATIC cannot express, and the primitive the
- * dynamic path is built on: os_queue_init_dynamic() obtains a buffer and hands it straight to this
- * function, so the two cannot drift apart in what they check or what they leave the object
- * holding. What OS_QUEUE_DEFINE_STATIC writes at compile time is this same field set.
+ * Not public, and deliberately so. A queue over storage the application declares is set up at
+ * compile time by OS_QUEUE_DEFINE_STATIC or OS_QUEUE_DEFINE_BUFFER, which read the item size and
+ * capacity off the array; exposing this as an API would mean asking callers to pass a geometry
+ * back that the array already states, and every such pair is a chance for the two to disagree.
+ *
+ * What is left is one genuine run-time case - a buffer that does not exist until the heap hands it
+ * over - so os_queue_init_dynamic() is the only caller. Keeping it a function rather than folding
+ * it into that one means the field set a queue starts life holding is written in exactly one place
+ * for the run-time path, matching what OS_QUEUE_INITIALIZER writes for the compile-time ones.
  *
  * @param[in,out] queue      Queue object to initialize.
  * @param[in]     buffer     Backing storage buffer.
@@ -40,7 +47,7 @@
  * @param[in]     capacity   Number of items buffer can hold.
  * @return os_status    Status code.
  */
-os_status os_queue_init_buffer(os_queue_t *queue, void *buffer, size_t item_size, size_t capacity)
+static os_status os_queue_bind_buffer(os_queue_t *queue, void *buffer, size_t item_size, size_t capacity)
 {
     if ((queue == NULL) || (buffer == NULL) || (item_size == 0U) || (capacity == 0U))
     {
@@ -64,13 +71,22 @@ os_status os_queue_init_buffer(os_queue_t *queue, void *buffer, size_t item_size
     queue->head         = 0U;
     queue->tail         = 0U;
     queue->count        = 0U;
-    queue->buffer_owned = false; /* caller's storage: os_queue_cleanup must never free it */
+    queue->buffer_owned = false; /* the caller claims ownership after this, inside its own critical
+                                  * section - see os_queue_init_dynamic */
     os_list_init(&queue->send_waiters);
     os_list_init(&queue->receive_waiters);
 
     os_critical_exit();
     return OS_STATUS_OK;
 }
+
+#endif /* OS_CONFIG_ALLOC_ENABLE */
+
+/*
+ * ***********************************************************************************************************
+ * Public function implementations
+ * ***********************************************************************************************************
+*/
 
 /******************************************************************************************************/
 /**
@@ -254,9 +270,9 @@ size_t os_queue_count_get(const os_queue_t *queue)
  * about the queue behaves identically; the only difference is that os_queue_cleanup() releases the
  * buffer, because this call is what obtained it.
  *
- * The queue object itself is still the caller's, exactly as with os_queue_init_buffer: only the item
- * buffer comes from the heap. That keeps the object's lifetime obvious and lets it live wherever
- * suits the application, and it means a failed call leaves nothing to clean up.
+ * The queue object itself is still the caller's, exactly as with the compile-time macros: only the
+ * item buffer comes from the heap. That keeps the object's lifetime obvious and lets it live
+ * wherever suits the application, and it means a failed call leaves nothing to clean up.
  *
  * @param[out] queue      Queue object, on zero-initialized storage (OS_QUEUE_DEFINE_DYNAMIC).
  * @param[in]  item_size  Size of one item in bytes.
@@ -301,12 +317,13 @@ os_status os_queue_init_dynamic(os_queue_t *queue, size_t item_size, size_t capa
      * report it. The window is only a few instructions wide, which is exactly the kind that
      * survives testing and fails in the field.
      *
-     * os_queue_init_buffer performs the waiter check and every field assignment, so the static and
-     * dynamic paths cannot drift apart. It only fails here if the queue still has blocked waiters,
-     * in which case the allocation has to go back rather than leak. */
+     * os_queue_bind_buffer performs the waiter check and every field assignment, so this path
+     * leaves the object holding exactly what OS_QUEUE_INITIALIZER writes for the compile-time
+     * ones. It only fails here if the queue still has blocked waiters, in which case the
+     * allocation has to go back rather than leak. */
     os_critical_enter();
 
-    status = os_queue_init_buffer(queue, buffer, item_size, capacity);
+    status = os_queue_bind_buffer(queue, buffer, item_size, capacity);
 
     if (status == OS_STATUS_OK)
     {
@@ -337,10 +354,10 @@ os_status os_queue_init_dynamic(os_queue_t *queue, size_t item_size, size_t capa
  *   - Buffer from os_queue_init_dynamic. It goes back to the heap, and the geometry goes with it,
  *     because the memory it described is no longer the queue's. Re-use means another
  *     os_queue_init_dynamic call.
- *   - Buffer from OS_QUEUE_DEFINE_STATIC or os_queue_init_buffer. There is nothing to release, so
- *     the queue keeps its storage and is left empty and immediately usable. That is what makes
- *     the static macro's promise hold in both directions: such a queue never needs an init call,
- *     before this or after it.
+ *   - Buffer from OS_QUEUE_DEFINE_STATIC or OS_QUEUE_DEFINE_BUFFER. There is nothing to release,
+ *     so the queue keeps its storage and is left empty and immediately usable. That is what makes
+ *     the compile-time macros' promise hold in both directions: such a queue never needs an init
+ *     call, before this or after it.
  *
  * Refuses while tasks are blocked on the queue. Freeing underneath them would leave those tasks
  * parked on list nodes inside memory the heap is free to hand out again, and waking them instead

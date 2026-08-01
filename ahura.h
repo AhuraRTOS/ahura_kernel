@@ -84,26 +84,42 @@ typedef void (*os_task_entry_t)(void *context);
 
 /******************************************************************************************************/
 /**
- * @brief Public task handle object.
+ * @brief What a task is called and where its stack lives.
+ *
+ * The half of a task's definition that belongs to the handle rather than to what the task does:
+ * OS_TASK_DEFINE fills one of these in at compile time and points the handle at it, which is why
+ * os_task_create needs neither a name nor a stack. Const, so it costs flash rather than RAM.
  */
 typedef struct
 {
-    uint32_t id;
+    const char *name;
+    void       *stack_memory;
+    size_t      stack_bytes;
+
+} os_task_storage_t;
+
+/******************************************************************************************************/
+/**
+ * @brief Public task handle object. Declare one with OS_TASK_DEFINE, never by hand: os_task_create
+ *        refuses a handle whose storage the macro has not filled in.
+ */
+typedef struct
+{
+    uint32_t                id;
+    const os_task_storage_t *storage;
 
 } os_task_t;
 
 /******************************************************************************************************/
 /**
- * @brief Task creation parameters.
+ * @brief Task creation parameters: what the task does, as opposed to what it is called and where
+ *        its stack lives, which the handle already carries. Built with OS_TASK_CONFIG.
  */
 typedef struct
 {
-    const char      *name;
     os_task_entry_t entry;
     void            *context;
     uint32_t        priority;
-    void            *stack_memory;
-    size_t          stack_bytes;
     uint32_t        core_affinity; /**< Bitmask of cores the task may run on;
                                         OS_TASK_CORE_ANY (0) = any core.
                                         Ignored on single-core builds. */
@@ -214,49 +230,64 @@ typedef enum
 #define OS_STACK_ALIGNED
 #endif
 
-/** Define a task stack and handle: the handle is declared as plain "name" (the
- *  object every other os_task_* call references), while the backing stack
- *  buffer gets the decorated "name_STACK" (touched only by OS_TASK_CONFIG
- *  below, never by hand). The size is in bytes (rounded up to an 8-byte
- *  multiple so os_task_create's alignment check cannot fail) and must be at
- *  least OS_CONFIG_MIN_STACK_SIZE. */
-#define OS_TASK_DEFINE(name, stack_bytes) \
-    static uint8_t   name##_STACK[(((stack_bytes) + 7U) & ~7U)] OS_STACK_ALIGNED; \
-    static os_task_t name
+/** Define a task: its handle, its stack, and the storage descriptor tying the two together.
+ *
+ *  The handle is declared as plain "task_name" - the object every os_task_* call references - and
+ *  the backing stack gets the decorated "task_name_STACK", which nothing should name by hand. The
+ *  size is in bytes, rounded up to an 8-byte multiple so os_task_create's alignment check cannot
+ *  fail, and must be at least OS_CONFIG_MIN_STACK_SIZE.
+ *
+ *      OS_TASK_DEFINE(worker, 512U);
+ *      ...
+ *      status = os_task_create(&worker, OS_TASK_CONFIG(worker_entry, NULL, OS_TASK_PRIO_1));
+ *      status = os_task_start(&worker);
+ *
+ *  The task's name and stack are recorded here, in the handle, rather than being passed to
+ *  os_task_create - which is why the name is written once. Handing one task's handle another
+ *  task's stack is not something the API can express any more; it used to be a matching pair the
+ *  caller had to keep in step, and a mismatched one still compiled.
+ *
+ *  Parameters are task_name and stack_size, not name and stack_bytes, because a macro parameter
+ *  named after a struct field would be substituted inside the designated initializers below. */
+#define OS_TASK_DEFINE(task_name, stack_size)                                        \
+    static uint8_t task_name##_STACK[(((stack_size) + 7U) & ~7U)] OS_STACK_ALIGNED;  \
+    static const os_task_storage_t task_name##_STORAGE = {                           \
+        .name         = #task_name,                                                  \
+        .stack_memory = (void *)(task_name##_STACK),                                 \
+        .stack_bytes  = sizeof(task_name##_STACK)                                    \
+    };                                                                               \
+    static os_task_t task_name = { .storage = &task_name##_STORAGE }
 
-/** Task configuration for os_task_create, built from a stack declared with
- *  OS_TASK_DEFINE. The signature follows OS_CONFIG_CORE_COUNT:
+/** Task behaviour for os_task_create: what the task runs, with what, and at what priority. What it
+ *  is called and where its stack lives came from OS_TASK_DEFINE, so neither appears here. The
+ *  signature follows OS_CONFIG_CORE_COUNT:
  *
- *    single-core  OS_TASK_CONFIG(name, entry, context, priority)
- *    multi-core   OS_TASK_CONFIG(name, entry, context, priority, core_affinity)
+ *    single-core  OS_TASK_CONFIG(entry, context, priority)
+ *    multi-core   OS_TASK_CONFIG(entry, context, priority, core_affinity)
  *
- *  There is nothing to place a task on when the build has one core, so the
- *  argument does not exist there rather than being an ignored constant. On a
- *  multi-core build it is required, which makes every task state where it may
- *  run instead of silently defaulting: core_affinity is a bitmask
- *  (OS_TASK_CORE(n), OR-combinable; OS_TASK_CORE_ANY = any core), and bits
- *  naming cores beyond OS_CONFIG_CORE_COUNT make os_task_create fail with
- *  OS_STATUS_INVALID_ARG, so a stale pin is caught, not silently ignored. */
+ *  There is nothing to place a task on when the build has one core, so the argument does not exist
+ *  there rather than being an ignored constant. On a multi-core build it is required, which makes
+ *  every task state where it may run instead of silently defaulting: core_affinity is a bitmask
+ *  (OS_TASK_CORE(n), OR-combinable; OS_TASK_CORE_ANY = any core), and bits naming cores beyond
+ *  OS_CONFIG_CORE_COUNT make os_task_create fail with OS_STATUS_INVALID_ARG, so a stale pin is
+ *  caught, not silently ignored.
+ *
+ *  Initialized positionally: every parameter here shares a name with the field it fills, so
+ *  designated initializers would be substituted the same way the note above describes. */
 #if (OS_CONFIG_CORE_COUNT > 1U)
-#define OS_TASK_CONFIG(name, entry, context, priority, core_affinity) \
+#define OS_TASK_CONFIG(entry, context, priority, core_affinity) \
     &(os_task_config_t) { \
-        #name, \
         (entry), \
         (context), \
         (priority), \
-        (void *)(name##_STACK), \
-        sizeof(name##_STACK), \
         (core_affinity) \
     }
 #else
-#define OS_TASK_CONFIG(name, entry, context, priority) \
+#define OS_TASK_CONFIG(entry, context, priority) \
     &(os_task_config_t) { \
-        #name, \
         (entry), \
         (context), \
         (priority), \
-        (void *)(name##_STACK), \
-        sizeof(name##_STACK), \
         OS_TASK_CORE_ANY \
     }
 #endif
@@ -560,18 +591,27 @@ os_status os_semaphore_take(os_semaphore_t *semaphore, uint32_t timeout_ms);
  * ***********************************************************************************************************
  *
  * A queue is an object plus an item buffer. Which macro declares it decides
- * where that buffer comes from, and that is the only difference between the two
- * kinds. Declared below in that order: static storage, dynamic storage, storage
- * you lay out yourself, then the operations they all share.
+ * where that buffer comes from, and that is the only difference between the
+ * three kinds. Declared below in that order, then the operations they all share.
  *
  *   STATIC    OS_QUEUE_DEFINE_STATIC(sensor_q, sample_t, 8);
- *             / file scope; usable where it stands, nothing to call
+ *             / the macro declares the buffer too; usable where it stands
  *
- *   DYNAMIC   OS_QUEUE_DEFINE_DYNAMIC(rx_q);
- *             os_queue_init_dynamic(&rx_q, item_size, capacity);
+ *   BUFFER    static sample_t dma_area[8] __attribute__((section(".dma")));
+ *             OS_QUEUE_DEFINE_BUFFER(rx_q, dma_area);
+ *             / you declare the buffer, for storage the line above cannot
+ *               express; still usable where it stands
+ *
+ *   DYNAMIC   OS_QUEUE_DEFINE_DYNAMIC(log_q);
+ *             os_queue_init_dynamic(&log_q, item_size, capacity);
  *             / file scope declares only the object; the call obtains the buffer
  *
- * From there every call is the same for both kinds, teardown included.
+ * Only the dynamic kind has an init call, because only it has work that cannot
+ * happen until run time. The other two are initialized where they are declared,
+ * and neither takes an item size or a capacity: both are read off the array, so
+ * they cannot disagree with the storage that actually exists.
+ *
+ * From there every call is the same for all three, teardown included.
 */
 
 #if (OS_CONFIG_QUEUE_ENABLE == 1U)
@@ -594,40 +634,76 @@ typedef struct
 
 } os_queue_t;
 
-/* --- Static storage: declared and initialized by the macro ------------------------------------ */
+/* --- Compile-time storage: the geometry is read off the array --------------------------------- */
+
+/** Compile-time initializer binding a queue object to an item array. Shared by the two macros
+ *  below so both derive the geometry the same way and cannot drift apart.
+ *
+ *  Everything omitted here - head, tail, count, the two waiter lists, buffer_owned - is
+ *  zero-initialized by the C rules for objects with static storage duration, which is exactly the
+ *  empty queue with empty waiter lists an init call would otherwise write at run time. That is why
+ *  a queue defined this way is usable where it stands, with nothing to call and no status to check.
+ *
+ *  Its only parameter is "array" on purpose: a macro parameter named after a struct field would be
+ *  substituted inside the designated initializers, turning ".capacity" into ".8" and failing to
+ *  compile. Nothing here may be called buffer, item_size or capacity. */
+#define OS_QUEUE_INITIALIZER(array)                            \
+    {                                                          \
+        .buffer    = (uint8_t *)(array),                       \
+        .item_size = sizeof((array)[0]),                       \
+        .capacity  = (sizeof(array) / sizeof((array)[0])),     \
+    }
+
+/** Compile-time proof that "array" is an array and not a pointer to one. sizeof() on a pointer
+ *  would derive a nonsense capacity in silence, and every send past the first would then run off
+ *  the end of the storage - the exact failure deriving the geometry exists to prevent, so it is
+ *  worth refusing to build over. Evaluates to a permitted 1 on compilers without the builtin,
+ *  where the check simply does not run. */
+#if defined(__GNUC__) || defined(__clang__)
+#define OS_QUEUE_IS_ARRAY(array) \
+    (!__builtin_types_compatible_p(__typeof__(array), __typeof__(&(array)[0])))
+#else
+#define OS_QUEUE_IS_ARRAY(array) 1
+#endif
 
 /** Define a queue with statically allocated storage, ready to use where it stands. The queue
- *  object is declared as plain "name" (what every os_queue_* call takes the address of), the
- *  backing array gets the decorated "name_BUFFER", and the macro initializes the object over that
- *  array at compile time.
+ *  object is declared as plain "name" (what every os_queue_* call takes the address of), and the
+ *  backing array gets the decorated "name_BUFFER", which nothing should name by hand.
  *
- *  There is deliberately no init call to pair this with. The item size and capacity are taken
- *  from the declaration itself, so they cannot disagree with the storage that actually exists -
- *  handing a queue a geometry larger than its buffer is otherwise an easy and silent way to read
- *  or write past the end of it. "type" is the item type rather than a byte count, so the buffer is
- *  typed and the compiler checks what goes into it.
+ *  There is deliberately no init call to pair this with, and no item size or capacity to pass
+ *  anywhere: both are read off the array, so they cannot disagree with the storage that actually
+ *  exists - handing a queue a geometry larger than its buffer is otherwise an easy and silent way
+ *  to read or write past the end of it. "type" is the item type rather than a byte count, so the
+ *  buffer is typed and the compiler checks what goes into it.
  *
  *      OS_QUEUE_DEFINE_STATIC(sensor_q, sensor_sample_t, 8);
  *      ...
  *      status = os_queue_send(&sensor_q, &sample, 10U);
  *
- *  Both objects are static, so this belongs at file scope. Everything omitted from the initializer
- *  - head, tail, count, the two waiter lists, buffer_owned - is zero-initialized by the C rules
- *  for objects with static storage duration, which is exactly the empty queue with empty waiter
- *  lists that os_queue_init_buffer would otherwise have to write at run time.
+ *  Both objects are static, so this belongs at file scope. To place the buffer somewhere
+ *  particular, declare it yourself and use OS_QUEUE_DEFINE_BUFFER; for a geometry not known until
+ *  run time, use OS_QUEUE_DEFINE_DYNAMIC. */
+#define OS_QUEUE_DEFINE_STATIC(name, type, item_count)    \
+    static type       name##_BUFFER[(item_count)];        \
+    static os_queue_t name = OS_QUEUE_INITIALIZER(name##_BUFFER)
+
+/** Define a queue over an item array you declared yourself, ready to use where it stands. The
+ *  escape hatch for storage OS_QUEUE_DEFINE_STATIC cannot express - a named linker section,
+ *  DMA-capable RAM, a particular alignment - since the array is yours to attribute however the
+ *  platform needs.
  *
- *  The third parameter is item_count and NOT capacity on purpose: a macro parameter named after a
- *  field would be substituted inside the designated initializer below, turning ".capacity" into
- *  ".8" and failing to compile. Same reason no parameter here is called buffer or item_size.
+ *      static sample_t dma_area[8] __attribute__((section(".dma_buffers")));
+ *      OS_QUEUE_DEFINE_BUFFER(rx_q, dma_area);
+ *      ...
+ *      status = os_queue_send(&rx_q, &sample, 10U);
  *
- *  For a queue whose geometry is not known until run time, use OS_QUEUE_DEFINE_DYNAMIC. */
-#define OS_QUEUE_DEFINE_STATIC(name, type, item_count) \
-    static type       name##_BUFFER[(item_count)];     \
-    static os_queue_t name = {                         \
-        .buffer    = (uint8_t *)(name##_BUFFER),       \
-        .item_size = sizeof(type),                     \
-        .capacity  = (item_count),                     \
-    }
+ *  The array must be declared above this, at file scope, and must be an array rather than a
+ *  pointer to one - the line below refuses to compile otherwise. Item size and capacity come from
+ *  it, so there is nothing to keep in step by hand. */
+#define OS_QUEUE_DEFINE_BUFFER(name, array)                                                 \
+    _Static_assert(OS_QUEUE_IS_ARRAY(array),                                                \
+                   "OS_QUEUE_DEFINE_BUFFER needs the item array itself, not a pointer");    \
+    static os_queue_t name = OS_QUEUE_INITIALIZER(array)
 
 /* --- Dynamic storage: the item buffer comes from the kernel heap ------------------------------ */
 
@@ -653,17 +729,6 @@ typedef struct
  */
 os_status os_queue_init_dynamic(os_queue_t *queue, size_t item_size, size_t capacity);
 #endif /* OS_CONFIG_ALLOC_ENABLE */
-
-/* --- Storage you lay out yourself ------------------------------------------------------------- */
-
-/******************************************************************************************************/
-/**
- * @brief Initialize a queue over an item buffer the caller declares. The escape hatch for storage
- *        the two macros above cannot express - a named linker section, DMA-capable RAM, a slice of
- *        an application pool. Nothing derives item_size or capacity here, so they must match the
- *        buffer exactly; prefer OS_QUEUE_DEFINE_STATIC wherever ordinary static storage will do.
- */
-os_status os_queue_init_buffer(os_queue_t *queue, void *buffer, size_t item_size, size_t capacity);
 
 /* --- Operations: identical for every storage kind --------------------------------------------- */
 
@@ -777,12 +842,24 @@ typedef struct
     uint32_t            period_ticks;
     uint32_t            remaining_ticks;
     os_timer_mode_t     mode;
-    bool                active;
+    bool                active;  /**< Counting down right now.                       */
+    bool                paused;  /**< Halted by os_timer_pause, remaining_ticks kept. */
     bool                expired; /**< Expiry noted by the tick, callback not yet run. */
     os_timer_callback_t callback;
     void                *context;
 
 } os_timer_t;
+
+/*
+ * A timer's life cycle, and what each call does to the countdown:
+ *
+ *   os_timer_init      set the period, mode and callback; nothing runs yet
+ *   os_timer_start     run - from the full period, or from where a pause left off
+ *   os_timer_restart   run from the full period, whatever the timer was doing
+ *   os_timer_pause     halt, keeping the time that was left
+ *   os_timer_stop      cancel, discarding both the remaining time and any owed callback
+ *   os_timer_delete    stop, and require os_timer_init before the object is used again
+ */
 
 /******************************************************************************************************/
 /**
@@ -792,15 +869,38 @@ os_status os_timer_init(os_timer_t *timer, uint32_t period_ticks, os_timer_mode_
 
 /******************************************************************************************************/
 /**
- * @brief Start a software timer (callback runs on the kernel timer task).
+ * @brief Start a software timer, or resume one that os_timer_pause halted (callback runs on the
+ *        kernel timer task). A paused timer continues with the time it had left; any other timer
+ *        starts a full period.
  */
 os_status os_timer_start(os_timer_t *timer);
 
 /******************************************************************************************************/
 /**
- * @brief Stop a software timer.
+ * @brief Restart a software timer from a full period, whether it was running, paused or stopped.
+ *        The call to reach for when an event should push the deadline back.
+ */
+os_status os_timer_restart(os_timer_t *timer);
+
+/******************************************************************************************************/
+/**
+ * @brief Halt a running timer, keeping the time it had left for os_timer_start to resume from.
+ *        An expiry already noted but not yet delivered still runs.
+ */
+os_status os_timer_pause(os_timer_t *timer);
+
+/******************************************************************************************************/
+/**
+ * @brief Stop a software timer, discarding the remaining time and any owed callback.
  */
 os_status os_timer_stop(os_timer_t *timer);
+
+/******************************************************************************************************/
+/**
+ * @brief Stop a timer and return its registry slot, leaving the object needing os_timer_init
+ *        before it can be started again.
+ */
+os_status os_timer_delete(os_timer_t *timer);
 
 #endif /* OS_CONFIG_TIMER_ENABLE */
 
@@ -814,47 +914,38 @@ os_status os_timer_stop(os_timer_t *timer);
 
 /******************************************************************************************************/
 /**
- * @brief Work handler signature; context is the pointer given at os_work_init.
+ * @brief Work handler signature.
+ *
+ * data points at the kernel's own copy of what was submitted, valid for the duration of the call,
+ * and len is how many bytes of it there are. Both are NULL and 0 for a submission that carried no
+ * payload.
  */
-typedef void (*os_work_handler_t)(void *context);
+typedef void (*os_work_handler_t)(void *data, size_t len);
 
 /******************************************************************************************************/
 /**
- * @brief Deferrable work item, executed by the kernel work task.
+ * @brief Submit a function to run later on the kernel work task (0 ms = as soon as possible).
+ *
+ * There is nothing to declare, initialize or keep alive. The handler and the len bytes at data are
+ * copied into one of the kernel's OS_CONFIG_MAX_WORKS slots, so the submission is complete in
+ * itself: the caller's buffer may be a local that goes out of scope the moment this returns. The
+ * slot is released as the handler starts, and the handler receives the kernel's copy.
+ *
+ * Pass data = NULL and len = 0 for a call that needs no payload. To hand over something larger
+ * than OS_CONFIG_WORK_PAYLOAD_SIZE, submit a POINTER to it - os_work_submit(h, &p, sizeof(p), 0) -
+ * which makes the fact that the target's lifetime is now yours to manage explicit at the call
+ * site, rather than the silent default.
+ *
+ * The consequences of having no handle are worth stating outright. Each call queues its own
+ * execution: submitting the same handler twice runs it twice, rather than the second submission
+ * rescheduling the first. And a submission cannot be cancelled or inspected once made - if a
+ * handler must be able to change its mind, give it something in its payload it can re-read.
+ *
+ * @return OS_STATUS_OK; OS_STATUS_INVALID_ARG for a NULL handler, OS_WAIT_FOREVER, a len above
+ *         OS_CONFIG_WORK_PAYLOAD_SIZE, or a NULL data with a nonzero len; OS_STATUS_FULL when all
+ *         OS_CONFIG_MAX_WORKS slots are occupied.
  */
-typedef struct
-{
-    os_work_handler_t handler;
-    void              *context;
-    uint32_t          delay_ticks; /**< Remaining ticks until the item becomes ready. */
-    bool              pending;     /**< Submitted, waiting for its delay to elapse.   */
-    bool              ready;       /**< Delay elapsed, awaiting execution.            */
-
-} os_work_t;
-
-/******************************************************************************************************/
-/**
- * @brief Initialize a work item with its handler and user-data pointer.
- */
-os_status os_work_init(os_work_t *work, os_work_handler_t handler, void *context);
-
-/******************************************************************************************************/
-/**
- * @brief Submit work to run after delay_ms on the kernel work task (0 = as soon as possible; ISR-safe).
- */
-os_status os_work_submit(os_work_t *work, uint32_t delay_ms);
-
-/******************************************************************************************************/
-/**
- * @brief Cancel submitted work that has not started executing yet (ISR-safe).
- */
-os_status os_work_cancel(os_work_t *work);
-
-/******************************************************************************************************/
-/**
- * @brief Check whether a work item is submitted and not yet executed.
- */
-bool os_work_is_pending(const os_work_t *work);
+os_status os_work_submit(os_work_handler_t handler, const void *data, size_t len, uint32_t delay_ms);
 
 #endif /* OS_CONFIG_WORK_ENABLE */
 
@@ -877,6 +968,10 @@ os_status os_task_notify_give(os_task_t *task, uint32_t value);
 /**
  * @brief Wait for this task's notification mailbox, up to timeout_ms. Task-only (like
  *        os_mutex_lock, an ISR has no task identity of its own to wait as).
+ *
+ *        Pass NULL for value_out to wait for the notification and discard the value it carried,
+ *        which is what a notification used as a plain wake-up signal wants. The notification is
+ *        consumed either way.
  */
 os_status os_task_notify_wait(uint32_t timeout_ms, uint32_t *value_out);
 
