@@ -1157,7 +1157,7 @@ static void test_atomic_hammer_entry(void *context)
     (void)context;
 
     for (i = 0U; i < TEST_ATOMIC_ITERATIONS; i++)
-    {
+    { 
         (void)os_atomic_inc(&os_test_atomic_counter);
 
         /* Deliberately NOT atomic, as the control case: load, add, store, with a preemption point
