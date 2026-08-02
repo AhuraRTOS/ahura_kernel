@@ -26,6 +26,12 @@
 #define OS_TASK_PRIO_IDLE            0U
 #define OS_TASK_STACK_FILL_BYTE      0xA5U
 
+/* Guard word written at the LOWEST address of every task stack - the last place a growing stack
+ * reaches before it leaves its own memory. Deliberately the fill byte repeated, so a build with
+ * OS_CONFIG_STACK_WATERMARK_ENABLE already writes it as part of its whole-stack fill and the two
+ * features cost nothing together. */
+#define OS_TASK_STACK_CANARY         0xA5A5A5A5UL
+
 /* TCB back-references from the embedded intrusive list nodes. */
 #define OS_TASK_TCB_FROM_NODE(node)      ((os_task_tcb_t *)(void *)((uint8_t *)(node) - offsetof(os_task_tcb_t, state_node)))
 #define OS_TASK_TCB_FROM_WAIT_NODE(node) ((os_task_tcb_t *)(void *)((uint8_t *)(node) - offsetof(os_task_tcb_t, wait_node)))
@@ -83,9 +89,26 @@ typedef struct
  * task table and the ready/delay lists are shared between the cores (the
  * critical sections and the explicit PRIMASK guards protect them, plus the
  * kernel spinlock on multi-core builds). */
+/* Table slots the kernel reserves for its own service tasks, on top of OS_CONFIG_MAX_USER_TASKS.
+ *
+ * This is what lets OS_CONFIG_MAX_USER_TASKS mean what an application would expect it to mean - how
+ * many of ITS tasks may exist - instead of a budget it has to share with whichever kernel services
+ * happen to be enabled. Turning on the log or the work queue no longer quietly costs the
+ * application a task.
+ *
+ * Exactly one of tsk_main and tsk_test always exists (os_kernel.c compiles in one or the other,
+ * never both), and each optional service task adds one. The idle tasks are NOT counted: they live
+ * in os_task_idle_tcb below, outside this table, one per core. */
+#define OS_TASK_SYSTEM_SLOTS  (1U + \
+                               ((OS_CONFIG_TIMER_ENABLE == 1U) ? 1U : 0U) + \
+                               ((OS_CONFIG_WORK_ENABLE  == 1U) ? 1U : 0U) + \
+                               ((OS_CONFIG_LOG_ENABLE   == 1U) ? 1U : 0U))
+
+#define OS_TASK_TABLE_SIZE    (OS_CONFIG_MAX_USER_TASKS + OS_TASK_SYSTEM_SLOTS)
+
 static uint8_t                 os_task_idle_stack[OS_CONFIG_CORE_COUNT][OS_CONFIG_MIN_STACK_SIZE] OS_STACK_ALIGNED;
 static os_task_tcb_t           os_task_idle_tcb[OS_CONFIG_CORE_COUNT];
-static os_task_tcb_t           os_task_table[OS_CONFIG_MAX_TASKS];
+static os_task_tcb_t           os_task_table[OS_TASK_TABLE_SIZE];
 static uint32_t                os_task_next_id = 1U;
 
 /* Written by PendSV and read from task/ISR context: the pointer itself is the
@@ -110,6 +133,10 @@ static os_list_t               os_task_delay_list;
 static os_status      os_task_create_any(os_task_t *task, const os_task_config_t *config);
 #if (OS_CONFIG_STACK_WATERMARK_ENABLE == 1U)
 static void           os_task_stack_fill(uint8_t *stack_base, size_t stack_bytes);
+#endif
+#if (OS_CONFIG_STACK_CHECK_ENABLE == 1U)
+static void           os_task_stack_guard_set(uint8_t *stack_base);
+static void           os_task_stack_guard_check(const os_task_tcb_t *tcb, const uint32_t *stack_ptr);
 #endif
 static void           os_task_idle_entry(void *context);
 static void           os_task_tcb_clear(os_task_tcb_t *tcb);
@@ -804,7 +831,7 @@ void os_task_wake(uint32_t task_id)
  *
  * The handle is a raw TCB pointer; it stays valid for the task's lifetime, so callers that
  * never delete the target (e.g. the kernel's own work/timer service tasks) may resolve it
- * once at init and cache it, skipping the O(OS_CONFIG_MAX_TASKS) id scan on every later wake.
+ * once at init and cache it, skipping the O(OS_TASK_TABLE_SIZE) id scan on every later wake.
  *
  * @param[in] task_id  Id to resolve.
  * @return void*  Opaque handle, or NULL when the id does not exist.
@@ -1277,6 +1304,10 @@ os_status os_task_idle_create(void)
 #if (OS_CONFIG_STACK_WATERMARK_ENABLE == 1U)
         os_task_stack_fill(os_task_idle_stack[core], sizeof(os_task_idle_stack[core]));
 #endif
+#if (OS_CONFIG_STACK_CHECK_ENABLE == 1U)
+        /* After any fill, which would otherwise overwrite it. */
+        os_task_stack_guard_set(os_task_idle_stack[core]);
+#endif
 
         stack_ptr = os_arch_task_stack_initialize(os_task_idle_stack[core], sizeof(os_task_idle_stack[core]),
                                                   os_task_idle_entry, NULL);
@@ -1325,7 +1356,7 @@ void os_task_system_init(void)
     uint32_t priority;
     uint32_t core;
 
-    for (index = 0U; index < OS_CONFIG_MAX_TASKS; index++)
+    for (index = 0U; index < OS_TASK_TABLE_SIZE; index++)
     {
         os_task_tcb_clear(&os_task_table[index]);
     }
@@ -1375,6 +1406,13 @@ void os_task_stack_save_current(uint32_t *stack_ptr)
     if (current_task != NULL)
     {
         current_task->stack_ptr = stack_ptr;
+
+#if (OS_CONFIG_STACK_CHECK_ENABLE == 1U)
+        /* Checked here because this is the one place the kernel sees a task's stack pointer at
+         * rest, on every switch away from it. A task that has overrun its stack is caught at the
+         * moment it stops running, before the scheduler hands its (corrupt) frame to anyone. */
+        os_task_stack_guard_check(current_task, stack_ptr);
+#endif
 
         /* The context is now safely saved: from this point any core may
          * dispatch this task (see the running_core check in
@@ -1539,6 +1577,10 @@ static os_status os_task_create_any(os_task_t *task, const os_task_config_t *con
     /* Pre-fill so os_task_stack_watermark_get can measure peak usage. */
     os_task_stack_fill((uint8_t *)task->storage->stack_memory, task->storage->stack_bytes);
 #endif
+#if (OS_CONFIG_STACK_CHECK_ENABLE == 1U)
+    /* After any fill, which would otherwise overwrite it. */
+    os_task_stack_guard_set((uint8_t *)task->storage->stack_memory);
+#endif
 
     /* Build the initial frame before taking the critical section: it only
      * touches the caller's stack memory. */
@@ -1552,7 +1594,7 @@ static os_status os_task_create_any(os_task_t *task, const os_task_config_t *con
 
     os_critical_enter();
 
-    for (index = 0U; index < OS_CONFIG_MAX_TASKS; index++)
+    for (index = 0U; index < OS_TASK_TABLE_SIZE; index++)
     {
         if (os_task_table[index].state == OS_TASK_STATE_INACTIVE)
         {
@@ -1615,6 +1657,89 @@ static void os_task_stack_fill(uint8_t *stack_base, size_t stack_bytes)
     }
 }
 #endif /* OS_CONFIG_STACK_WATERMARK_ENABLE */
+
+#if (OS_CONFIG_STACK_CHECK_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Write the guard word at the bottom of a task stack.
+ *
+ * @param[in] stack_base  Lowest address of the task's stack (8-byte aligned by OS_TASK_DEFINE).
+ * @return None.
+ */
+static void os_task_stack_guard_set(uint8_t *stack_base)
+{
+    *(uint32_t *)(void *)stack_base = OS_TASK_STACK_CANARY;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Check a task's stack for overflow at switch-out; never returns if one is found.
+ *
+ * Two tests, because they catch different failures:
+ *
+ *   The stack pointer below stack_base means the task is executing outside its own stack right
+ *   now - the frame just saved is already in someone else's memory.
+ *
+ *   A clobbered guard word means it went too deep at some point and came back. The pointer is
+ *   respectable again by the time of the switch, so nothing else would notice, but whatever lives
+ *   below that stack has been written through.
+ *
+ * On a hit the kernel does not try to continue: memory outside the task's stack has been modified
+ * and there is no way to know whose. os_stack_overflow_cb gets one chance to report it, then the
+ * core parks exactly as a failed OS_ASSERT does.
+ *
+ * Runs inside PendSV with the kernel mask raised and, on multi-core builds, the cross-core
+ * spinlock held - so the callback must not call kernel APIs, and parking here stops the other
+ * cores too. Both are the right trade when the alternative is scheduling on a corrupt frame.
+ *
+ * @param[in] tcb        Task being switched out.
+ * @param[in] stack_ptr  Stack pointer just saved for it.
+ * @return None.
+ */
+static void os_task_stack_guard_check(const os_task_tcb_t *tcb, const uint32_t *stack_ptr)
+{
+    if (tcb->stack_base == NULL)
+    {
+        return;
+    }
+
+    if (((const uint8_t *)(const void *)stack_ptr >= tcb->stack_base) &&
+        (*(const uint32_t *)(const void *)tcb->stack_base == OS_TASK_STACK_CANARY))
+    {
+        return;
+    }
+
+    os_stack_overflow_cb(tcb->name);
+    os_arch_config_fault_trap();
+
+    /* os_arch_config_fault_trap never returns; the loop only convinces the
+     * compiler of that when it is inlined as a plain call. */
+    while (1)
+    {
+    }
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Weak default for the overflow report: does nothing.
+ *
+ * Unlike os_assert_failed_cb, which the kernel deliberately leaves undefined so that forgetting it
+ * is a link error, this one has a default. Two reasons. OS_CONFIG_STACK_CHECK_ENABLE defaults to
+ * 1, so requiring the hook would break every existing project the moment it took this version.
+ * And the value here is not only in the message: the core parks at the instant of detection with
+ * the offending task still in os_task_current, which a debugger can read out, so a build without
+ * the hook still turns silent memory corruption into a clean stop.
+ *
+ * Override it (see os_cb_template.c) to record which task it was.
+ *
+ * @param[in] task_name  Name of the offending task.
+ * @return None.
+ */
+OS_WEAK void os_stack_overflow_cb(const char *task_name)
+{
+    (void)task_name;
+}
+#endif /* OS_CONFIG_STACK_CHECK_ENABLE */
 
 /******************************************************************************************************/
 /**
@@ -1696,7 +1821,7 @@ static os_task_tcb_t* os_task_find_by_id(uint32_t id)
 {
     uint32_t index;
 
-    for (index = 0U; index < OS_CONFIG_MAX_TASKS; index++)
+    for (index = 0U; index < OS_TASK_TABLE_SIZE; index++)
     {
         if ((os_task_table[index].state != OS_TASK_STATE_INACTIVE) && (os_task_table[index].id == id))
         {

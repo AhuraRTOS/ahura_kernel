@@ -68,11 +68,11 @@ typedef enum
  */
 typedef enum
 {
-    OS_TASK_STATE_INACTIVE = 0, /**< Not created / deleted.                    */
-    OS_TASK_STATE_READY,        /**< Runnable, waiting for the CPU.            */
-    OS_TASK_STATE_RUNNING,      /**< Currently executing.                      */
-    OS_TASK_STATE_BLOCKED,      /**< Waiting for a delay/timeout to expire.    */
-    OS_TASK_STATE_SUSPENDED,    /**< Paused until os_task_start is called.     */
+    OS_TASK_STATE_INACTIVE  = 0, /**< Not created / deleted.                    */
+    OS_TASK_STATE_READY     = 1, /**< Runnable, waiting for the CPU.            */
+    OS_TASK_STATE_RUNNING   = 2, /**< Currently executing.                      */
+    OS_TASK_STATE_BLOCKED   = 3, /**< Waiting for a delay/timeout to expire.    */
+    OS_TASK_STATE_SUSPENDED = 4, /**< Paused until os_task_start is called.     */
 
 } os_task_state_t;
 
@@ -94,7 +94,7 @@ typedef struct
 {
     const char *name;
     void       *stack_memory;
-    size_t      stack_bytes;
+    size_t     stack_bytes;
 
 } os_task_storage_t;
 
@@ -384,25 +384,32 @@ os_task_state_t os_task_state_get(const os_task_t *task);
  */
 uint32_t os_tick_get(void);
 
+/*
+ * The three delays return nothing. A delay either waits or the request was one the platform
+ * cannot express - an unreadable CPU clock, or a duration too long for a 32-bit tick count - and
+ * both of those are programming or configuration errors that OS_ASSERT reports where they happen,
+ * rather than a status every call site would have to cast away.
+ */
+
 /******************************************************************************************************/
 /**
  * @brief Block the calling task for the requested milliseconds (busy-waits before os_start).
  *        OS_WAIT_FOREVER parks the calling task permanently (never returns).
  */
-os_status os_delay_ms(uint32_t milliseconds);
+void os_delay_ms(uint32_t milliseconds);
 
 /******************************************************************************************************/
 /**
  * @brief Busy-wait for the requested microseconds (precise, does not yield).
  */
-os_status os_delay_us(uint32_t microseconds);
+void os_delay_us(uint32_t microseconds);
 
 /******************************************************************************************************/
 /**
  * @brief Block the calling task for the requested seconds (busy-waits before os_start).
  *        OS_WAIT_FOREVER parks the calling task permanently (never returns).
  */
-os_status os_delay_s(uint32_t seconds);
+void os_delay_s(uint32_t seconds);
 
 /*
  * ***********************************************************************************************************
@@ -1172,6 +1179,28 @@ void os_atomic_set_bit_to(os_atomic_t *target, uint32_t bit, bool value);
  */
 os_status os_task_stack_watermark_get(const os_task_t *task, size_t *min_free_bytes);
 #endif /* OS_CONFIG_STACK_WATERMARK_ENABLE */
+
+/*
+ * ***********************************************************************************************************
+ * Stack overflow     - OS_CONFIG_STACK_CHECK_ENABLE
+ * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_STACK_CHECK_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Reported when a task is found to have overrun its stack, at the moment it is switched
+ *        out. Optional: the weak default does nothing, and the kernel parks the core immediately
+ *        afterwards either way, so a missing hook loses the diagnosis but never lets execution
+ *        continue on memory that has already been corrupted.
+ *
+ *        Runs inside PendSV with the kernel's interrupts masked, so it must NOT call any kernel
+ *        API. Write the name to a UART, latch it somewhere the debugger can find, and return.
+ *
+ * @param[in] task_name  Name of the offending task, as given to OS_TASK_DEFINE.
+ */
+void os_stack_overflow_cb(const char *task_name);
+#endif /* OS_CONFIG_STACK_CHECK_ENABLE */
 
 /*
  * ***********************************************************************************************************

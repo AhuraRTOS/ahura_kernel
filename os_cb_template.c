@@ -78,6 +78,31 @@ void os_assert_failed_cb(const char *file, uint32_t line)
 }
 #endif /* OS_CONFIG_ASSERT_ENABLE */
 
+#if (OS_CONFIG_STACK_CHECK_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Called when a task is found to have overrun its stack, as it is switched out.
+ *
+ * OPTIONAL, unlike os_assert_failed_cb above: the kernel has a weak do-nothing default and parks
+ * the core straight after this returns either way. Defining it only buys the diagnosis - which
+ * task it was - so it is worth the few lines.
+ *
+ * Runs inside PendSV with the kernel's interrupts masked. Do NOT call kernel APIs from here, and
+ * do not use OS_LOG_*: the log task cannot run once the core is parked, so the line would never
+ * leave the buffer. Write to the transport directly, or latch the pointer somewhere the debugger
+ * can read after the halt.
+ *
+ * The usual fix is a bigger stack for that task (OS_TASK_DEFINE's second argument), or less on
+ * it - large locals and printf-family calls are the common culprits.
+ */
+void os_stack_overflow_cb(const char *task_name)
+{
+    (void)task_name;
+
+    /* Example: __asm volatile("bkpt 0"); or a direct blocking UART write of task_name. */
+}
+#endif /* OS_CONFIG_STACK_CHECK_ENABLE */
+
 #if (OS_CONFIG_LOG_ENABLE == 1U)
 /******************************************************************************************************/
 /**

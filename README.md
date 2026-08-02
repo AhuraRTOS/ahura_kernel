@@ -177,7 +177,7 @@ compiles away entirely when its `OS_CONFIG_<FEATURE>_ENABLE` is 0.
 | **Software timers** | `os_timer_init` · `os_timer_start` · `os_timer_restart` · `os_timer_pause` · `os_timer_stop` · `os_timer_delete` |
 | **Work queue** | `os_work_submit` |
 | **Kernel heap** | `os_mem_alloc` · `os_mem_free` · `os_mem_free_get` · `os_mem_watermark_get` |
-| **Diagnostics** | `os_task_stack_watermark_get` · `os_cpu_usage_get` |
+| **Diagnostics** | `os_task_stack_watermark_get` · `os_cpu_usage_get` · `os_stack_overflow_cb` |
 | **Debugging** | `OS_ASSERT` · `os_assert_failed_cb` · `OS_LOG_ERROR` / `OS_LOG_WARN` / `OS_LOG_INFO` / `OS_LOG_DEBUG` · `os_log_write` · `os_log_dropped_get` · `os_log_output_cb` |
 | **Intrusive list** | `os_list_init` · `os_list_is_empty` · `os_list_push_back` · `os_list_pop_front` · `os_list_remove` · `os_list_insert_before` |
 | **Tickless idle** | `os_tickless_idle_process` · `os_tickless_expected_idle_ticks_get` · `os_tickless_max_suppressed_ticks_get` |
@@ -258,8 +258,9 @@ called in that build.
 
 - `0` is the idle task, owned by the kernel.
 - `OS_TASK_PRIO_MAX` is reserved for the kernel service tasks `tsk_work` and
-  `tsk_timer`, which `os_init()` creates automatically. They occupy two
-  `OS_CONFIG_MAX_TASKS` slots.
+  `tsk_timer`, which `os_init()` creates automatically. They cost no
+  `OS_CONFIG_MAX_USER_TASKS` slots: the kernel reserves its service tasks' slots on
+  top of that number.
 - `OS_TASK_PRIO_USER_MIN` through `OS_TASK_PRIO_USER_MAX` (1 to MAX-1) are user
   tasks. `os_task_create` rejects anything outside this range.
 
@@ -573,6 +574,32 @@ os_task_stack_watermark_get(task, &min_free);   /* NULL task = calling task */
 ```
 
 reports the worst-case remaining stack in bytes since that task was created.
+It is a measurement you poll, not a detector — by the time a task has actually
+overrun, the damage is already done. That is what the next option is for.
+
+**Stack overflow detection.** With `OS_CONFIG_STACK_CHECK_ENABLE` (default 1),
+every switch away from a task checks two things: that its stack pointer is still
+inside its own stack, and that a guard word at the bottom of that stack is
+intact. The first catches a task executing outside its stack right now; the
+second catches one that went too deep and came back, which nothing else would
+notice. On a hit the kernel calls
+
+```c
+void os_stack_overflow_cb(const char *task_name);   /* optional; weak default does nothing */
+```
+
+and then parks the core, exactly as a failed `OS_ASSERT` does — there is no
+attempt to continue, because memory outside the task has already been written
+and there is no way to know whose. The callback runs inside PendSV with
+interrupts masked, so it must not call kernel APIs; write to a UART directly or
+latch the pointer for the debugger. Cost is a compare and a load per context
+switch.
+
+Worth knowing which cores need it: **ARMv8-M mainline** (M33, M35P, M52, M55,
+M85) already traps this in hardware through a per-task `PSPLIM`, whatever this
+option is set to. Every other supported core — M0, M0+, M23, M3, M4, M7 — has no
+stack-limit register, and this software check is the only detection available
+there.
 
 **CPU usage.** With `OS_CONFIG_CPU_USAGE_ENABLE` (default 1) the tick interrupt
 counts how many ticks interrupted the idle task versus anything else, and
@@ -664,8 +691,9 @@ is reported into the log once space frees:
 [    1251] I sensor = 45
 ```
 
-Two costs to budget for. `tsk_log` occupies one `OS_CONFIG_MAX_TASKS` slot, and
-formatting uses libc `vsnprintf`, which pulls newlib's formatter into the link
+Two costs to budget for. `tsk_log` needs its own stack (`OS_CONFIG_LOG_TASK_STACK_SIZE`,
+though not an `OS_CONFIG_MAX_USER_TASKS` slot - the kernel reserves service-task slots
+separately), and formatting uses libc `vsnprintf`, which pulls newlib's formatter into the link
 (roughly 1 to 3 KB) for a project that does not already use `printf`. As usual,
 `%f` additionally needs `-u _printf_float`. `OS_CONFIG_LOG_LINE_MAX` is the
 scratch buffer `os_log_write` places on the **caller's** stack, so every task

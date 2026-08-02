@@ -31,9 +31,9 @@
  * ***********************************************************************************************************
 */
 
-static os_status os_delay_forever(void);
-static os_status os_delay_ticks(uint32_t ticks);
-static void      os_delay_cycle_wait(uint64_t cycle_count);
+static void os_delay_forever(void);
+static void os_delay_ticks(uint32_t ticks);
+static void os_delay_cycle_wait(uint64_t cycle_count);
 
 /*
  * ***********************************************************************************************************
@@ -49,27 +49,39 @@ static void      os_delay_cycle_wait(uint64_t cycle_count);
  * falls back to a busy-wait before os_start or from interrupt context.
  * OS_WAIT_FOREVER parks the calling task permanently (never returns).
  *
+ * Returns nothing: a delay either waits or the caller asked for something the
+ * platform cannot express, and the second case is a programming or
+ * configuration error that OS_ASSERT reports far more usefully than a status
+ * nobody reads. See os_delay_ticks for the two conditions that can arise.
+ *
  * @param[in] milliseconds  Delay duration in milliseconds, or OS_WAIT_FOREVER.
- * @return os_status        Status code.
+ * @return None.
  */
-os_status os_delay_ms(uint32_t milliseconds)
+void os_delay_ms(uint32_t milliseconds)
 {
     uint64_t ticks_u64;
 
     if (milliseconds == OS_WAIT_FOREVER)
     {
-        return os_delay_forever();
+        os_delay_forever();
+        return;
     }
 
     ticks_u64 = ((uint64_t)milliseconds * (uint64_t)OS_CONFIG_TICK_HZ + (OS_DELAY_MS_PER_SECOND - 1ULL)) /
                 OS_DELAY_MS_PER_SECOND;
 
+    /* Only reachable when OS_CONFIG_TICK_HZ pushes the tick count past 32 bits, which needs a
+     * duration of weeks. Clamping delays as long as the kernel can represent, rather than the old
+     * "report INVALID_ARG and return immediately" - of the two wrong answers, waiting far too long
+     * is the one a caller notices. */
+    OS_ASSERT(ticks_u64 <= (uint64_t)UINT32_MAX);
+
     if (ticks_u64 > (uint64_t)UINT32_MAX)
     {
-        return OS_STATUS_INVALID_ARG;
+        ticks_u64 = (uint64_t)UINT32_MAX;
     }
 
-    return os_delay_ticks((uint32_t)ticks_u64);
+    os_delay_ticks((uint32_t)ticks_u64);
 }
 
 /******************************************************************************************************/
@@ -80,29 +92,31 @@ os_status os_delay_ms(uint32_t milliseconds)
  * os_delay_ms for anything at or above the tick period.
  *
  * @param[in] microseconds  Delay duration in microseconds.
- * @return os_status        Status code.
+ * @return None.
  */
-os_status os_delay_us(uint32_t microseconds)
+void os_delay_us(uint32_t microseconds)
 {
     uint32_t clock_hz = os_arch_clock_hz_get();
     uint64_t cycle_count;
 
     if (microseconds == 0U)
     {
-        return OS_STATUS_OK;
+        return;
     }
+
+    /* No clock reading means no way to measure a microsecond, so this cannot wait at all. The
+     * platform's clock callback is not answering - see the README "Platform clock". */
+    OS_ASSERT(clock_hz != 0U);
 
     if (clock_hz == 0U)
     {
-        return OS_STATUS_ERROR;
+        return;
     }
 
     cycle_count = ((uint64_t)microseconds * (uint64_t)clock_hz + (OS_DELAY_US_PER_SECOND - 1ULL)) /
                   OS_DELAY_US_PER_SECOND;
 
     os_delay_cycle_wait(cycle_count);
-
-    return OS_STATUS_OK;
 }
 
 /******************************************************************************************************/
@@ -112,25 +126,30 @@ os_status os_delay_us(uint32_t microseconds)
  * OS_WAIT_FOREVER parks the calling task permanently (never returns).
  *
  * @param[in] seconds  Delay duration in seconds, or OS_WAIT_FOREVER.
- * @return os_status   Status code.
+ * @return None.
  */
-os_status os_delay_s(uint32_t seconds)
+void os_delay_s(uint32_t seconds)
 {
     uint64_t ticks_u64;
 
     if (seconds == OS_WAIT_FOREVER)
     {
-        return os_delay_forever();
+        os_delay_forever();
+        return;
     }
 
     ticks_u64 = (uint64_t)seconds * (uint64_t)OS_CONFIG_TICK_HZ;
 
+    /* Clamped rather than refused, same reasoning as os_delay_ms. At 1 kHz this needs a request
+     * of about 50 days. */
+    OS_ASSERT(ticks_u64 <= (uint64_t)UINT32_MAX);
+
     if (ticks_u64 > (uint64_t)UINT32_MAX)
     {
-        return OS_STATUS_INVALID_ARG;
+        ticks_u64 = (uint64_t)UINT32_MAX;
     }
 
-    return os_delay_ticks((uint32_t)ticks_u64);
+    os_delay_ticks((uint32_t)ticks_u64);
 }
 
 /*
@@ -141,16 +160,20 @@ os_status os_delay_s(uint32_t seconds)
 
 /******************************************************************************************************/
 /**
- * @brief Park the calling task permanently (OS_WAIT_FOREVER delay). Never returns on success.
+ * @brief Park the calling task permanently (OS_WAIT_FOREVER delay). Never returns when it can.
  *
- * @return os_status  INVALID_ARG when the caller cannot block (ISR or pre-scheduler).
+ * @return None.
  */
-static os_status os_delay_forever(void)
+static void os_delay_forever(void)
 {
+    /* Nothing to park from an ISR or before the scheduler runs, and a permanent busy-wait there
+     * would hang the system outright - so this returns at once instead, which is the one case
+     * where a "forever" delay does not. */
+    OS_ASSERT(os_internal_can_block());
+
     if (!os_internal_can_block())
     {
-        /* A permanent busy-wait would hang the system: refuse instead. */
-        return OS_STATUS_INVALID_ARG;
+        return;
     }
 
     /* Re-arm on any spurious wake (forced os_task_wake aimed at a kernel
@@ -167,16 +190,16 @@ static os_status os_delay_forever(void)
  *        busy-wait otherwise.
  *
  * @param[in] ticks  Number of ticks to delay.
- * @return os_status Status code.
+ * @return None.
  */
-static os_status os_delay_ticks(uint32_t ticks)
+static void os_delay_ticks(uint32_t ticks)
 {
     uint32_t clock_hz;
     uint64_t cycle_count;
 
     if (ticks == 0U)
     {
-        return OS_STATUS_OK;
+        return;
     }
 
     /* The callers route an intentional OS_WAIT_FOREVER to os_delay_forever
@@ -204,20 +227,23 @@ static os_status os_delay_ticks(uint32_t ticks)
             elapsed = os_tick_get() - start_tick; /* wrap-safe unsigned diff */
         }
 
-        return OS_STATUS_OK;
+        return;
     }
 
     /* Pre-scheduler or interrupt context: precise busy-wait. */
     clock_hz = os_arch_clock_hz_get();
+
+    /* Same as os_delay_us: without a clock reading there is no way to time the wait, so this
+     * returns without delaying at all. The platform's clock callback is not answering. */
+    OS_ASSERT(clock_hz != 0U);
+
     if (clock_hz == 0U)
     {
-        return OS_STATUS_ERROR;
+        return;
     }
 
     cycle_count = ((uint64_t)ticks * (uint64_t)clock_hz) / (uint64_t)OS_CONFIG_TICK_HZ;
     os_delay_cycle_wait(cycle_count);
-
-    return OS_STATUS_OK;
 }
 
 /******************************************************************************************************/

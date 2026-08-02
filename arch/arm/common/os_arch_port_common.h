@@ -42,6 +42,7 @@
     !defined(OS_CONFIG_TIMER_ENABLE) || !defined(OS_CONFIG_WORK_ENABLE) ||                             \
     !defined(OS_CONFIG_ALLOC_ENABLE) ||                                                                \
     !defined(OS_CONFIG_STACK_WATERMARK_ENABLE) ||                                                      \
+    !defined(OS_CONFIG_STACK_CHECK_ENABLE) ||                                                          \
     !defined(OS_CONFIG_CPU_USAGE_ENABLE) ||                                                            \
     !defined(OS_CONFIG_ASSERT_ENABLE) || !defined(OS_CONFIG_LOG_ENABLE) ||                             \
     !defined(OS_CONFIG_ATOMIC_ENABLE) ||                                                               \
@@ -51,7 +52,7 @@
     !defined(OS_CONFIG_TEST_ENABLE) ||                                                                 \
     !defined(OS_CONFIG_TICK_HZ) ||                                                                     \
     !defined(OS_CONFIG_HEAP_SIZE) ||                                                                   \
-    !defined(OS_CONFIG_MAX_TASKS) ||                                                                   \
+    !defined(OS_CONFIG_MAX_USER_TASKS) ||                                                              \
     !defined(OS_CONFIG_MAX_TIMERS) || !defined(OS_CONFIG_MAX_WORKS) ||                                 \
     !defined(OS_CONFIG_WORK_PAYLOAD_SIZE) ||                                                           \
     !defined(OS_CONFIG_MIN_STACK_SIZE) || !defined(OS_CONFIG_WORK_STACK_SIZE) ||                       \

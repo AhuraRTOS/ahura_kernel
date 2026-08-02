@@ -64,12 +64,12 @@
  * ***********************************************************************************************************
 */
 
-/* Task table size; each enabled kernel service task (work, timer, log) occupies
- * one of these slots - and so does the default application task (tsk_main,
- * unconditional unless OS_CONFIG_TEST_ENABLE in PART 2 is 1) and the self-test
- * task (tsk_test) when enabled. Budget for all of them plus the application's
- * own tasks. */
-#define OS_CONFIG_MAX_TASKS                 10U
+/* How many tasks the APPLICATION may have. The kernel's own service tasks are
+ * NOT counted here: it reserves their slots on top of this number, so enabling
+ * the log or the work queue never costs the application a task, and this value
+ * is exactly what os_task_create() will accept before returning
+ * OS_STATUS_FULL. */
+#define OS_CONFIG_MAX_USER_TASKS            6U
 
 /**
  * Minimum stack size in bytes. Must leave room for one hardware exception
@@ -77,6 +77,20 @@
  * (100 bytes with FPU) on top of the task's own usage.
  */
 #define OS_CONFIG_MIN_STACK_SIZE            256U
+
+/* Stack-overflow detection. On every switch away from a task the kernel checks
+ * that its stack pointer is still inside its own stack and that the guard word
+ * at the bottom is intact; on a hit it calls os_stack_overflow_cb() and parks
+ * the core, exactly as a failed OS_ASSERT does. Costs a compare and a load per
+ * context switch.
+ *
+ * Worth leaving on. A blown stack otherwise corrupts whatever happens to sit
+ * below it and the symptom appears somewhere unrelated, often much later.
+ * ARMv8-M mainline traps this in hardware (per-task PSPLIM) whatever this is
+ * set to; every other core - M0, M0+, M23, M3, M4, M7 - has no such register
+ * and this is the only detection available. */
+#define OS_CONFIG_STACK_CHECK_ENABLE        1U
+
 
 /*
  * ***********************************************************************************************************
@@ -166,7 +180,8 @@
 */
 
 /* Timer callbacks run on the kernel timer task (tsk_timer), which occupies one
- * OS_CONFIG_MAX_TASKS slot and runs the callbacks on the stack sized here. */
+ * task-table slot the kernel reserves for itself - not one of
+ * OS_CONFIG_MAX_USER_TASKS - and runs the callbacks on the stack sized here. */
 #define OS_CONFIG_TIMER_ENABLE              1U
 #define OS_CONFIG_MAX_TIMERS                8U
 #define OS_CONFIG_TIMER_STACK_SIZE          512U
@@ -183,7 +198,8 @@
 */
 
 /* Work handlers run on the kernel work task (tsk_work), which occupies one
- * OS_CONFIG_MAX_TASKS slot and runs the handlers on the stack sized here. */
+ * task-table slot the kernel reserves for itself - not one of
+ * OS_CONFIG_MAX_USER_TASKS - and runs the handlers on the stack sized here. */
 #define OS_CONFIG_WORK_ENABLE               1U
 #define OS_CONFIG_MAX_WORKS                 8U
 #define OS_CONFIG_WORK_STACK_SIZE           512U
@@ -278,7 +294,7 @@
 /* Buffered debug logging (OS_LOG_ERROR/WARN/INFO/DEBUG): printf-style calls format into a ring
  * buffer and return immediately, and a low-priority kernel task (tsk_log) hands finished bytes
  * to os_log_output_cb() for the application to transmit. Safe from tasks and ISRs, and it never
- * blocks the caller. Two costs to budget for: tsk_log occupies one OS_CONFIG_MAX_TASKS slot,
+ * blocks the caller. Two costs to budget for: tsk_log occupies a kernel-reserved task-table slot (not one of OS_CONFIG_MAX_USER_TASKS),
  * and formatting uses libc vsnprintf, which pulls newlib's formatter into the link (~1-3 KB) if
  * the application does not already use printf. As usual, %f additionally needs the linker flag
  * -u _printf_float. See the README "Debugging" section. */

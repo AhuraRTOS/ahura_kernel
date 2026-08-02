@@ -52,6 +52,6 @@ void os_main(void)
     while (1)
     {
         /* TODO: replace with the application's own code. */
-        (void)os_delay_ms(1000U);
+        os_delay_ms(1000U);
     }
 }
