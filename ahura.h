@@ -827,7 +827,7 @@ os_status os_queue_cleanup(os_queue_t *queue);
 
 /*
  * ***********************************************************************************************************
- * Event group        - OS_CONFIG_EVENT_ENABLE
+ * Events             - OS_CONFIG_EVENT_ENABLE
  * ***********************************************************************************************************
 */
 
@@ -835,7 +835,7 @@ os_status os_queue_cleanup(os_queue_t *queue);
 
 /******************************************************************************************************/
 /**
- * @brief Event group object.
+ * @brief Event object: 32 bits several tasks can wait on.
  */
 typedef struct
 {
@@ -846,21 +846,21 @@ typedef struct
 
 /******************************************************************************************************/
 /**
- * @brief Initialize an event group object.
+ * @brief Initialize an event object.
  */
-os_status os_event_init(os_event_t *group);
+os_status os_event_init(os_event_t *event);
 
 /******************************************************************************************************/
 /**
- * @brief Set event bits in the group (ISR-safe).
+ * @brief Set event bits (ISR-safe).
  */
-os_status os_event_set_bits(os_event_t *group, uint32_t bits);
+os_status os_event_set_bits(os_event_t *event, uint32_t bits);
 
 /******************************************************************************************************/
 /**
- * @brief Clear event bits in the group (ISR-safe).
+ * @brief Clear event bits (ISR-safe).
  */
-os_status os_event_clear_bits(os_event_t *group, uint32_t bits);
+os_status os_event_clear_bits(os_event_t *event, uint32_t bits);
 
 /******************************************************************************************************/
 /**
@@ -868,7 +868,7 @@ os_status os_event_clear_bits(os_event_t *group, uint32_t bits);
  *        consumes the requested bits atomically with the match (no lost set between the
  *        wait returning and a separate manual clear).
  */
-os_status os_event_wait_bits(os_event_t *group, uint32_t bits, bool wait_all, bool clear_on_exit, uint32_t *matched_bits, uint32_t timeout_ms);
+os_status os_event_wait_bits(os_event_t *event, uint32_t bits, bool wait_all, bool clear_on_exit, uint32_t *matched_bits, uint32_t timeout_ms);
 
 #endif /* OS_CONFIG_EVENT_ENABLE */
 

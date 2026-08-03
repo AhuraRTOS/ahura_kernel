@@ -325,7 +325,7 @@ static test_fanin_ctx_t os_test_fanin_ctx[3];
 /* Concurrent multi-primitive stress/soak (see "Stress/Soak" below): unlike every scenario
  * above, which runs a small fixed handful of tasks each doing ONE thing, this runs
  * OS_TEST_STRESS_WORKER_COUNT tasks at distinct priorities that each hit a mutex, a
- * deliberately under-provisioned semaphore and queue, an event group, and the kernel heap -
+ * deliberately under-provisioned semaphore and queue, an event, and the kernel heap -
  * all at once, repeatedly, for many iterations, then check hard invariants instead of just
  * "the call returned OK". Bump OS_TEST_STRESS_ITERATIONS for a longer soak run; the default
  * is sized to add at most a couple of seconds to a boot-time log, not to replace a real
@@ -1620,7 +1620,7 @@ static void test_queue(void)
 
 /*
  * ***********************************************************************************************************
- * Event group
+ * Event
  * ***********************************************************************************************************
 */
 
@@ -1634,7 +1634,7 @@ static void test_event_group(void)
     uint32_t  t1;
     uint32_t  delta;
 
-    test_print_section("Event Group");
+    test_print_section("Events");
 
     AHURA_TEST_CHECK(os_event_init(&os_test_event) == OS_STATUS_OK, "os_event_init() succeeds");
 
@@ -2715,7 +2715,7 @@ static void test_mutex_multi_inheritance(void)
 /******************************************************************************************************/
 /**
  * @brief Waits ctx->work_ms (staggered per task so completion order is not predictable), sends
- *        ctx->value into the shared queue, then sets ctx->bit in the shared event group - one
+ *        ctx->value into the shared queue, then sets ctx->bit in the shared event - one
  *        of three independent workers in a fan-out/fan-in pattern.
  */
 static void test_fanin_worker_entry(void *context)
@@ -2730,7 +2730,7 @@ static void test_fanin_worker_entry(void *context)
 /******************************************************************************************************/
 /**
  * @brief Three tasks each do "work" for a different duration, then deliver a queue item and set
- *        their own event bit. The test task wait-alls on all 3 bits (proving the event group
+ *        their own event bit. The test task wait-alls on all 3 bits (proving the event
  *        correctly rendezvous-es 3 independent, differently-timed setters) then drains the
  *        queue and checks the exact multiset of values arrived - order-independent, since which
  *        worker finishes first is not deterministic.
@@ -2745,12 +2745,12 @@ static void test_event_queue_fanin(void)
     uint32_t  expected_sum;
     bool      saw[3]       = { false, false, false };
 
-    test_print_section("Combined: Event Group + Queue, fan-out/fan-in across 3 tasks");
+    test_print_section("Combined: Events + Queue, fan-out/fan-in across 3 tasks");
 
     AHURA_TEST_CHECK(os_queue_cleanup(&os_test_queue) == OS_STATUS_OK,
                       "fan-in queue emptied and reused (capacity %u, one slot per worker)",
                       (unsigned)os_test_queue.capacity);
-    AHURA_TEST_CHECK(os_event_init(&os_test_event) == OS_STATUS_OK, "fan-in event group initialized");
+    AHURA_TEST_CHECK(os_event_init(&os_test_event) == OS_STATUS_OK, "fan-in event initialized");
 
     os_test_fanin_ctx[0].bit = 0x01U; os_test_fanin_ctx[0].value = 10U; os_test_fanin_ctx[0].work_ms = 60U;
     os_test_fanin_ctx[1].bit = 0x02U; os_test_fanin_ctx[1].value = 20U; os_test_fanin_ctx[1].work_ms = 20U;
@@ -2891,7 +2891,7 @@ static void test_stress_worker_entry(void *context)
                 break;
             }
 
-            case 3U: /* event group: set a couple of bits, then a short bounded wait - mainly
+            case 3U: /* event: set a couple of bits, then a short bounded wait - mainly
                       * here to add concurrent set/wait/clear-on-exit pressure on top of the rest. */
             {
                 uint32_t bit     = 1UL << (test_stress_prng_next(&ctx->prng_state) % 4U);
@@ -2936,7 +2936,7 @@ static void test_stress_worker_entry(void *context)
 /******************************************************************************************************/
 /**
  * @brief Concurrent multi-primitive stress/soak: OS_TEST_STRESS_WORKER_COUNT tasks at distinct
- *        priorities hit a mutex, an under-provisioned semaphore and queue, an event group, and
+ *        priorities hit a mutex, an under-provisioned semaphore and queue, an event, and
  *        the kernel heap simultaneously and repeatedly, then the results are checked against
  *        hard invariants (exact mutex-protected counter, exact semaphore token reconciliation,
  *        no heap leak, no pattern/queue corruption) rather than just "the call returned OK".
@@ -2965,7 +2965,7 @@ static void test_stress_soak(void)
     AHURA_TEST_CHECK(os_semaphore_init(&os_test_stress_sem, OS_TEST_STRESS_SEM_MAX, OS_TEST_STRESS_SEM_MAX) == OS_STATUS_OK,
                       "stress semaphore initialized (max=%u, deliberately < %u workers)",
                       (unsigned)OS_TEST_STRESS_SEM_MAX, (unsigned)OS_TEST_STRESS_WORKER_COUNT);
-    AHURA_TEST_CHECK(os_event_init(&os_test_stress_event) == OS_STATUS_OK, "stress event group initialized");
+    AHURA_TEST_CHECK(os_event_init(&os_test_stress_event) == OS_STATUS_OK, "stress event initialized");
     AHURA_TEST_CHECK(os_queue_cleanup(&os_test_stress_queue) == OS_STATUS_OK,
                       "stress queue emptied and reused (capacity=%u, deliberately < %u workers)",
                       (unsigned)os_test_stress_queue.capacity, (unsigned)OS_TEST_STRESS_WORKER_COUNT);
@@ -3832,7 +3832,7 @@ static void test_ebs_entry(void *context)
 
 /******************************************************************************************************/
 /**
- * @brief Four tasks each own one bit of the same event group and pound set / wait / clear-on-exit
+ * @brief Four tasks each own one bit of the same event and pound set / wait / clear-on-exit
  *        on it concurrently, 250 iterations apiece. Because a worker only ever touches its OWN bit
  *        and consumes it in the same iteration it set it, the group must end with all four bits
  *        clear - a bit left standing means one set was matched without being cleared, or cleared
@@ -3848,7 +3848,7 @@ static void test_stress_event_bit_storm(void)
 
     test_print_section("Stress: 4 tasks set/wait/clear their own event bit concurrently");
 
-    AHURA_TEST_CHECK(os_event_init(&os_test_ebs_event) == OS_STATUS_OK, "bit-storm event group initialized");
+    AHURA_TEST_CHECK(os_event_init(&os_test_ebs_event) == OS_STATUS_OK, "bit-storm event initialized");
 
     for (i = 0U; i < OS_TEST_EBS_WORKERS; i++)
     {

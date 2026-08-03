@@ -11,7 +11,7 @@ HAL or CMSIS dependency.
 - **Preemptive priority scheduler.** 31 priority levels, O(1) list-based ready
   queues, and round-robin among tasks of equal priority.
 - **Full sync/IPC set.** Mutexes (always with single-level priority
-  inheritance), counting semaphores, queues, event groups, and lightweight
+  inheritance), counting semaphores, queues, events, and lightweight
   per-task notifications, all with millisecond timeouts.
 - **Software timers and a deferrable work queue.** One-shot and periodic timers
   plus a work queue in the style of Zephyr, each on its own kernel service task.
@@ -174,7 +174,7 @@ compiles away entirely when its `OS_CONFIG_<FEATURE>_ENABLE` is 0.
 | **Mutex** | `os_mutex_init` · `os_mutex_lock` · `os_mutex_try_lock` · `os_mutex_unlock` |
 | **Semaphore** | `os_semaphore_init` · `os_semaphore_give` · `os_semaphore_take` |
 | **Queue** | `OS_QUEUE_DEFINE_STATIC` · `OS_QUEUE_DEFINE_BUFFER` · `OS_QUEUE_DEFINE_DYNAMIC` · `os_queue_init_dynamic` · `os_queue_send` · `os_queue_receive` · `os_queue_count_get` · `os_queue_free_get` · `os_queue_cleanup` |
-| **Event group** | `os_event_init` · `os_event_set_bits` · `os_event_clear_bits` · `os_event_wait_bits` |
+| **Event** | `os_event_init` · `os_event_set_bits` · `os_event_clear_bits` · `os_event_wait_bits` |
 | **Task notifications** | `os_notify_give` · `os_notify_wait` |
 | **Software timers** | `os_timer_init` · `os_timer_start` · `os_timer_restart` · `os_timer_pause` · `os_timer_stop` · `os_timer_delete` |
 | **Work queue** | `os_work_submit` |
@@ -349,7 +349,7 @@ Waits are exact. Every object carries its own waiter list, and queues carry two,
 one for senders and one for receivers. A blocked task consumes zero CPU until
 the object signals it or its timeout expires. Unlock, give, send, receive, and
 set_bits all wake the **highest-priority** waiter, FIFO among equals, while
-event groups wake all waiters so each one re-evaluates its bit condition. On a
+events wake all waiters so each one re-evaluates its bit condition. On a
 timeout the tick removes the task from both the delay list and the waiter list.
 Wakeups re-check the condition, so a faster third task taking the object in
 between is handled by re-waiting with the remaining timeout.
@@ -1033,7 +1033,7 @@ running normally again.
 The task runs `os_test()` once. It exercises whichever
 `OS_CONFIG_<FEATURE>_ENABLE` switches are on, covering tasks, delays, critical
 sections, the scheduler lock, mutexes and priority inheritance, semaphores,
-queues, event groups, task notifications, timers, work items, the kernel heap,
+queues, events, task notifications, timers, work items, the kernel heap,
 stack watermarks, CPU usage, and the intrusive list. It prints a detailed PASS/FAIL log via `printf`
 with a pass/fail summary, then finishes with a **benchmark table**: each hot
 kernel path timed with the CPU cycle counter, sampled repeatedly with the
@@ -1056,7 +1056,7 @@ a different class of bug:
 
 | Tier | What it does |
 |---|---|
-| **Multi-primitive soak** | `test_stress_soak` — 4 tasks at distinct priorities hit a mutex, an under-provisioned semaphore and queue, an event group and the heap *simultaneously* for many iterations, then check hard invariants (exact mutex-protected counter, exact token reconciliation, no leak, no corruption) |
+| **Multi-primitive soak** | `test_stress_soak` — 4 tasks at distinct priorities hit a mutex, an under-provisioned semaphore and queue, an event and the heap *simultaneously* for many iterations, then check hard invariants (exact mutex-protected counter, exact token reconciliation, no leak, no corruption) |
 | **Create/destroy churn** | `test_stress_task_churn`, `test_stress_timer_churn` — one create/run/exit or init/start/stop path cycled 500 times, to shake out slot-reuse and list-corruption bugs |
 | **Per-subsystem stress** | Nine tests, one subsystem each, at high volume with exact accounting (below) |
 
@@ -1106,7 +1106,7 @@ HAL headers.
 | `os_main_mutex.c` | Mutual exclusion with `os_mutex_*` |
 | `os_main_semaphore.c` | Counting semaphore, producer and consumer |
 | `os_main_queue.c` | Message queue, producer and consumer, both static (`OS_QUEUE_DEFINE_STATIC`) and dynamic (`os_queue_init_dynamic`) storage |
-| `os_main_event.c` | Event group, waiting on multiple bits |
+| `os_main_event.c` | Event, waiting on multiple bits |
 | `os_main_notify.c` | Task notifications with `os_notify_*` |
 | `os_main_timer.c` | One-shot and periodic software timers |
 | `os_main_work.c` | Deferrable work queue |

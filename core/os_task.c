@@ -1168,7 +1168,7 @@ bool os_task_waiters_wake_one(os_list_t *waiters)
 /******************************************************************************************************/
 /**
  * @brief Wake every task waiting on an object (call inside a critical section; ISR-safe).
- *        Used by event groups, where each waiter re-evaluates its own bit condition.
+ *        Used by events, where each waiter re-evaluates its own bit condition.
  *
  * @param[in,out] waiters  The object's waiter list.
  * @return None.
@@ -2310,7 +2310,7 @@ static void os_task_wake_locked(os_task_tcb_t *tcb)
  *
  * The clears are what keep woken_from from outliving its object: a task that
  * has finished waiting must not carry a pointer into a queue, semaphore or
- * event group it no longer has any relationship with, since that object may
+ * event it no longer has any relationship with, since that object may
  * be released or leave scope long before the task is paused or deleted.
  *
  * @param[in,out] tcb  Task about to be suspended or deleted.

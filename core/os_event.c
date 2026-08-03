@@ -1,6 +1,6 @@
 /**
  * @file os_event.c
- * @brief Event group module implementation with timeouts.
+ * @brief Event module implementation with timeouts: 32 bits several tasks can wait on.
  *
  * @copyright (c) 2026 Ahura Project Contributors
  *            SPDX-License-Identifier: MIT
@@ -37,7 +37,7 @@
 /* Context handed through os_task_waiters_wake_match during a set_bits walk. */
 typedef struct
 {
-    uint32_t flags_snapshot; /* group flags every waiter is evaluated against  */
+    uint32_t flags_snapshot; /* event flags every waiter is evaluated against  */
     uint32_t clear_accum;    /* bits consumed by satisfied clear-on-exit waiters */
 
 } os_event_match_context_t;
@@ -58,33 +58,33 @@ static bool os_event_waiter_match(uint32_t data0, uint32_t data1, void *context,
 
 /******************************************************************************************************/
 /**
- * @brief Initialize an event group object.
+ * @brief Initialize an event object.
  *
- * Re-initializing a group that still has queued waiters is refused: resetting
+ * Re-initializing an event object that still has queued waiters is refused: resetting
  * the waiter list would strand the queued tasks on dangling intrusive nodes
  * and corrupt the list. (First-time init must run on zero-initialized
  * storage - static objects are.)
  *
- * @param[in,out] group  Event group object.
+ * @param[in,out] event  Event object.
  * @return os_status  OK, or BUSY while tasks are waiting on it.
  */
-os_status os_event_init(os_event_t *group)
+os_status os_event_init(os_event_t *event)
 {
-    if (group == NULL)
+    if (event == NULL)
     {
         return OS_STATUS_INVALID_ARG;
     }
 
     os_critical_enter();
 
-    if (group->waiters.head != NULL)
+    if (event->waiters.head != NULL)
     {
         os_critical_exit();
         return OS_STATUS_BUSY;
     }
 
-    group->flags = 0U;
-    os_list_init(&group->waiters);
+    event->flags = 0U;
+    os_list_init(&event->waiters);
 
     os_critical_exit();
     return OS_STATUS_OK;
@@ -92,7 +92,7 @@ os_status os_event_init(os_event_t *group)
 
 /******************************************************************************************************/
 /**
- * @brief Set event bits in the group (ISR-safe).
+ * @brief Set event bits (ISR-safe).
  *
  * Every waiter's condition is evaluated HERE, against one snapshot of the
  * flags, and satisfied waiters receive their matched bits atomically with
@@ -101,29 +101,29 @@ os_status os_event_init(os_event_t *group)
  * clear-on-exit waiters are cleared after the walk, so several waiters
  * satisfied by the same set all get delivery.
  *
- * @param[in,out] group  Event group object.
+ * @param[in,out] event  Event object.
  * @param[in]     bits   Bits to set.
  * @return os_status Status code.
  */
-os_status os_event_set_bits(os_event_t *group, uint32_t bits)
+os_status os_event_set_bits(os_event_t *event, uint32_t bits)
 {
     os_event_match_context_t match_context;
 
-    if (group == NULL)
+    if (event == NULL)
     {
         return OS_STATUS_INVALID_ARG;
     }
 
     os_critical_enter();
 
-    group->flags |= bits;
+    event->flags |= bits;
 
-    match_context.flags_snapshot = group->flags;
+    match_context.flags_snapshot = event->flags;
     match_context.clear_accum    = 0U;
 
-    (void)os_task_waiters_wake_match(&group->waiters, os_event_waiter_match, &match_context);
+    (void)os_task_waiters_wake_match(&event->waiters, os_event_waiter_match, &match_context);
 
-    group->flags &= ~match_context.clear_accum;
+    event->flags &= ~match_context.clear_accum;
 
     os_critical_exit();
 
@@ -132,21 +132,21 @@ os_status os_event_set_bits(os_event_t *group, uint32_t bits)
 
 /******************************************************************************************************/
 /**
- * @brief Clear event bits in the group (ISR-safe).
+ * @brief Clear event bits (ISR-safe).
  *
- * @param[in,out] group  Event group object.
+ * @param[in,out] event  Event object.
  * @param[in]     bits   Bits to clear.
  * @return os_status Status code.
  */
-os_status os_event_clear_bits(os_event_t *group, uint32_t bits)
+os_status os_event_clear_bits(os_event_t *event, uint32_t bits)
 {
-    if (group == NULL)
+    if (event == NULL)
     {
         return OS_STATUS_INVALID_ARG;
     }
 
     os_critical_enter();
-    group->flags &= ~bits;
+    event->flags &= ~bits;
     os_critical_exit();
 
     return OS_STATUS_OK;
@@ -163,7 +163,7 @@ os_status os_event_clear_bits(os_event_t *group, uint32_t bits)
  * no longer be lost. Nonzero timeouts are only honored from task context
  * after os_start.
  *
- * @param[in]  group          Event group object.
+ * @param[in]  event          Event object.
  * @param[in]  bits           Bits to wait for.
  * @param[in]  wait_all       True to require all bits, false for any bit.
  * @param[in]  clear_on_exit  True to consume (clear) the requested bits on a match.
@@ -172,14 +172,14 @@ os_status os_event_clear_bits(os_event_t *group, uint32_t bits)
  * @return os_status  OK on match, BUSY when unmatched without waiting,
  *                    TIMEOUT when the wait elapsed.
  */
-os_status os_event_wait_bits(os_event_t *group, uint32_t bits, bool wait_all, bool clear_on_exit, uint32_t *matched_bits, uint32_t timeout_ms)
+os_status os_event_wait_bits(os_event_t *event, uint32_t bits, bool wait_all, bool clear_on_exit, uint32_t *matched_bits, uint32_t timeout_ms)
 {
     uint32_t budget_ticks;
     uint32_t start_tick;
     uint32_t remaining_ticks;
     uint32_t wait_flags;
 
-    if ((group == NULL) || (matched_bits == NULL) || (bits == 0U))
+    if ((event == NULL) || (matched_bits == NULL) || (bits == 0U))
     {
         return OS_STATUS_INVALID_ARG;
     }
@@ -199,7 +199,7 @@ os_status os_event_wait_bits(os_event_t *group, uint32_t bits, bool wait_all, bo
 
         os_critical_enter();
 
-        current_flags = group->flags & bits;
+        current_flags = event->flags & bits;
         *matched_bits = current_flags;
 
         if (wait_all)
@@ -215,7 +215,7 @@ os_status os_event_wait_bits(os_event_t *group, uint32_t bits, bool wait_all, bo
         {
             if (clear_on_exit)
             {
-                group->flags &= ~bits;
+                event->flags &= ~bits;
             }
 
             os_task_wait_end();
@@ -241,7 +241,7 @@ os_status os_event_wait_bits(os_event_t *group, uint32_t bits, bool wait_all, bo
          * waiter list inside the same critical section that saw the bits
          * unmatched (no lost-wakeup window against set_bits). */
         os_task_wait_data_set(bits, wait_flags);
-        os_task_wait_begin(&group->waiters, remaining_ticks);
+        os_task_wait_begin(&event->waiters, remaining_ticks);
         os_critical_exit();
 
         if (!os_task_wait_signaled())
