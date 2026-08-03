@@ -131,18 +131,21 @@ os_status os_queue_send(os_queue_t *queue, const void *item, uint32_t timeout_ms
             /* An item arrived: release the highest-priority receiver. */
             (void)os_task_waiters_wake_one(&queue->receive_waiters);
 
+            os_task_wait_end();
             os_critical_exit();
             return OS_STATUS_OK;
         }
 
         if ((timeout_ms == OS_WAIT_NOTHING) || !os_internal_can_block())
         {
+            os_task_wait_end();
             os_critical_exit();
             return OS_STATUS_FULL;
         }
 
         if (remaining_ticks == 0U)
         {
+            os_task_wait_end();
             os_critical_exit();
             return OS_STATUS_TIMEOUT;
         }
@@ -157,6 +160,7 @@ os_status os_queue_send(os_queue_t *queue, const void *item, uint32_t timeout_ms
          * counts toward the timeout. */
         if (!os_task_wait_signaled())
         {
+            os_task_wait_end();
             return OS_STATUS_TIMEOUT;
         }
 
@@ -204,18 +208,21 @@ os_status os_queue_receive(os_queue_t *queue, void *item_out, uint32_t timeout_m
             /* A slot freed up: release the highest-priority sender. */
             (void)os_task_waiters_wake_one(&queue->send_waiters);
 
+            os_task_wait_end();
             os_critical_exit();
             return OS_STATUS_OK;
         }
 
         if ((timeout_ms == OS_WAIT_NOTHING) || !os_internal_can_block())
         {
+            os_task_wait_end();
             os_critical_exit();
             return OS_STATUS_EMPTY;
         }
 
         if (remaining_ticks == 0U)
         {
+            os_task_wait_end();
             os_critical_exit();
             return OS_STATUS_TIMEOUT;
         }
@@ -230,6 +237,7 @@ os_status os_queue_receive(os_queue_t *queue, void *item_out, uint32_t timeout_m
          * counts toward the timeout. */
         if (!os_task_wait_signaled())
         {
+            os_task_wait_end();
             return OS_STATUS_TIMEOUT;
         }
 
@@ -258,6 +266,38 @@ size_t os_queue_count_get(const os_queue_t *queue)
     os_critical_exit();
 
     return count;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Get the number of item slots the queue can still accept.
+ *
+ * The companion to os_queue_count_get, and the one back-pressure actually asks for: how many more
+ * items fit right now, without having to pair a count with the capacity the caller declared
+ * somewhere else. Both are snapshots - anything that sends or receives in between changes the
+ * answer - so treat a nonzero result as "worth trying", not as a guarantee that the next send
+ * cannot report OS_STATUS_FULL.
+ *
+ * @param[in] queue  Queue object.
+ * @return size_t    Free item slots; 0 for NULL, and 0 for a dynamic queue with no buffer bound yet.
+ */
+size_t os_queue_free_get(const os_queue_t *queue)
+{
+    size_t free_slots;
+
+    if (queue == NULL)
+    {
+        return 0U;
+    }
+
+    /* count never exceeds capacity (every send checks first), so the
+     * subtraction cannot wrap - including on an unbound queue, where both
+     * are still 0. */
+    os_critical_enter();
+    free_slots = queue->capacity - queue->count;
+    os_critical_exit();
+
+    return free_slots;
 }
 
 #if (OS_CONFIG_ALLOC_ENABLE == 1U)
@@ -332,10 +372,14 @@ os_status os_queue_init_dynamic(os_queue_t *queue, size_t item_size, size_t capa
 
     os_critical_exit();
 
+    /* The bind's own status, not a guess at it: os_queue_bind_buffer also
+     * reports OS_STATUS_INVALID_ARG, and hardcoding BUSY here is correct only
+     * for as long as every INVALID_ARG precondition happens to be checked
+     * above. */
     if (status != OS_STATUS_OK)
     {
         os_mem_free(buffer);
-        return OS_STATUS_BUSY;
+        return status;
     }
 
     return OS_STATUS_OK;

@@ -108,6 +108,7 @@ os_status os_mutex_lock(os_mutex_t *mutex, uint32_t timeout_ms)
             mutex->locked   = true;
             mutex->owner_id = self_id;
             os_task_mutex_owner_link(&mutex->owner_node);
+            os_task_wait_end();
             os_critical_exit();
             return OS_STATUS_OK;
         }
@@ -117,12 +118,14 @@ os_status os_mutex_lock(os_mutex_t *mutex, uint32_t timeout_ms)
         /* Recursive lock attempt would deadlock forever: fail fast. */
         if (held_by_self || (timeout_ms == OS_WAIT_NOTHING) || !os_internal_can_block())
         {
+            os_task_wait_end();
             os_critical_exit();
             return OS_STATUS_BUSY;
         }
 
         if (remaining_ticks == 0U)
         {
+            os_task_wait_end();
             os_critical_exit();
             return OS_STATUS_TIMEOUT;
         }
@@ -141,6 +144,7 @@ os_status os_mutex_lock(os_mutex_t *mutex, uint32_t timeout_ms)
          * against the wall clock so READY time counts toward the timeout. */
         if (!os_task_wait_signaled())
         {
+            os_task_wait_end();
             return OS_STATUS_TIMEOUT;
         }
 
@@ -171,6 +175,7 @@ os_status os_mutex_try_lock(os_mutex_t *mutex)
 os_status os_mutex_unlock(os_mutex_t *mutex)
 {
     uint32_t self_id;
+    uint32_t owner_id;
 
     OS_ASSERT(!os_arch_in_isr());
     OS_ASSERT(mutex != NULL);
@@ -202,12 +207,18 @@ os_status os_mutex_unlock(os_mutex_t *mutex)
         return OS_STATUS_NOT_OWNER;
     }
 
+    /* Captured before the release clears it: the id is the only handle on the
+     * task whose owned-mutex list and priority boost this unlock has to undo,
+     * and that task is not necessarily the caller (see the ownership check
+     * above, which passes when either side is unidentifiable). */
+    owner_id = mutex->owner_id;
+
     mutex->locked   = false;
     mutex->owner_id = 0U;
 
     /* Drop any boost owed to this mutex before waking the next waiter, so
      * the wake's own preempt check compares against the correct priority. */
-    os_task_mutex_owner_unlink_and_reprioritize(&mutex->owner_node);
+    os_task_mutex_owner_unlink_and_reprioritize(owner_id, &mutex->owner_node);
 
     /* Hand the release to the highest-priority waiter (it re-takes in its
      * own context; no ownership transfer inside the unlock). */

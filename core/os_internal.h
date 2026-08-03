@@ -101,6 +101,14 @@ void os_task_wait_begin(os_list_t *waiters, uint32_t timeout_ticks);
 
 /******************************************************************************************************/
 /**
+ * @brief Drop the calling task's pending-wake state; call on every path where a blocking
+ *        primitive stops retrying and returns to its caller, signaled or not - that is what
+ *        tells os_task_wake_compensate the notification was consumed (os_task.c).
+ */
+void os_task_wait_end(void);
+
+/******************************************************************************************************/
+/**
  * @brief After resuming from a wait: true = object signaled, false = timeout (os_task.c).
  */
 bool os_task_wait_signaled(void);
@@ -163,9 +171,18 @@ bool os_task_current_is_idle(void);
 /******************************************************************************************************/
 /**
  * @brief Whether a PendSV on this core would actually switch or round-robin (os_task.c,
- *        ISR-safe). Lets the tick handler skip a pointless PendSV round trip.
+ *        ISR-safe). Lets the tick handler skip a pointless PendSV round trip. False while the
+ *        scheduler is locked, and for an equal-priority peer until the running task's time
+ *        slice has run out.
  */
 bool os_task_reschedule_possible(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Count elapsed ticks against the running task's round-robin time slice; call once per
+ *        tick on every core, before os_task_reschedule_possible (os_task.c, ISR context).
+ */
+void os_task_slice_tick(uint32_t elapsed_ticks);
 
 /******************************************************************************************************/
 /**
@@ -190,6 +207,51 @@ uint32_t* os_task_stack_select_next(void);
  * @brief Return ticks until the next finite-delay sleeper wakes, UINT32_MAX when none (os_task.c).
  */
 uint32_t os_task_next_delay_ticks_get(void);
+
+#if (OS_CONFIG_NOTIFY_ENABLE == 1U)
+/*
+ * ***********************************************************************************************************
+ * Task notification mailbox - the storage os_notify.c works on
+ * ***********************************************************************************************************
+ *
+ * The mailbox lives in the TCB because it belongs to the task, not to any object; os_notify.c owns
+ * what it MEANS. These three calls are the whole surface between them - os_task.c never reads or
+ * writes a slot, and os_notify.c never sees a TCB - and they join os_task_tcb_resolve,
+ * os_task_wake_tcb and os_task_sleep_ticks, which the notify module uses as they stand.
+*/
+
+/******************************************************************************************************/
+/**
+ * @brief One task's notification mailbox: a value with overwrite semantics, plus the two flags
+ *        that say whether one is latched and whether the owner is parked waiting for it.
+ */
+typedef struct
+{
+    uint32_t value;   /* latched value (overwrite: last os_notify_give wins)          */
+    bool     pending; /* a value is latched, waiting to be consumed by os_notify_wait */
+    bool     waiting; /* true only while the task is blocked inside os_notify_wait    */
+
+} os_notify_slot_t;
+
+/******************************************************************************************************/
+/**
+ * @brief The calling task's TCB handle, or NULL for the idle task and before the scheduler starts
+ *        (os_task.c, call inside a critical section).
+ */
+void* os_task_tcb_current(void);
+
+/******************************************************************************************************/
+/**
+ * @brief The notification mailbox embedded in a resolved task (os_task.c).
+ */
+os_notify_slot_t* os_task_notify_slot(void *tcb_handle);
+
+/******************************************************************************************************/
+/**
+ * @brief Whether a resolved task is currently BLOCKED (os_task.c, caller holds a critical section).
+ */
+bool os_task_tcb_is_blocked(const void *tcb_handle);
+#endif /* OS_CONFIG_NOTIFY_ENABLE */
 
 /*
  * ***********************************************************************************************************
@@ -243,11 +305,16 @@ static inline void os_critical_multicore_unlock(void) { }
 
 /******************************************************************************************************/
 /**
- * @brief Check whether the caller is allowed to block (task context, scheduler running).
+ * @brief Check whether the caller is allowed to block (task context, scheduler running and not
+ *        locked).
+ *
+ * A scheduler lock defers the very context switch blocking depends on, so a primitive that blocked
+ * under one would leave its task running while the kernel had it parked. Every blocking primitive
+ * therefore degrades to its OS_WAIT_NOTHING behaviour there, exactly as it does in an ISR.
  */
 static inline bool os_internal_can_block(void)
 {
-    return (os_kernel_is_running() && !os_arch_in_isr());
+    return (os_kernel_is_running() && !os_arch_in_isr() && !os_scheduler_is_locked());
 }
 
 /******************************************************************************************************/
@@ -337,11 +404,12 @@ void os_task_mutex_priority_inherit(uint32_t owner_task_id);
 
 /******************************************************************************************************/
 /**
- * @brief Unlink a released mutex from its owner's owned-mutex list and recompute the owner's
- *        effective priority as max(base_priority, highest waiter still queued on any mutex it
- *        still holds) (os_task.c, call inside a critical section, right after releasing).
+ * @brief Unlink a released mutex from the owned-mutex list of the task owner_id names - not the
+ *        calling task, which need not be the owner - and recompute that owner's effective
+ *        priority as max(base_priority, highest waiter still queued on any mutex it still holds)
+ *        (os_task.c, call inside a critical section, right after releasing).
  */
-void os_task_mutex_owner_unlink_and_reprioritize(os_list_node_t *owner_node);
+void os_task_mutex_owner_unlink_and_reprioritize(uint32_t owner_id, os_list_node_t *owner_node);
 #endif /* OS_CONFIG_MUTEX_ENABLE */
 
 /*

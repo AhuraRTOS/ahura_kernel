@@ -51,6 +51,24 @@
 
 #define OS_CONFIG_TICK_HZ                   1000U
 
+/* Round-robin time slice, in ticks: how long a task may hold the CPU before an
+ * equal-priority peer takes over. Tasks of DIFFERENT priorities are unaffected
+ * - a higher-priority task always preempts immediately, whatever is set here.
+ *
+ *   1  Rotate on every tick. The classic default, and what the kernel did
+ *      before this option existed.
+ *   N  Rotate every N ticks. Each equal-priority task gets a longer, less
+ *      interrupted run, and the kernel spends proportionally fewer context
+ *      switches on rotation alone - the tick that would only have rotated now
+ *      costs a bitmap check instead of a full PendSV round trip.
+ *   0  No rotation at all: a task runs until it blocks, yields or is preempted
+ *      by a higher priority. Lowest overhead, but two equal-priority
+ *      compute-bound tasks will starve each other.
+ *
+ * A task that blocks or yields gives up the rest of its slice, and a freshly
+ * dispatched task always starts a whole one. */
+#define OS_CONFIG_TIME_SLICE_TICKS          1U
+
 /* The CPU clock is NOT configured here. The kernel reads the live CMSIS
  * SystemCoreClock variable, which the device's own SystemInit() sets and
  * SystemCoreClockUpdate() refreshes after every clock-tree change - a
@@ -224,9 +242,9 @@
 */
 
 /* Task notifications: a single overwrite uint32_t "mailbox" built into every task's own
- * control block (os_task_notify_give / os_task_notify_wait) - lets one task or an ISR signal
+ * control block (os_notify_give / os_notify_wait) - lets one task or an ISR signal
  * a specific task directly without allocating a separate semaphore/queue object. */
-#define OS_CONFIG_TASK_NOTIFY_ENABLE        1U
+#define OS_CONFIG_NOTIFY_ENABLE        1U
 
 /*
  * ***********************************************************************************************************

@@ -45,12 +45,12 @@
     !defined(OS_CONFIG_STACK_CHECK_ENABLE) ||                                                          \
     !defined(OS_CONFIG_CPU_USAGE_ENABLE) ||                                                            \
     !defined(OS_CONFIG_ASSERT_ENABLE) || !defined(OS_CONFIG_LOG_ENABLE) ||                             \
-    !defined(OS_CONFIG_ATOMIC_ENABLE) ||                                                               \
+    !defined(OS_CONFIG_ATOMIC_ENABLE) || !defined(OS_CONFIG_NOTIFY_ENABLE) ||                          \
     !defined(OS_CONFIG_LOG_LEVEL) || !defined(OS_CONFIG_LOG_BUFFER_SIZE) ||                            \
     !defined(OS_CONFIG_LOG_LINE_MAX) || !defined(OS_CONFIG_LOG_TASK_STACK_SIZE) ||                     \
     !defined(OS_CONFIG_LOG_TASK_PRIORITY) ||                                                           \
     !defined(OS_CONFIG_TEST_ENABLE) ||                                                                 \
-    !defined(OS_CONFIG_TICK_HZ) ||                                                                     \
+    !defined(OS_CONFIG_TICK_HZ) || !defined(OS_CONFIG_TIME_SLICE_TICKS) ||                             \
     !defined(OS_CONFIG_HEAP_SIZE) ||                                                                   \
     !defined(OS_CONFIG_MAX_USER_TASKS) ||                                                              \
     !defined(OS_CONFIG_MAX_TIMERS) || !defined(OS_CONFIG_MAX_WORKS) ||                                 \

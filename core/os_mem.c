@@ -184,7 +184,14 @@ void os_mem_free(void *memory)
         return;
     }
 
-    if (((uint8_t *)memory <= &os_mem_heap[0]) ||
+    /* The payload must leave room for its own header BELOW it, not merely lie
+     * somewhere in the heap: a pointer into the first header's worth of bytes
+     * would pass a plain range check and then be validated through a header
+     * that sits before the array entirely - an out-of-bounds read that links a
+     * fabricated block into the free list whenever the bytes preceding the
+     * heap happen to look allocated. Every real payload starts at least
+     * OS_MEM_HEADER_SIZE into the heap, so nothing legitimate is rejected. */
+    if (((uint8_t *)memory < &os_mem_heap[OS_MEM_HEADER_SIZE]) ||
         ((uint8_t *)memory >= &os_mem_heap[OS_CONFIG_HEAP_SIZE]))
     {
         return;

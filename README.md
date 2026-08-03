@@ -43,6 +43,7 @@ HAL or CMSIS dependency.
 [API at a glance](#api-at-a-glance) ·
 [Default application task](#default-application-task) ·
 [Task priorities](#task-priorities) ·
+[Scheduler lock](#scheduler-lock) ·
 [Timeout semantics](#timeout-semantics) ·
 [Mutexes and priority inheritance](#mutexes-and-priority-inheritance) ·
 [Task notifications](#task-notifications) ·
@@ -168,12 +169,13 @@ compiles away entirely when its `OS_CONFIG_<FEATURE>_ENABLE` is 0.
 | **Tasks** | `os_task_create` · `os_task_start` · `os_task_pause` · `os_task_delete` · `os_task_yield` · `os_task_state_get` · `os_task_core_affinity_set` |
 | **Delays and time** | `os_delay_ms` · `os_delay_us` · `os_delay_s` · `os_tick_get` |
 | **Critical sections** | `os_critical_enter` · `os_critical_exit` |
+| **Scheduler lock** | `os_scheduler_lock` · `os_scheduler_unlock` · `os_scheduler_is_locked` |
 | **Atomics** | `os_atomic_get` · `os_atomic_set` · `os_atomic_add` · `os_atomic_sub` · `os_atomic_inc` · `os_atomic_dec` · `os_atomic_or` · `os_atomic_and` · `os_atomic_xor` · `os_atomic_nand` · `os_atomic_clear` · `os_atomic_cas` · `os_atomic_test_bit` · `os_atomic_set_bit` · `os_atomic_clear_bit` · `os_atomic_test_and_set_bit` · `os_atomic_test_and_clear_bit` · `os_atomic_set_bit_to` |
 | **Mutex** | `os_mutex_init` · `os_mutex_lock` · `os_mutex_try_lock` · `os_mutex_unlock` |
 | **Semaphore** | `os_semaphore_init` · `os_semaphore_give` · `os_semaphore_take` |
-| **Queue** | `OS_QUEUE_DEFINE_STATIC` · `OS_QUEUE_DEFINE_BUFFER` · `OS_QUEUE_DEFINE_DYNAMIC` · `os_queue_init_dynamic` · `os_queue_send` · `os_queue_receive` · `os_queue_count_get` · `os_queue_cleanup` |
-| **Event group** | `os_event_group_init` · `os_event_group_set_bits` · `os_event_group_clear_bits` · `os_event_group_wait_bits` |
-| **Task notifications** | `os_task_notify_give` · `os_task_notify_wait` |
+| **Queue** | `OS_QUEUE_DEFINE_STATIC` · `OS_QUEUE_DEFINE_BUFFER` · `OS_QUEUE_DEFINE_DYNAMIC` · `os_queue_init_dynamic` · `os_queue_send` · `os_queue_receive` · `os_queue_count_get` · `os_queue_free_get` · `os_queue_cleanup` |
+| **Event group** | `os_event_init` · `os_event_set_bits` · `os_event_clear_bits` · `os_event_wait_bits` |
+| **Task notifications** | `os_notify_give` · `os_notify_wait` |
 | **Software timers** | `os_timer_init` · `os_timer_start` · `os_timer_restart` · `os_timer_pause` · `os_timer_stop` · `os_timer_delete` |
 | **Work queue** | `os_work_submit` |
 | **Kernel heap** | `os_mem_alloc` · `os_mem_free` · `os_mem_free_get` · `os_mem_watermark_get` |
@@ -269,15 +271,67 @@ live in the user range too, at `OS_CONFIG_MAIN_TASK_PRIORITY` and
 `OS_CONFIG_TEST_PRIORITY`. Unlike `tsk_work` and `tsk_timer` they are not
 priority-reserved, so pick values that fit alongside the application's own tasks.
 
+The kernel's own service tasks — `tsk_timer`, `tsk_work` and `tsk_log` — are
+also protected: `os_task_pause` and `os_task_delete` refuse them with
+`OS_STATUS_BUSY`, because the timer, work and log APIs are all built on one
+running and suspending it would turn every later call into a silent no-op that
+still reports success. `tsk_main` and `tsk_test` are ordinary application tasks
+and stay fully under the application's control. Note that the log task is *not*
+identifiable by priority — it runs at `OS_CONFIG_LOG_TASK_PRIORITY`, deliberately
+low — so the protection is a property of how the task was created, not of where
+it sits in the priority range.
+
 Because mutexes always do priority inheritance, a task's effective priority can
 be temporarily boosted above its configured value while it holds a contended
 mutex. See [Mutexes and priority
 inheritance](#mutexes-and-priority-inheritance).
 
+Tasks at the **same** priority round-robin. `OS_CONFIG_TIME_SLICE_TICKS` sets
+how long one holds the CPU before its peers get a turn:
+
+| Value | Behavior |
+|---|---|
+| `1` (default) | Rotate on every tick. |
+| `N` | Rotate every N ticks. Fewer context switches, longer uninterrupted runs. |
+| `0` | No rotation: a task runs until it blocks, yields, or is preempted. |
+
+Only equal-priority tasks are affected — a higher-priority task always preempts
+immediately, whatever the quantum. A task that blocks or yields gives up the
+rest of its slice, and a freshly dispatched task always starts a whole one.
+Raising the quantum also makes ticks cheaper: a tick that would only have
+rotated now costs a bitmap check instead of a full `PendSV` round trip.
+
+### Scheduler lock
+
+`os_scheduler_lock()` / `os_scheduler_unlock()` defer context switches on the
+calling core **without masking interrupts**. Interrupts keep running and keep
+waking tasks; those tasks simply do not get the CPU until the outermost unlock,
+which then takes the switch it deferred straight away. Nesting is counted, and
+`os_scheduler_is_locked()` reports the current state.
+
+This is the right tool when what you are guarding against is another *task*:
+
+| Data shared between | Use | Cost |
+|---|---|---|
+| task ↔ task | `os_scheduler_lock` | No interrupt latency at all. |
+| task ↔ ISR | `os_critical_enter` (or an atomic) | Interrupts masked for the region. |
+| core ↔ core | `os_critical_enter` | Masks locally, spins the other cores. |
+
+A scheduler lock excludes **no interrupt** and **no other core** — it is per
+core, and another core keeps scheduling its own tasks normally. Anything an ISR
+also touches still needs a critical section.
+
+While the lock is held the calling task cannot block, because blocking means
+switching away. Every blocking primitive behaves as if it had been called with
+`OS_WAIT_NOTHING`, `os_delay_ms` busy-waits instead of sleeping, and
+`os_task_pause`/`os_task_delete` aimed at the *calling* task return
+`OS_STATUS_BUSY`. Keep locked regions short and free of blocking calls, exactly
+as with a critical section.
+
 ### Timeout semantics
 
 Blocking APIs (`os_mutex_lock`, `os_semaphore_take`, `os_queue_send`,
-`os_queue_receive`, `os_event_group_wait_bits`, `os_task_notify_wait`) take a
+`os_queue_receive`, `os_event_wait_bits`, `os_notify_wait`) take a
 `timeout_ms` argument:
 
 | Value | Behavior |
@@ -287,8 +341,9 @@ Blocking APIs (`os_mutex_lock`, `os_semaphore_take`, `os_queue_send`,
 | `OS_WAIT_FOREVER` | Wait until available. |
 
 Nonzero timeouts are honored only from task context after `os_start`. From
-interrupt context, or before the scheduler starts, the call degrades to a
-non-blocking attempt.
+interrupt context, before the scheduler starts, or while the calling core holds
+a [scheduler lock](#scheduler-lock), the call degrades to a non-blocking
+attempt.
 
 Waits are exact. Every object carries its own waiter list, and queues carry two,
 one for senders and one for receivers. A blocked task consumes zero CPU until
@@ -326,19 +381,19 @@ rather than deadlocking.
 ### Task notifications
 
 A lightweight, single-value mailbox built directly into every task's own control
-block, enabled by `OS_CONFIG_TASK_NOTIFY_ENABLE`. It lets you signal one
+block, enabled by `OS_CONFIG_NOTIFY_ENABLE`. It lets you signal one
 specific task without allocating a separate semaphore or queue object:
 
 ```c
-os_task_notify_give(&some_task, 42U);         /* ISR-safe; overwrite: last write wins */
-os_task_notify_wait(OS_WAIT_FOREVER, &value); /* called by that task about itself     */
+os_notify_give(&some_task, 42U);         /* ISR-safe; overwrite: last write wins */
+os_notify_wait(OS_WAIT_FOREVER, &value); /* called by that task about itself     */
 ```
 
-`os_task_notify_give` latches the value and, if the target is currently blocked
-in `os_task_notify_wait`, wakes it immediately. A task blocked for any other
+`os_notify_give` latches the value and, if the target is currently blocked
+in `os_notify_wait`, wakes it immediately. A task blocked for any other
 reason, such as a delay or a mutex, queue, semaphore, or event wait, is left
 running as normal. The value simply waits to be picked up on its next
-`os_task_notify_wait` call, so nothing is lost. `os_task_notify_wait` is
+`os_notify_wait` call, so nothing is lost. `os_notify_wait` is
 task-only, like `os_mutex_lock`, because an ISR has no task identity to wait as,
 and it follows the `timeout_ms` convention above.
 
@@ -585,8 +640,12 @@ second catches one that went too deep and came back, which nothing else would
 notice. On a hit the kernel calls
 
 ```c
-void os_stack_overflow_cb(const char *task_name);   /* optional; weak default does nothing */
+void os_stack_overflow_cb(const char *task_name);   /* you define it; no kernel default */
 ```
+
+The kernel ships no default for it, so a build with the check enabled and no
+callback is a link error rather than an overflow detector reporting to nobody —
+same rule as `os_assert_failed_cb`. Copy the definition from `os_cb_template.c`.
 
 and then parks the core, exactly as a failed `OS_ASSERT` does — there is no
 attempt to continue, because memory outside the task has already been written
@@ -973,9 +1032,9 @@ running normally again.
 
 The task runs `os_test()` once. It exercises whichever
 `OS_CONFIG_<FEATURE>_ENABLE` switches are on, covering tasks, delays, critical
-sections, mutexes and priority inheritance, semaphores, queues, event groups,
-task notifications, timers, work items, the kernel heap, stack watermarks, CPU
-usage, and the intrusive list. It prints a detailed PASS/FAIL log via `printf`
+sections, the scheduler lock, mutexes and priority inheritance, semaphores,
+queues, event groups, task notifications, timers, work items, the kernel heap,
+stack watermarks, CPU usage, and the intrusive list. It prints a detailed PASS/FAIL log via `printf`
 with a pass/fail summary, then finishes with a **benchmark table**: each hot
 kernel path timed with the CPU cycle counter, sampled repeatedly with the
 minimum kept, and the measurement overhead subtracted. The header reports the
@@ -1048,7 +1107,7 @@ HAL headers.
 | `os_main_semaphore.c` | Counting semaphore, producer and consumer |
 | `os_main_queue.c` | Message queue, producer and consumer, both static (`OS_QUEUE_DEFINE_STATIC`) and dynamic (`os_queue_init_dynamic`) storage |
 | `os_main_event.c` | Event group, waiting on multiple bits |
-| `os_main_notify.c` | Task notifications with `os_task_notify_*` |
+| `os_main_notify.c` | Task notifications with `os_notify_*` |
 | `os_main_timer.c` | One-shot and periodic software timers |
 | `os_main_work.c` | Deferrable work queue |
 | `os_main_mem.c` | Kernel heap with `os_mem_alloc` and `os_mem_free` |
@@ -1128,9 +1187,13 @@ All filenames are `os_`-prefixed:
   ready list per priority plus a ready bitmap, where the highest set bit is the
   next priority to run and costs a single `CLZ` on ARMv7-M and up, round-robin
   by list rotation, and a delay list holding only the finite-delay sleepers.
-  This is also where mutex priority inheritance's effective-priority changes and
-  task notifications (`os_task_notify_give` and `os_task_notify_wait`) live,
-  since both are entirely about the TCB rather than separate kernel objects.
+  This is also where the scheduler lock and mutex priority inheritance's
+  effective-priority changes live, since both are entirely about the TCB and the
+  ready lists rather than about separate kernel objects.
+- `os_notify.c` is direct-to-task notifications (`os_notify_give`,
+  `os_notify_wait`). The one-word mailbox itself sits in the TCB, because it
+  belongs to the task rather than to any object, so `os_task.c` hands out the
+  slot and this module owns everything about what a notification means.
 - `os_tick.c` is the tick counter and tick handler, which wakes delays, drives
   timers, and preempts.
 - `os_delay.c` provides blocking millisecond and second delays plus a
@@ -1201,7 +1264,11 @@ folders on top.
 ## Notes and constraints
 
 - Do not block, whether by delaying or locking with a timeout, inside a critical
-  section or an ISR.
+  section, a scheduler-locked region, or an ISR. Under a scheduler lock the
+  kernel enforces it: blocking calls degrade to non-blocking rather than parking
+  a task it cannot switch away from. See [Scheduler lock](#scheduler-lock).
+- The kernel's service tasks (`tsk_timer`, `tsk_work`, `tsk_log`) cannot be
+  paused or deleted by the application; both calls return `OS_STATUS_BUSY`.
 - Work handlers and timer callbacks run on the highest-priority kernel tasks, so
   keep them short and non-blocking or user tasks will starve.
 - Timers run in two modes, `OS_TIMER_MODE_ONE_SHOT` which fires once then stops,

@@ -207,9 +207,18 @@ typedef enum
  * ***********************************************************************************************************
 */
 
-#define OS_TICKS_FROM_S(sec)    ((uint32_t)((uint64_t)(sec) * (uint64_t)OS_CONFIG_TICK_HZ))
-#define OS_TICKS_FROM_MS(ms)    ((uint32_t)((((uint64_t)(ms) * (uint64_t)OS_CONFIG_TICK_HZ) + 999ULL) / 1000ULL))
-#define OS_TICKS_FROM_US(us)    ((uint32_t)((((uint64_t)(us) * (uint64_t)OS_CONFIG_TICK_HZ) + 999999ULL) / 1000000ULL))
+/** Clamp a 64-bit tick count into the uint32_t tick range, one short of the OS_WAIT_FOREVER
+ *  sentinel - the same saturation the kernel applies internally to every timeout it converts.
+ *  A duration too large for the tick range is a duration the caller cannot have, but truncating
+ *  it turns it into a small, plausible-looking one (and, at the sentinel, into "wait forever"),
+ *  which no caller can detect. This is what the three conversions below are built on; it expands
+ *  its argument twice, so pass a value rather than an expression with side effects. */
+#define OS_TICKS_SATURATE(ticks) ((uint32_t)(((ticks) >= (uint64_t)OS_WAIT_FOREVER) ? \
+                                             ((uint64_t)OS_WAIT_FOREVER - 1ULL) : (ticks)))
+
+#define OS_TICKS_FROM_S(sec)    OS_TICKS_SATURATE((uint64_t)(sec) * (uint64_t)OS_CONFIG_TICK_HZ)
+#define OS_TICKS_FROM_MS(ms)    OS_TICKS_SATURATE((((uint64_t)(ms) * (uint64_t)OS_CONFIG_TICK_HZ) + 999ULL) / 1000ULL)
+#define OS_TICKS_FROM_US(us)    OS_TICKS_SATURATE((((uint64_t)(us) * (uint64_t)OS_CONFIG_TICK_HZ) + 999999ULL) / 1000000ULL)
 
 /*
  * ***********************************************************************************************************
@@ -350,13 +359,15 @@ os_status os_task_start(os_task_t *task);
 
 /******************************************************************************************************/
 /**
- * @brief Pause a task (NULL means current running task).
+ * @brief Pause a task (NULL means current running task). OS_STATUS_BUSY for the idle task and for
+ *        the kernel's own service tasks (timer, work, log).
  */
 os_status os_task_pause(os_task_t *task);
 
 /******************************************************************************************************/
 /**
- * @brief Delete a task and release its TCB slot (NULL means current running task).
+ * @brief Delete a task and release its TCB slot (NULL means current running task). OS_STATUS_BUSY
+ *        for the idle task and for the kernel's own service tasks (timer, work, log).
  */
 os_status os_task_delete(os_task_t *task);
 
@@ -428,6 +439,46 @@ void os_critical_enter(void);
  * @brief Exit a critical section (re-enables interrupts at outermost level).
  */
 void os_critical_exit(void);
+
+/*
+ * ***********************************************************************************************************
+ * Scheduler lock
+ * ***********************************************************************************************************
+ *
+ * The other preemption barrier, and the cheaper one when what you are protecting against is another
+ * TASK rather than an interrupt. os_critical_enter stops the world - the tick, every driver, every
+ * latency budget that depends on them - because masking interrupts is the only tool it has.
+ * os_scheduler_lock stops the scheduler alone: interrupts keep running and keep waking tasks, and
+ * those tasks simply wait for the CPU until the outermost unlock hands it over.
+ *
+ * Pick by what shares the data:
+ *   task <-> task   os_scheduler_lock, and interrupt latency is unaffected.
+ *   task <-> ISR    os_critical_enter (or an atomic). A scheduler lock excludes no interrupt.
+ *   core <-> core   os_critical_enter, whose outermost level takes the cross-core spinlock. The
+ *                   scheduler lock is per core and holds back nobody else's scheduling.
+ *
+ * Both nest, and neither may be held across a blocking call - see os_scheduler_lock for what a
+ * blocking primitive does when it finds the scheduler locked.
+*/
+
+/******************************************************************************************************/
+/**
+ * @brief Defer context switches on the calling core, leaving interrupts enabled (nesting counted).
+ *        Blocking calls degrade to non-blocking while held; a no-op from an ISR.
+ */
+void os_scheduler_lock(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Release one level of scheduler lock, taking any switch deferred while it was held.
+ */
+void os_scheduler_unlock(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Whether the calling core currently has its scheduler locked (ISR-safe).
+ */
+bool os_scheduler_is_locked(void);
 
 /*
  * ***********************************************************************************************************
@@ -759,6 +810,12 @@ size_t os_queue_count_get(const os_queue_t *queue);
 
 /******************************************************************************************************/
 /**
+ * @brief Get the number of item slots the queue can still accept (capacity minus count).
+ */
+size_t os_queue_free_get(const os_queue_t *queue);
+
+/******************************************************************************************************/
+/**
  * @brief Tear down a queue of any kind: empty it, and release the item buffer only when
  *        os_queue_init_dynamic allocated it. A queue that owns no buffer keeps its storage and
  *        stays usable, so a statically defined queue needs no init call after this either.
@@ -785,25 +842,25 @@ typedef struct
     uint32_t  flags;
     os_list_t waiters; /**< Tasks blocked waiting for bits to match. */
 
-} os_event_group_t;
+} os_event_t;
 
 /******************************************************************************************************/
 /**
  * @brief Initialize an event group object.
  */
-os_status os_event_group_init(os_event_group_t *group);
+os_status os_event_init(os_event_t *group);
 
 /******************************************************************************************************/
 /**
  * @brief Set event bits in the group (ISR-safe).
  */
-os_status os_event_group_set_bits(os_event_group_t *group, uint32_t bits);
+os_status os_event_set_bits(os_event_t *group, uint32_t bits);
 
 /******************************************************************************************************/
 /**
  * @brief Clear event bits in the group (ISR-safe).
  */
-os_status os_event_group_clear_bits(os_event_group_t *group, uint32_t bits);
+os_status os_event_clear_bits(os_event_t *group, uint32_t bits);
 
 /******************************************************************************************************/
 /**
@@ -811,7 +868,7 @@ os_status os_event_group_clear_bits(os_event_group_t *group, uint32_t bits);
  *        consumes the requested bits atomically with the match (no lost set between the
  *        wait returning and a separate manual clear).
  */
-os_status os_event_group_wait_bits(os_event_group_t *group, uint32_t bits, bool wait_all, bool clear_on_exit, uint32_t *matched_bits, uint32_t timeout_ms);
+os_status os_event_wait_bits(os_event_t *group, uint32_t bits, bool wait_all, bool clear_on_exit, uint32_t *matched_bits, uint32_t timeout_ms);
 
 #endif /* OS_CONFIG_EVENT_ENABLE */
 
@@ -958,18 +1015,18 @@ os_status os_work_submit(os_work_handler_t handler, const void *data, size_t len
 
 /*
  * ***********************************************************************************************************
- * Task notifications - OS_CONFIG_TASK_NOTIFY_ENABLE
+ * Task notifications - OS_CONFIG_NOTIFY_ENABLE
  * ***********************************************************************************************************
 */
 
-#if (OS_CONFIG_TASK_NOTIFY_ENABLE == 1U)
+#if (OS_CONFIG_NOTIFY_ENABLE == 1U)
 
 /******************************************************************************************************/
 /**
  * @brief Deliver a value to a task's notification mailbox (overwrite: last write wins), waking
- *        it if it is currently blocked in os_task_notify_wait; ISR-safe.
+ *        it if it is currently blocked in os_notify_wait; ISR-safe.
  */
-os_status os_task_notify_give(os_task_t *task, uint32_t value);
+os_status os_notify_give(os_task_t *task, uint32_t value);
 
 /******************************************************************************************************/
 /**
@@ -980,9 +1037,9 @@ os_status os_task_notify_give(os_task_t *task, uint32_t value);
  *        which is what a notification used as a plain wake-up signal wants. The notification is
  *        consumed either way.
  */
-os_status os_task_notify_wait(uint32_t timeout_ms, uint32_t *value_out);
+os_status os_notify_wait(uint32_t timeout_ms, uint32_t *value_out);
 
-#endif /* OS_CONFIG_TASK_NOTIFY_ENABLE */
+#endif /* OS_CONFIG_NOTIFY_ENABLE */
 
 /*
  * ***********************************************************************************************************

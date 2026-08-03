@@ -83,9 +83,11 @@ void os_assert_failed_cb(const char *file, uint32_t line)
 /**
  * @brief Called when a task is found to have overrun its stack, as it is switched out.
  *
- * OPTIONAL, unlike os_assert_failed_cb above: the kernel has a weak do-nothing default and parks
- * the core straight after this returns either way. Defining it only buys the diagnosis - which
- * task it was - so it is worth the few lines.
+ * REQUIRED when OS_CONFIG_STACK_CHECK_ENABLE is 1, exactly like os_assert_failed_cb above: the
+ * kernel ships no default, so leaving this out is a link error. How a blown stack gets reported
+ * belongs to the product, and a stub that did nothing would turn the detector into an unexplained
+ * halt - the core parks right after this returns either way, so this is the only chance to say
+ * which task it was.
  *
  * Runs inside PendSV with the kernel's interrupts masked. Do NOT call kernel APIs from here, and
  * do not use OS_LOG_*: the log task cannot run once the core is parked, so the line would never

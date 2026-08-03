@@ -228,8 +228,10 @@ void os_work_tick_process(uint32_t elapsed_ticks)
      * multi-core builds the cross-core spinlock additionally excludes the
      * other cores' os_work_submit callers, who hold it via
      * os_critical_enter - the local mask alone only stops this core's own
-     * interrupts. Released before os_task_wake below, which acquires the
-     * same lock itself (never hold both at once - not recursive). */
+     * interrupts. Both are held across the os_task_wake_tcb below, which is
+     * exactly what that call requires of its caller (unlike os_task_wake,
+     * which takes the same non-recursive lock itself and so could not be
+     * called from in here). */
     mask_state = os_arch_kernel_mask_save();
     os_critical_multicore_lock();
 

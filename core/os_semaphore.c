@@ -127,18 +127,21 @@ os_status os_semaphore_take(os_semaphore_t *semaphore, uint32_t timeout_ms)
         if (semaphore->count > 0U)
         {
             semaphore->count--;
+            os_task_wait_end();
             os_critical_exit();
             return OS_STATUS_OK;
         }
 
         if ((timeout_ms == OS_WAIT_NOTHING) || !os_internal_can_block())
         {
+            os_task_wait_end();
             os_critical_exit();
             return OS_STATUS_EMPTY;
         }
 
         if (remaining_ticks == 0U)
         {
+            os_task_wait_end();
             os_critical_exit();
             return OS_STATUS_TIMEOUT;
         }
@@ -153,6 +156,7 @@ os_status os_semaphore_take(os_semaphore_t *semaphore, uint32_t timeout_ms)
          * time counts toward the timeout. */
         if (!os_task_wait_signaled())
         {
+            os_task_wait_end();
             return OS_STATUS_TIMEOUT;
         }
 

@@ -1,0 +1,187 @@
+/**
+ * @file os_notify.c
+ * @brief Direct-to-task notifications: a one-word mailbox built into every task, delivered
+ *        without any intermediate object.
+ *
+ * The lightest signal the kernel offers. A semaphore or a queue is a thing that has to be
+ * created, sized, and kept alive by whoever both sides can reach; a notification is addressed to
+ * the task itself, so an ISR that already holds a task handle can signal it with nothing else in
+ * between. The mailbox is one value with overwrite semantics - last give wins - which is what
+ * makes it a signal rather than a stream: for anything that must not be lost, use a queue.
+ *
+ * The mailbox lives in the TCB, since it belongs to the task rather than to this module. os_task.c
+ * hands out the slot (os_task_notify_slot) and the two facts about a task this module needs
+ * (os_task_tcb_current, os_task_tcb_is_blocked); everything about what a notification MEANS is
+ * here.
+ *
+ * @copyright (c) 2026 Ahura Project Contributors
+ *            SPDX-License-Identifier: MIT
+ *            See LICENSE.md in the project root for the full license text.
+ */
+
+/*
+ * ***********************************************************************************************************
+ * Includes
+ * ***********************************************************************************************************
+*/
+
+#include "os_internal.h"
+
+#if (OS_CONFIG_NOTIFY_ENABLE == 1U)
+
+/*
+ * ***********************************************************************************************************
+ * Public function implementations
+ * ***********************************************************************************************************
+*/
+
+/******************************************************************************************************/
+/**
+ * @brief Deliver a value to a task's notification mailbox (overwrite: last write wins),
+ *        waking it if it is currently blocked in os_notify_wait; ISR-safe.
+ *
+ * A task blocked for any other reason (delay, mutex/queue/semaphore/event wait) is left
+ * alone - the value is only latched for it to pick up on its next os_notify_wait.
+ *
+ * @param[in,out] task   Target task.
+ * @param[in]     value  Value to store.
+ * @return os_status  OK, or INVALID_ARG for a NULL/stale task handle.
+ */
+os_status os_notify_give(os_task_t *task, uint32_t value)
+{
+    void             *tcb;
+    os_notify_slot_t *slot;
+
+    if ((task == NULL) || (task->id == 0U))
+    {
+        return OS_STATUS_INVALID_ARG;
+    }
+
+    os_critical_enter();
+
+    tcb = os_task_tcb_resolve(task->id);
+    if (tcb == NULL)
+    {
+        os_critical_exit();
+        return OS_STATUS_INVALID_ARG;
+    }
+
+    slot = os_task_notify_slot(tcb);
+
+    slot->value   = value;
+    slot->pending = true;
+
+    /* Only a task parked in os_notify_wait is woken. waiting is true only inside that block, so
+     * a task blocked on anything else keeps its own wakeup reason and finds the value waiting the
+     * next time it asks for one.
+     *
+     * os_task_wake_tcb rather than os_task_wake: the critical section above already holds both the
+     * kernel mask and (on multi-core) the cross-core spinlock that the direct-handle form requires
+     * of its caller, so it skips the id lookup and the nested critical section. */
+    if (os_task_tcb_is_blocked(tcb) && slot->waiting)
+    {
+        slot->waiting = false;
+        os_task_wake_tcb(tcb);
+    }
+
+    os_critical_exit();
+    return OS_STATUS_OK;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Wait for this task's own notification mailbox, up to timeout_ms.
+ *
+ * Task-only, like os_mutex_lock: an ISR has no task identity of its own to wait as.
+ *
+ * value_out may be NULL, for the common case of a notification used as a plain "something
+ * happened" signal where the value carries nothing. The notification is consumed either way -
+ * what is discarded is the copy, not the delivery - so a NULL here cannot leave the mailbox full
+ * and make the next wait return at once.
+ *
+ * @param[in]  timeout_ms  OS_WAIT_NOTHING, a duration in ms, or OS_WAIT_FOREVER.
+ * @param[out] value_out   Set to the delivered value on OS_STATUS_OK; NULL to discard it.
+ * @return os_status  OK on delivery, EMPTY when unavailable without waiting, TIMEOUT when the
+ *                     wait elapsed, INVALID_ARG from an ISR or before a real task exists.
+ */
+os_status os_notify_wait(uint32_t timeout_ms, uint32_t *value_out)
+{
+    uint32_t budget_ticks;
+    uint32_t start_tick;
+    uint32_t remaining_ticks;
+
+    /* Task-only, like os_mutex_lock: an ISR has no task identity to wait as. */
+    OS_ASSERT(!os_arch_in_isr());
+
+    if (os_arch_in_isr())
+    {
+        return OS_STATUS_INVALID_ARG;
+    }
+
+    budget_ticks    = os_internal_timeout_to_ticks(timeout_ms);
+    start_tick      = os_tick_get();
+    remaining_ticks = budget_ticks;
+
+    for (;;)
+    {
+        void             *current;
+        os_notify_slot_t *slot;
+
+        os_critical_enter();
+
+        current = os_task_tcb_current();
+        if (current == NULL)
+        {
+            os_critical_exit();
+            return OS_STATUS_INVALID_ARG;
+        }
+
+        slot = os_task_notify_slot(current);
+
+        /* Cleared every iteration: only true while genuinely blocked below,
+         * so a give() arriving any other time correctly just latches. */
+        slot->waiting = false;
+
+        if (slot->pending)
+        {
+            /* Consumed unconditionally: only the copy out is optional. */
+            slot->pending = false;
+
+            if (value_out != NULL)
+            {
+                *value_out = slot->value;
+            }
+
+            slot->value = 0U;
+            os_critical_exit();
+            return OS_STATUS_OK;
+        }
+
+        if ((timeout_ms == OS_WAIT_NOTHING) || !os_internal_can_block())
+        {
+            os_critical_exit();
+            return OS_STATUS_EMPTY;
+        }
+
+        if (remaining_ticks == 0U)
+        {
+            os_critical_exit();
+            return OS_STATUS_TIMEOUT;
+        }
+
+        /* Blocks without joining any object's waiter list - os_notify_give addresses this task
+         * directly by id, so there is no list for it to walk. The sleep runs inside the critical
+         * section that just found the mailbox empty (no lost-wakeup window); the switch happens
+         * when the outermost critical section is left. */
+        slot->waiting = true;
+        os_task_sleep_ticks(remaining_ticks);
+        os_critical_exit();
+
+        /* Resumed: either give() latched a value (checked at the top of the next
+         * iteration) or the wait timed out - the budget recomputed against the wall
+         * clock decides which, exactly as every other blocking primitive here does. */
+        remaining_ticks = os_internal_wait_remaining(budget_ticks, start_tick);
+    }
+}
+
+#endif /* OS_CONFIG_NOTIFY_ENABLE */

@@ -68,7 +68,7 @@ static bool os_event_waiter_match(uint32_t data0, uint32_t data1, void *context,
  * @param[in,out] group  Event group object.
  * @return os_status  OK, or BUSY while tasks are waiting on it.
  */
-os_status os_event_group_init(os_event_group_t *group)
+os_status os_event_init(os_event_t *group)
 {
     if (group == NULL)
     {
@@ -105,7 +105,7 @@ os_status os_event_group_init(os_event_group_t *group)
  * @param[in]     bits   Bits to set.
  * @return os_status Status code.
  */
-os_status os_event_group_set_bits(os_event_group_t *group, uint32_t bits)
+os_status os_event_set_bits(os_event_t *group, uint32_t bits)
 {
     os_event_match_context_t match_context;
 
@@ -138,7 +138,7 @@ os_status os_event_group_set_bits(os_event_group_t *group, uint32_t bits)
  * @param[in]     bits   Bits to clear.
  * @return os_status Status code.
  */
-os_status os_event_group_clear_bits(os_event_group_t *group, uint32_t bits)
+os_status os_event_clear_bits(os_event_t *group, uint32_t bits)
 {
     if (group == NULL)
     {
@@ -172,7 +172,7 @@ os_status os_event_group_clear_bits(os_event_group_t *group, uint32_t bits)
  * @return os_status  OK on match, BUSY when unmatched without waiting,
  *                    TIMEOUT when the wait elapsed.
  */
-os_status os_event_group_wait_bits(os_event_group_t *group, uint32_t bits, bool wait_all, bool clear_on_exit, uint32_t *matched_bits, uint32_t timeout_ms)
+os_status os_event_wait_bits(os_event_t *group, uint32_t bits, bool wait_all, bool clear_on_exit, uint32_t *matched_bits, uint32_t timeout_ms)
 {
     uint32_t budget_ticks;
     uint32_t start_tick;
@@ -218,18 +218,21 @@ os_status os_event_group_wait_bits(os_event_group_t *group, uint32_t bits, bool 
                 group->flags &= ~bits;
             }
 
+            os_task_wait_end();
             os_critical_exit();
             return OS_STATUS_OK;
         }
 
         if ((timeout_ms == OS_WAIT_NOTHING) || !os_internal_can_block())
         {
+            os_task_wait_end();
             os_critical_exit();
             return OS_STATUS_BUSY;
         }
 
         if (remaining_ticks == 0U)
         {
+            os_task_wait_end();
             os_critical_exit();
             return OS_STATUS_TIMEOUT;
         }
@@ -243,6 +246,7 @@ os_status os_event_group_wait_bits(os_event_group_t *group, uint32_t bits, bool 
 
         if (!os_task_wait_signaled())
         {
+            os_task_wait_end();
             return OS_STATUS_TIMEOUT;
         }
 
@@ -255,6 +259,7 @@ os_status os_event_group_wait_bits(os_event_group_t *group, uint32_t bits, bool 
         if (delivered != 0U)
         {
             *matched_bits = delivered;
+            os_task_wait_end();
             return OS_STATUS_OK;
         }
 

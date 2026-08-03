@@ -75,6 +75,10 @@ void os_tick_handler(void)
      * or elapsed time would be counted once per core. */
     if (os_arch_core_id_get() != 0U)
     {
+        /* This core's own round-robin quantum still has to be counted down,
+         * even though the kernel time base belongs to core 0. */
+        os_task_slice_tick(1U);
+
         if (os_kernel_is_running() && os_task_reschedule_possible())
         {
             OS_ARCH_CONTEXT_SWITCH_REQUEST();
@@ -101,15 +105,15 @@ void os_tick_handler(void)
     os_timer_tick_process(1U);
 #endif
     os_task_tick_update(1U);
+    os_task_slice_tick(1U);
 
     /* Pend PendSV only when it would actually do something: a wake this tick
-     * (work/timer/delay expiry) or an equal-priority peer to round-robin
-     * with both already show up as a ready-bitmap bit at or above the
-     * running task's priority, so os_task_reschedule_possible catches every
-     * case that mattered under the old unconditional pend - a quiescent
-     * tick now costs one bitmap check instead of a full PendSV round trip.
-     * PendSV is the lowest priority, so a real one still runs after all
-     * pending interrupts complete. */
+     * (work/timer/delay expiry) or an equal-priority peer whose turn has come
+     * both show up in os_task_reschedule_possible, which also answers false
+     * while the scheduler is locked or the running task still has time slice
+     * left - so a tick that would not switch costs one bitmap check instead
+     * of a full PendSV round trip. PendSV is the lowest priority, so a real
+     * one still runs after all pending interrupts complete. */
     if (os_kernel_is_running() && os_task_reschedule_possible())
     {
         OS_ARCH_CONTEXT_SWITCH_REQUEST();
@@ -146,6 +150,7 @@ void os_tick_announce(uint32_t elapsed_ticks)
     os_timer_tick_process(elapsed_ticks);
 #endif
     os_task_tick_update(elapsed_ticks);
+    os_task_slice_tick(elapsed_ticks);
 
     if (os_kernel_is_running() && os_task_reschedule_possible())
     {

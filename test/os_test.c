@@ -61,6 +61,13 @@ static __IO bool     os_test_worker_should_run = true;
 static __IO uint32_t os_test_busy_counter    = 0U;
 static __IO bool     os_test_busy_should_run = true;
 
+/* test_scheduler_lock(): set by a task that outranks the test task, so the flag can only
+ * turn true once the scheduler is actually allowed to switch. */
+static __IO bool     os_test_sched_lock_ran  = false;
+#if (OS_CONFIG_SEMAPHORE_ENABLE == 1U)
+static os_semaphore_t os_test_sched_lock_sem;  /* left empty: a take would have to block */
+#endif
+
 #define TEST_BURST_ITERATIONS 200000UL
 
 /*
@@ -132,7 +139,7 @@ static uint32_t       os_test_bench_queue_buf[4];
 OS_QUEUE_DEFINE_BUFFER(os_test_bench_queue, os_test_bench_queue_buf);
 #endif
 #if (OS_CONFIG_EVENT_ENABLE == 1U)
-static os_event_group_t os_test_bench_event;
+static os_event_t os_test_bench_event;
 #endif
 
 /* Shared between two equal-priority tasks in test_context_switch_timing(): each increments
@@ -172,7 +179,7 @@ OS_QUEUE_DEFINE_BUFFER(os_test_queue, os_test_queue_buf);
 #endif
 
 #if (OS_CONFIG_EVENT_ENABLE == 1U)
-static os_event_group_t os_test_event;
+static os_event_t os_test_event;
 #endif
 
 #if (OS_CONFIG_TIMER_ENABLE == 1U)
@@ -207,7 +214,7 @@ static __IO bool     os_test_log_capture_on       = false;
 static __IO bool     os_test_log_capture_overflow = false;
 #endif
 
-#if (OS_CONFIG_TASK_NOTIFY_ENABLE == 1U)
+#if (OS_CONFIG_NOTIFY_ENABLE == 1U)
 static __IO os_status os_test_notify_wait_status;
 static __IO uint32_t  os_test_notify_wait_value;
 static __IO uint32_t  os_test_notify_wait_ticks;
@@ -345,7 +352,7 @@ static os_mutex_t        os_test_stress_mutex;
 static __IO uint32_t os_test_stress_shared_counter; /* protected exclusively by os_test_stress_mutex */
 
 static os_semaphore_t    os_test_stress_sem;
-static os_event_group_t  os_test_stress_event;
+static os_event_t  os_test_stress_event;
 static uint32_t          os_test_stress_queue_buf[OS_TEST_STRESS_QUEUE_CAPACITY];
 OS_QUEUE_DEFINE_BUFFER(os_test_stress_queue, os_test_stress_queue_buf);
 #endif
@@ -370,6 +377,8 @@ static void test_critical_section(void);
 static void test_task_lifecycle(void);
 static void test_task_identity(void);
 static void test_priority_preemption(void);
+static void test_sched_lock_entry(void *context);
+static void test_scheduler_lock(void);
 #if (OS_CONFIG_MUTEX_ENABLE == 1U)
 static void test_mutex(void);
 #endif
@@ -397,7 +406,7 @@ static void test_log(void);
 #if (OS_CONFIG_LOG_ENABLE == 1U)
 static bool test_log_capture_contains(const char *needle);
 #endif
-#if (OS_CONFIG_TASK_NOTIFY_ENABLE == 1U)
+#if (OS_CONFIG_NOTIFY_ENABLE == 1U)
 static void test_notify_wait_entry(void *context);
 static void test_notify_unrelated_block_entry(void *context);
 static void test_notify_discard_entry(void *context);
@@ -651,7 +660,7 @@ static void test_helper_entry(void *context)
 #if (OS_CONFIG_EVENT_ENABLE == 1U)
     case HELPER_EVENT_SET_AFTER:
         os_delay_ms(os_test_helper_ctx.hold_ms);
-        (void)os_event_group_set_bits(&os_test_event, os_test_helper_ctx.bits);
+        (void)os_event_set_bits(&os_test_event, os_test_helper_ctx.bits);
         break;
 #endif
 
@@ -1020,6 +1029,112 @@ static void test_priority_preemption(void)
 
     os_test_busy_should_run = false;
     AHURA_TEST_CHECK(test_wait_inactive(&worker, 200U), "low-priority spinner stops cleanly");
+}
+
+/*
+ * ***********************************************************************************************************
+ * Scheduler lock
+ * ***********************************************************************************************************
+*/
+
+/******************************************************************************************************/
+/**
+ * @brief Runs at TEST_PRIO_HIGH, so it outranks the test task and would preempt it the instant it
+ *        is started - unless the scheduler is locked.
+ */
+static void test_sched_lock_entry(void *context)
+{
+    (void)context;
+
+    os_test_sched_lock_ran = true;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief os_scheduler_lock() defers preemption without masking interrupts.
+ *
+ * The claim under test is not "nothing ran" - a critical section would give that too - but that
+ * nothing ran WHILE INTERRUPTS STAYED LIVE. The locked window is 200 us of real wall time
+ * (os_delay_us busy-waits and never yields), so at a 1 kHz tick the tick interrupt fires inside it,
+ * and with it every wake and round-robin decision the kernel makes. A task that outranks this one
+ * is started inside that window and must still not get the CPU until the unlock.
+ *
+ * The two flags are sampled inside the window and reported afterwards on purpose: AHURA_TEST_CHECK
+ * printfs, and that polled UART write takes milliseconds - it would dominate the window it is
+ * supposed to be measuring.
+ */
+static void test_scheduler_lock(void)
+{
+    os_status status;
+    bool      locked_flag;
+    bool      ran_while_locked;
+#if (OS_CONFIG_SEMAPHORE_ENABLE == 1U)
+    os_status take_status;
+#endif
+
+    test_print_section("Scheduler Lock");
+
+    AHURA_TEST_CHECK(!os_scheduler_is_locked(), "the scheduler starts out unlocked");
+
+    os_test_sched_lock_ran = false;
+
+#if (OS_CONFIG_SEMAPHORE_ENABLE == 1U)
+    AHURA_TEST_CHECK(os_semaphore_init(&os_test_sched_lock_sem, 0U, 1U) == OS_STATUS_OK,
+                      "empty semaphore initialized (a take on it can only block)");
+#endif
+
+    status = os_task_create(&helper, OS_TASK_CONFIG(test_sched_lock_entry, NULL, TEST_PRIO_HIGH));
+    AHURA_TEST_CHECK(status == OS_STATUS_OK, "higher-priority task created (priority %u)",
+                      (unsigned)TEST_PRIO_HIGH);
+
+    os_scheduler_lock();
+
+    locked_flag = os_scheduler_is_locked();
+    (void)os_task_start(&helper);
+    os_delay_us(200U);
+    ran_while_locked = os_test_sched_lock_ran;
+#if (OS_CONFIG_SEMAPHORE_ENABLE == 1U)
+    take_status = os_semaphore_take(&os_test_sched_lock_sem, 10U);
+#endif
+
+    os_scheduler_unlock();
+
+    /* The unlock issues the switch it deferred, and the task that outranks this one takes the CPU
+     * before the next line runs - so by here it has already finished. */
+    AHURA_TEST_CHECK(locked_flag, "os_scheduler_is_locked() reports the lock while held");
+    AHURA_TEST_CHECK(!ran_while_locked,
+                      "higher-priority task held back for 200 us of live-interrupt time");
+    AHURA_TEST_CHECK(os_test_sched_lock_ran, "os_scheduler_unlock() took the deferred switch at once");
+    AHURA_TEST_CHECK(!os_scheduler_is_locked(), "os_scheduler_unlock() released the lock");
+    AHURA_TEST_CHECK(test_wait_inactive(&helper, 200U), "the higher-priority task ran to completion");
+
+#if (OS_CONFIG_SEMAPHORE_ENABLE == 1U)
+    /* Blocking under the lock would park a task the lock then refuses to switch away from, so
+     * every blocking primitive degrades to its OS_WAIT_NOTHING behaviour instead - EMPTY here,
+     * NOT the TIMEOUT a real 10 ms wait would have reported. */
+    AHURA_TEST_CHECK(take_status == OS_STATUS_EMPTY,
+                      "os_semaphore_take(10 ms) is non-blocking under the lock (status=%d)",
+                      (int)take_status);
+#endif
+
+    /* Nesting: only the outermost unlock reopens the scheduler. */
+    os_scheduler_lock();
+    os_scheduler_lock();
+    os_scheduler_unlock();
+    locked_flag = os_scheduler_is_locked();
+    os_scheduler_unlock();
+
+    AHURA_TEST_CHECK(locked_flag, "a nested unlock leaves the scheduler locked");
+    AHURA_TEST_CHECK(!os_scheduler_is_locked(), "the outermost unlock releases it");
+
+    /* Self-suspension needs the switch the lock is holding back, so it is refused rather than
+     * leaving this task running while the kernel marks it SUSPENDED. */
+    os_scheduler_lock();
+    status = os_task_pause(NULL);
+    os_scheduler_unlock();
+
+    AHURA_TEST_CHECK(status == OS_STATUS_BUSY, "os_task_pause(self) is refused under the lock (status=%d)",
+                      (int)status);
 }
 
 /*
@@ -1453,6 +1568,9 @@ static void test_queue(void)
                       (os_test_queue.capacity == (sizeof(os_test_queue_buf) / sizeof(os_test_queue_buf[0]))),
                       "OS_QUEUE_DEFINE_BUFFER() bound the queue to the declared array, geometry derived");
     AHURA_TEST_CHECK(os_queue_count_get(&os_test_queue) == 0U, "a fresh queue reports 0 items");
+    AHURA_TEST_CHECK(os_queue_free_get(&os_test_queue) == os_test_queue.capacity,
+                      "a fresh queue reports its whole capacity free (%lu)",
+                      (unsigned long)os_queue_free_get(&os_test_queue));
     AHURA_TEST_CHECK(os_queue_receive(&os_test_queue, &value, OS_WAIT_NOTHING) == OS_STATUS_EMPTY,
                       "receive on an empty queue with OS_WAIT_NOTHING returns EMPTY");
 
@@ -1462,6 +1580,7 @@ static void test_queue(void)
                           "send #%lu succeeds while the queue has room", (unsigned long)i);
     }
     AHURA_TEST_CHECK(os_queue_count_get(&os_test_queue) == 3U, "queue count reports 3/3 full");
+    AHURA_TEST_CHECK(os_queue_free_get(&os_test_queue) == 0U, "a full queue reports 0 free slots");
 
     value = 99U;
     AHURA_TEST_CHECK(os_queue_send(&os_test_queue, &value, OS_WAIT_NOTHING) == OS_STATUS_FULL,
@@ -1517,32 +1636,32 @@ static void test_event_group(void)
 
     test_print_section("Event Group");
 
-    AHURA_TEST_CHECK(os_event_group_init(&os_test_event) == OS_STATUS_OK, "os_event_group_init() succeeds");
+    AHURA_TEST_CHECK(os_event_init(&os_test_event) == OS_STATUS_OK, "os_event_init() succeeds");
 
     matched = 0xFFFFFFFFU;
-    AHURA_TEST_CHECK(os_event_group_wait_bits(&os_test_event, 0x03U, false, false, &matched, OS_WAIT_NOTHING) == OS_STATUS_BUSY,
+    AHURA_TEST_CHECK(os_event_wait_bits(&os_test_event, 0x03U, false, false, &matched, OS_WAIT_NOTHING) == OS_STATUS_BUSY,
                       "wait-any on unset bits with OS_WAIT_NOTHING returns BUSY");
     AHURA_TEST_CHECK(matched == 0U, "matched_bits reports 0 when nothing matched");
 
-    AHURA_TEST_CHECK(os_event_group_set_bits(&os_test_event, 0x01U) == OS_STATUS_OK,
-                      "os_event_group_set_bits(0x01) succeeds");
-    AHURA_TEST_CHECK(os_event_group_wait_bits(&os_test_event, 0x03U, false, false, &matched, OS_WAIT_NOTHING) == OS_STATUS_OK,
+    AHURA_TEST_CHECK(os_event_set_bits(&os_test_event, 0x01U) == OS_STATUS_OK,
+                      "os_event_set_bits(0x01) succeeds");
+    AHURA_TEST_CHECK(os_event_wait_bits(&os_test_event, 0x03U, false, false, &matched, OS_WAIT_NOTHING) == OS_STATUS_OK,
                       "wait-any matches once one of the requested bits is set");
     AHURA_TEST_CHECK(matched == 0x01U, "matched_bits reports the intersecting bits (0x%02lx)",
                       (unsigned long)matched);
 
-    AHURA_TEST_CHECK(os_event_group_wait_bits(&os_test_event, 0x03U, true, false, &matched, OS_WAIT_NOTHING) == OS_STATUS_BUSY,
+    AHURA_TEST_CHECK(os_event_wait_bits(&os_test_event, 0x03U, true, false, &matched, OS_WAIT_NOTHING) == OS_STATUS_BUSY,
                       "wait-all is still BUSY while only some requested bits are set");
 
-    AHURA_TEST_CHECK(os_event_group_wait_bits(&os_test_event, 0x01U, false, true, &matched, OS_WAIT_NOTHING) == OS_STATUS_OK,
+    AHURA_TEST_CHECK(os_event_wait_bits(&os_test_event, 0x01U, false, true, &matched, OS_WAIT_NOTHING) == OS_STATUS_OK,
                       "wait-any with clear_on_exit consumes the matched bit");
-    AHURA_TEST_CHECK(os_event_group_wait_bits(&os_test_event, 0x01U, false, false, &matched, OS_WAIT_NOTHING) == OS_STATUS_BUSY,
+    AHURA_TEST_CHECK(os_event_wait_bits(&os_test_event, 0x01U, false, false, &matched, OS_WAIT_NOTHING) == OS_STATUS_BUSY,
                       "a consumed (atomically cleared) bit no longer matches");
 
     AHURA_TEST_CHECK(test_spawn_helper(HELPER_EVENT_SET_AFTER, 80U, 0x06U, 0U) == OS_STATUS_OK,
                       "helper spawned to set bits 0x06 after 80 ms");
     t0     = os_tick_get();
-    status = os_event_group_wait_bits(&os_test_event, 0x06U, true, false, &matched, 500U);
+    status = os_event_wait_bits(&os_test_event, 0x06U, true, false, &matched, 500U);
     t1     = os_tick_get();
     delta  = t1 - t0;
     AHURA_TEST_CHECK((status == OS_STATUS_OK) && (matched == 0x06U),
@@ -1771,13 +1890,13 @@ static void test_work(void)
  * ***********************************************************************************************************
 */
 
-#if (OS_CONFIG_TASK_NOTIFY_ENABLE == 1U)
+#if (OS_CONFIG_NOTIFY_ENABLE == 1U)
 /******************************************************************************************************/
 /**
- * @brief Calls os_task_notify_wait(os_test_notify_wait_timeout_ms, ...) and records the result, the
+ * @brief Calls os_notify_wait(os_test_notify_wait_timeout_ms, ...) and records the result, the
  *        delivered value, and the elapsed ticks - shared body for the give-before-wait,
  *        wait-then-give, and timeout cases below (each just sets the timeout and interleaves
- *        os_task_notify_give differently around starting this task).
+ *        os_notify_give differently around starting this task).
  */
 static void test_notify_wait_entry(void *context)
 {
@@ -1787,7 +1906,7 @@ static void test_notify_wait_entry(void *context)
 
     (void)context;
 
-    status = os_task_notify_wait(os_test_notify_wait_timeout_ms, &value);
+    status = os_notify_wait(os_test_notify_wait_timeout_ms, &value);
 
     os_test_notify_wait_status = status;
     os_test_notify_wait_value  = value;
@@ -1797,7 +1916,7 @@ static void test_notify_wait_entry(void *context)
 /******************************************************************************************************/
 /**
  * @brief Blocks in an unrelated os_delay_ms (not a notification wait), then does a
- *        non-blocking os_task_notify_wait - proves a give() that arrives during the delay
+ *        non-blocking os_notify_wait - proves a give() that arrives during the delay
  *        neither cuts it short nor is lost.
  */
 static void test_notify_unrelated_block_entry(void *context)
@@ -1808,7 +1927,7 @@ static void test_notify_unrelated_block_entry(void *context)
     (void)context;
 
     os_delay_ms(80U);
-    status = os_task_notify_wait(OS_WAIT_NOTHING, &value);
+    status = os_notify_wait(OS_WAIT_NOTHING, &value);
 
     os_test_notify_wait_status = status;
     os_test_notify_wait_value  = value;
@@ -1821,8 +1940,8 @@ static void test_notify_discard_entry(void *context)
 {
     (void)context;
 
-    os_test_notify_wait_status   = os_task_notify_wait(OS_WAIT_FOREVER, NULL);
-    os_test_notify_second_status = os_task_notify_wait(OS_WAIT_NOTHING, NULL);
+    os_test_notify_wait_status   = os_notify_wait(OS_WAIT_FOREVER, NULL);
+    os_test_notify_second_status = os_notify_wait(OS_WAIT_NOTHING, NULL);
 }
 
 /******************************************************************************************************/
@@ -1835,19 +1954,19 @@ static void test_task_notify(void)
 
     test_print_section("Task Notifications");
 
-    AHURA_TEST_CHECK(os_task_notify_give(NULL, 1U) == OS_STATUS_INVALID_ARG,
-                      "os_task_notify_give(NULL) is rejected");
+    AHURA_TEST_CHECK(os_notify_give(NULL, 1U) == OS_STATUS_INVALID_ARG,
+                      "os_notify_give(NULL) is rejected");
 
     stale_task.id = 0xFFFFFFF0U;
-    AHURA_TEST_CHECK(os_task_notify_give(&stale_task, 1U) == OS_STATUS_INVALID_ARG,
-                      "os_task_notify_give() to a stale/unknown task id is rejected");
+    AHURA_TEST_CHECK(os_notify_give(&stale_task, 1U) == OS_STATUS_INVALID_ARG,
+                      "os_notify_give() to a stale/unknown task id is rejected");
 
     /* Give-before-wait: the latched value must be delivered without blocking. */
     os_test_notify_wait_timeout_ms = 500U;
     status = os_task_create(&helper, OS_TASK_CONFIG(test_notify_wait_entry, NULL, 3U));
     AHURA_TEST_CHECK(status == OS_STATUS_OK, "give-before-wait helper created");
-    AHURA_TEST_CHECK(os_task_notify_give(&helper, 111U) == OS_STATUS_OK,
-                      "os_task_notify_give() to a created-but-not-started task succeeds");
+    AHURA_TEST_CHECK(os_notify_give(&helper, 111U) == OS_STATUS_OK,
+                      "os_notify_give() to a created-but-not-started task succeeds");
     t0 = os_tick_get();
     AHURA_TEST_CHECK(os_task_start(&helper) == OS_STATUS_OK, "give-before-wait helper started");
     AHURA_TEST_CHECK(test_wait_inactive(&helper, 200U), "give-before-wait helper finished");
@@ -1865,8 +1984,8 @@ static void test_task_notify(void)
     AHURA_TEST_CHECK(os_task_start(&worker) == OS_STATUS_OK, "wait-then-give helper started");
     os_delay_ms(20U);
     AHURA_TEST_CHECK(os_task_state_get(&worker) == OS_TASK_STATE_BLOCKED,
-                      "wait-then-give helper is blocked in os_task_notify_wait");
-    AHURA_TEST_CHECK(os_task_notify_give(&worker, 222U) == OS_STATUS_OK, "os_task_notify_give() wakes it");
+                      "wait-then-give helper is blocked in os_notify_wait");
+    AHURA_TEST_CHECK(os_notify_give(&worker, 222U) == OS_STATUS_OK, "os_notify_give() wakes it");
     AHURA_TEST_CHECK(test_wait_inactive(&worker, 200U), "wait-then-give helper finished");
     AHURA_TEST_CHECK(os_test_notify_wait_status == OS_STATUS_OK, "the wait reports delivery, not timeout");
     AHURA_TEST_CHECK(os_test_notify_wait_value == 222U, "the delivered value matches (got %lu)",
@@ -1882,7 +2001,7 @@ static void test_task_notify(void)
     AHURA_TEST_CHECK(os_task_start(&helper) == OS_STATUS_OK, "timeout-case helper started");
     AHURA_TEST_CHECK(test_wait_inactive(&helper, 400U), "timeout-case helper finished");
     AHURA_TEST_CHECK(os_test_notify_wait_status == OS_STATUS_TIMEOUT,
-                      "os_task_notify_wait() times out when nobody gives");
+                      "os_notify_wait() times out when nobody gives");
     AHURA_TEST_CHECK(os_test_notify_wait_ticks >= OS_TICKS_FROM_MS(200U),
                       "the timeout waited its full budget (elapsed=%lu ticks)",
                       (unsigned long)os_test_notify_wait_ticks);
@@ -1893,8 +2012,8 @@ static void test_task_notify(void)
     t0 = os_tick_get();
     AHURA_TEST_CHECK(os_task_start(&worker) == OS_STATUS_OK, "unrelated-block helper started (delaying 80ms)");
     os_delay_ms(20U);
-    AHURA_TEST_CHECK(os_task_notify_give(&worker, 333U) == OS_STATUS_OK,
-                      "os_task_notify_give() during the unrelated delay succeeds");
+    AHURA_TEST_CHECK(os_notify_give(&worker, 333U) == OS_STATUS_OK,
+                      "os_notify_give() during the unrelated delay succeeds");
     AHURA_TEST_CHECK(test_wait_inactive(&worker, 300U), "unrelated-block helper finished");
     t1 = os_tick_get();
     AHURA_TEST_CHECK((t1 - t0) >= OS_TICKS_FROM_MS(75U),
@@ -1909,12 +2028,12 @@ static void test_task_notify(void)
     (void)os_task_create(&helper, OS_TASK_CONFIG(test_notify_discard_entry, NULL, 3U));
     (void)os_task_start(&helper);
     os_delay_ms(20U);
-    (void)os_task_notify_give(&helper, 444U);
+    (void)os_notify_give(&helper, 444U);
     (void)test_wait_inactive(&helper, 200U);
     AHURA_TEST_CHECK(os_test_notify_wait_status == OS_STATUS_OK, "notify_wait(NULL) reports the delivery");
     AHURA_TEST_CHECK(os_test_notify_second_status == OS_STATUS_EMPTY, "and still consumed it");
 }
-#endif /* OS_CONFIG_TASK_NOTIFY_ENABLE */
+#endif /* OS_CONFIG_NOTIFY_ENABLE */
 
 /*
  * ***********************************************************************************************************
@@ -2605,7 +2724,7 @@ static void test_fanin_worker_entry(void *context)
 
     os_delay_ms(ctx->work_ms);
     (void)os_queue_send(&os_test_queue, &ctx->value, OS_WAIT_FOREVER);
-    (void)os_event_group_set_bits(&os_test_event, ctx->bit);
+    (void)os_event_set_bits(&os_test_event, ctx->bit);
 }
 
 /******************************************************************************************************/
@@ -2631,7 +2750,7 @@ static void test_event_queue_fanin(void)
     AHURA_TEST_CHECK(os_queue_cleanup(&os_test_queue) == OS_STATUS_OK,
                       "fan-in queue emptied and reused (capacity %u, one slot per worker)",
                       (unsigned)os_test_queue.capacity);
-    AHURA_TEST_CHECK(os_event_group_init(&os_test_event) == OS_STATUS_OK, "fan-in event group initialized");
+    AHURA_TEST_CHECK(os_event_init(&os_test_event) == OS_STATUS_OK, "fan-in event group initialized");
 
     os_test_fanin_ctx[0].bit = 0x01U; os_test_fanin_ctx[0].value = 10U; os_test_fanin_ctx[0].work_ms = 60U;
     os_test_fanin_ctx[1].bit = 0x02U; os_test_fanin_ctx[1].value = 20U; os_test_fanin_ctx[1].work_ms = 20U;
@@ -2649,7 +2768,7 @@ static void test_event_queue_fanin(void)
     (void)os_task_start(&helper);
     (void)os_task_start(&helper2);
 
-    status = os_event_group_wait_bits(&os_test_event, 0x07U, true, false, &matched, 500U);
+    status = os_event_wait_bits(&os_test_event, 0x07U, true, false, &matched, 500U);
     AHURA_TEST_CHECK((status == OS_STATUS_OK) && (matched == 0x07U),
                       "wait-all sees all 3 workers' bits despite different finish times (matched=0x%02lx)",
                       (unsigned long)matched);
@@ -2778,8 +2897,8 @@ static void test_stress_worker_entry(void *context)
                 uint32_t bit     = 1UL << (test_stress_prng_next(&ctx->prng_state) % 4U);
                 uint32_t matched = 0U;
 
-                (void)os_event_group_set_bits(&os_test_stress_event, bit);
-                (void)os_event_group_wait_bits(&os_test_stress_event, bit, false, true, &matched, 2U);
+                (void)os_event_set_bits(&os_test_stress_event, bit);
+                (void)os_event_wait_bits(&os_test_stress_event, bit, false, true, &matched, 2U);
                 break;
             }
 
@@ -2846,7 +2965,7 @@ static void test_stress_soak(void)
     AHURA_TEST_CHECK(os_semaphore_init(&os_test_stress_sem, OS_TEST_STRESS_SEM_MAX, OS_TEST_STRESS_SEM_MAX) == OS_STATUS_OK,
                       "stress semaphore initialized (max=%u, deliberately < %u workers)",
                       (unsigned)OS_TEST_STRESS_SEM_MAX, (unsigned)OS_TEST_STRESS_WORKER_COUNT);
-    AHURA_TEST_CHECK(os_event_group_init(&os_test_stress_event) == OS_STATUS_OK, "stress event group initialized");
+    AHURA_TEST_CHECK(os_event_init(&os_test_stress_event) == OS_STATUS_OK, "stress event group initialized");
     AHURA_TEST_CHECK(os_queue_cleanup(&os_test_stress_queue) == OS_STATUS_OK,
                       "stress queue emptied and reused (capacity=%u, deliberately < %u workers)",
                       (unsigned)os_test_stress_queue.capacity, (unsigned)OS_TEST_STRESS_WORKER_COUNT);
@@ -3596,7 +3715,7 @@ static void test_stress_semaphore_pingpong(void)
 }
 #endif /* OS_CONFIG_SEMAPHORE_ENABLE */
 
-#if (OS_CONFIG_TASK_NOTIFY_ENABLE == 1U)
+#if (OS_CONFIG_NOTIFY_ENABLE == 1U)
 
 #define OS_TEST_NOTIFY_STORM_COUNT 1000U
 
@@ -3614,7 +3733,7 @@ static void test_ns_entry(void *context)
     {
         uint32_t value = 0U;
 
-        if (os_task_notify_wait(50U, &value) == OS_STATUS_OK)
+        if (os_notify_wait(50U, &value) == OS_STATUS_OK)
         {
             /* Values are sent 1..N in order, so the next one must be exactly one past the count
              * already taken. Anything else means a notification was lost, delivered twice, or the
@@ -3656,7 +3775,7 @@ static void test_stress_notify_storm(void)
 
     for (i = 1U; i <= OS_TEST_NOTIFY_STORM_COUNT; i++)
     {
-        if (os_task_notify_give(&worker, i) != OS_STATUS_OK) { break; }
+        if (os_notify_give(&worker, i) != OS_STATUS_OK) { break; }
 
         delivered++;
     }
@@ -3674,7 +3793,7 @@ static void test_stress_notify_storm(void)
     AHURA_TEST_CHECK(os_test_ns_last == OS_TEST_NOTIFY_STORM_COUNT,
                       "the last value received is the last one sent (%lu)", (unsigned long)os_test_ns_last);
 }
-#endif /* OS_CONFIG_TASK_NOTIFY_ENABLE */
+#endif /* OS_CONFIG_NOTIFY_ENABLE */
 
 #if (OS_CONFIG_EVENT_ENABLE == 1U)
 
@@ -3689,7 +3808,7 @@ typedef struct
 } test_ebs_ctx_t;
 
 static test_ebs_ctx_t   os_test_ebs_ctx[OS_TEST_EBS_WORKERS];
-static os_event_group_t os_test_ebs_event;
+static os_event_t os_test_ebs_event;
 static __IO uint32_t    os_test_ebs_matched[OS_TEST_EBS_WORKERS];
 
 /******************************************************************************************************/
@@ -3702,9 +3821,9 @@ static void test_ebs_entry(void *context)
     {
         uint32_t matched = 0U;
 
-        (void)os_event_group_set_bits(&os_test_ebs_event, ctx->bit);
+        (void)os_event_set_bits(&os_test_ebs_event, ctx->bit);
 
-        if (os_event_group_wait_bits(&os_test_ebs_event, ctx->bit, false, true, &matched, 100U) == OS_STATUS_OK)
+        if (os_event_wait_bits(&os_test_ebs_event, ctx->bit, false, true, &matched, 100U) == OS_STATUS_OK)
         {
             if ((matched & ctx->bit) != 0U) { os_test_ebs_matched[ctx->id]++; }
         }
@@ -3729,7 +3848,7 @@ static void test_stress_event_bit_storm(void)
 
     test_print_section("Stress: 4 tasks set/wait/clear their own event bit concurrently");
 
-    AHURA_TEST_CHECK(os_event_group_init(&os_test_ebs_event) == OS_STATUS_OK, "bit-storm event group initialized");
+    AHURA_TEST_CHECK(os_event_init(&os_test_ebs_event) == OS_STATUS_OK, "bit-storm event group initialized");
 
     for (i = 0U; i < OS_TEST_EBS_WORKERS; i++)
     {
@@ -3750,7 +3869,7 @@ static void test_stress_event_bit_storm(void)
                       "every set was matched by its owner's wait (%lu of %lu)",
                       (unsigned long)total, (unsigned long)(OS_TEST_EBS_WORKERS * OS_TEST_EBS_ITERS));
 
-    (void)os_event_group_wait_bits(&os_test_ebs_event, all_bits, false, false, &leftover, OS_WAIT_NOTHING);
+    (void)os_event_wait_bits(&os_test_ebs_event, all_bits, false, false, &leftover, OS_WAIT_NOTHING);
     AHURA_TEST_CHECK((leftover & all_bits) == 0U,
                       "no worker's bit was left standing at the end (flags=0x%02lX)",
                       (unsigned long)(leftover & all_bits));
@@ -4509,25 +4628,25 @@ static void test_benchmarks(void)
 #endif
 
 #if (OS_CONFIG_EVENT_ENABLE == 1U)
-    if (os_event_group_init(&os_test_bench_event) == OS_STATUS_OK)
+    if (os_event_init(&os_test_bench_event) == OS_STATUS_OK)
     {
         uint32_t matched;
 
         TEST_BENCH_MIN_CYCLES(best, TEST_BENCH_SAMPLES,
-                              (void)os_event_group_set_bits(&os_test_bench_event, 0x01U);
-                              (void)os_event_group_wait_bits(&os_test_bench_event, 0x01U, false, true,
+                              (void)os_event_set_bits(&os_test_bench_event, 0x01U);
+                              (void)os_event_wait_bits(&os_test_bench_event, 0x01U, false, true,
                                                               &matched, OS_WAIT_NOTHING));
-        test_bench_row("os_event_group_set + wait (immediate)", TEST_BENCH_SUB(best, overhead), clock_hz);
+        test_bench_row("os_event_set + wait (immediate)", TEST_BENCH_SUB(best, overhead), clock_hz);
     }
 #endif
 
-#if (OS_CONFIG_TASK_NOTIFY_ENABLE == 1U)
+#if (OS_CONFIG_NOTIFY_ENABLE == 1U)
     /* Created but never started: give() then only latches, which is exactly the ISR-side cost
      * an application cares about (the wake path is a context switch, measured below). */
     if (os_task_create(&helper, OS_TASK_CONFIG(test_worker_entry, NULL, 1U)) == OS_STATUS_OK)
     {
-        TEST_BENCH_MIN_CYCLES(best, TEST_BENCH_SAMPLES, (void)os_task_notify_give(&helper, 1U));
-        test_bench_row("os_task_notify_give (latch, no wake)", TEST_BENCH_SUB(best, overhead), clock_hz);
+        TEST_BENCH_MIN_CYCLES(best, TEST_BENCH_SAMPLES, (void)os_notify_give(&helper, 1U));
+        test_bench_row("os_notify_give (latch, no wake)", TEST_BENCH_SUB(best, overhead), clock_hz);
 
         (void)os_task_delete(&helper);
     }
@@ -4659,6 +4778,7 @@ void os_test(void)
     test_task_lifecycle();
     test_task_identity();
     test_priority_preemption();
+    test_scheduler_lock();
 
 #if (OS_CONFIG_MUTEX_ENABLE == 1U)
     test_mutex();
@@ -4682,7 +4802,7 @@ void os_test(void)
 #if (OS_CONFIG_WORK_ENABLE == 1U)
     test_work();
 #endif
-#if (OS_CONFIG_TASK_NOTIFY_ENABLE == 1U)
+#if (OS_CONFIG_NOTIFY_ENABLE == 1U)
     test_task_notify();
 #endif
     test_assert();
@@ -4732,7 +4852,7 @@ void os_test(void)
 #if (OS_CONFIG_SEMAPHORE_ENABLE == 1U)
     test_stress_semaphore_pingpong();
 #endif
-#if (OS_CONFIG_TASK_NOTIFY_ENABLE == 1U)
+#if (OS_CONFIG_NOTIFY_ENABLE == 1U)
     test_stress_notify_storm();
 #endif
 #if (OS_CONFIG_EVENT_ENABLE == 1U)

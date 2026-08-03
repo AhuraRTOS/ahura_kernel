@@ -60,6 +60,10 @@ static uint32_t    os_timer_registry_slot_acquire(const os_timer_t *timer);
 /**
  * @brief Initialize a software timer as one-shot or periodic.
  *
+ * Re-initializing a timer that was already started is allowed and behaves like a stop followed by
+ * the new configuration: the registry slot goes back, so repeated re-initialisation cannot exhaust
+ * the registry, and the tick can no longer reach the object while its fields are being rewritten.
+ *
  * @param[in,out] timer         Timer object.
  * @param[in]     period_ticks  Timer period in ticks (see OS_TICKS_FROM_MS).
  * @param[in]     mode          OS_TIMER_MODE_ONE_SHOT or OS_TIMER_MODE_PERIODIC.
@@ -69,10 +73,25 @@ static uint32_t    os_timer_registry_slot_acquire(const os_timer_t *timer);
  */
 os_status os_timer_init(os_timer_t *timer, uint32_t period_ticks, os_timer_mode_t mode, os_timer_callback_t callback, void *context)
 {
+    uint32_t slot;
+
     if ((timer == NULL) || (period_ticks == 0U) || (callback == NULL) ||
         ((mode != OS_TIMER_MODE_ONE_SHOT) && (mode != OS_TIMER_MODE_PERIODIC)))
     {
         return OS_STATUS_INVALID_ARG;
+    }
+
+    /* The critical section is what makes this safe on a live timer: clearing active alone would
+     * still leave os_timer_tick_process reading this object from the tick ISR while the fields
+     * below are half-rewritten. */
+    os_critical_enter();
+
+    /* Leaving the timer registered would keep the slot occupied (nothing else releases it until a
+     * later start or stop) and hand the tick a timer the caller has just reconfigured. */
+    slot = os_timer_registry_slot_find(timer);
+    if (slot < OS_CONFIG_MAX_TIMERS)
+    {
+        os_timer_registry[slot] = NULL;
     }
 
     timer->period_ticks    = period_ticks;
@@ -84,6 +103,7 @@ os_status os_timer_init(os_timer_t *timer, uint32_t period_ticks, os_timer_mode_
     timer->callback        = callback;
     timer->context         = context;
 
+    os_critical_exit();
     return OS_STATUS_OK;
 }
 
@@ -314,8 +334,10 @@ void os_timer_tick_process(uint32_t elapsed_ticks)
      * On multi-core builds the cross-core spinlock additionally excludes the
      * other cores' os_timer_start/os_timer_stop callers, who hold it via
      * os_critical_enter - the local mask alone only stops this core's own
-     * interrupts. Released before os_task_wake below, which acquires the
-     * same lock itself (never hold both at once - not recursive). */
+     * interrupts. Both are held across the os_task_wake_tcb below, which is
+     * exactly what that call requires of its caller (unlike os_task_wake,
+     * which takes the same non-recursive lock itself and so could not be
+     * called from in here). */
     mask_state = os_arch_kernel_mask_save();
     os_critical_multicore_lock();
 
@@ -516,10 +538,18 @@ static os_status os_timer_arm(os_timer_t *timer, bool reload)
 
     /* Resuming keeps remaining_ticks; everything else counts a whole period. A paused timer is the
      * only one whose remaining_ticks means anything, which is why the flag rather than the caller
-     * decides what a plain start does. */
+     * decides what a plain start does.
+     *
+     * An expiry the tick already noted but the timer task has not drained yet belongs to the period
+     * being discarded here, so it goes with it. Without this, restarting a timer whose expiry is
+     * still in flight leaves active=1 with expired=1 and a full period on the clock, and the next
+     * os_timer_expired_fetch runs the callback at once - a whole period early, at the very moment
+     * the caller asked for the deadline to be pushed back. Only this branch clears it: the resume
+     * path must not, because os_timer_pause documents that a noted expiry is still owed. */
     if (reload || (!timer->paused))
     {
         timer->remaining_ticks = timer->period_ticks;
+        timer->expired         = false;
     }
 
     timer->paused = false;
