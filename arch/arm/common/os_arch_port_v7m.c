@@ -416,19 +416,11 @@ void os_arch_sleep_finish(void)
  * go round again if it did not. Nothing is masked, so an ISR - or another core - landing in the
  * middle costs a second pass rather than costing anyone correctness.
  *
- * Written out per operation rather than funnelled through a shared helper or a compare-and-swap
- * loop, for two reasons that pull the same way:
- *
- *   Speed. The whole sequence is five instructions. Routing it through CAS would load the word a
- *   second time and compare it, when the reservation already carries exactly that information;
- *   routing it through a shared helper would leave the compiler to decide whether the operation
- *   selector folds away, which it only reliably does with optimization on.
- *
- *   Safety. Keeping each loop inside one asm block means it is the same five instructions at -O0
- *   as at -O2, and no compiler-generated spill can land between the LDREX and the STREX. ARM
- *   guarantees only one outstanding reservation per core and leaves it implementation-defined
- *   whether unrelated memory accesses clear it, so the fewer of them inside the window, the fewer
- *   implementations this has to be lucky on.
+ * Written out per operation rather than funnelled through a shared helper or a CAS loop. Speed:
+ * the whole sequence is five instructions, and CAS would re-load and compare what the reservation
+ * already tells us. Safety: one asm block per loop is the same five instructions at -O0 as at -O2,
+ * with no compiler spill between the LDREX and the STREX - ARM allows only one reservation per
+ * core and leaves it implementation-defined whether other accesses clear it.
  *
  * "1:" and "1b" are local numeric labels, so each block stays correct even if the compiler emits
  * it more than once. Every operation returns the value the word held BEFORE it ran.

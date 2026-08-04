@@ -1,29 +1,19 @@
 /**
  * @file os_config_template.h
- * @brief Template for the application's os_config.h — the complete Ahura
- *        kernel configuration with every option at its default value.
+ * @brief Template for the application's os_config.h - every kernel option at its default value.
  *
- * NOT included by the kernel: copy this file into the application source
- * tree as os_config.h, adjust the values, and make its directory visible
- * to BOTH the application and the kernel library build (set OS_CONFIG_DIR
- * before add_subdirectory(ahura_kernel) — see the README "Configuration"
- * section). The kernel refuses to build without a complete os_config.h.
+ * NOT included by the kernel: copy it into the application source tree as os_config.h, adjust the
+ * values, and make its directory visible to BOTH the application and the kernel library build
+ * (OS_CONFIG_DIR, see the README "Configuration" section).
  *
- * This file is the single source of configuration: all options are plain
- * defines, so do not additionally define OS_CONFIG_ macros from the build
- * system (that would redefine them). Do not remove options either: an
- * incomplete configuration is rejected with a compile-time error rather
- * than silently misconfiguring the kernel.
+ * This file is the single source of configuration, so do not also define OS_CONFIG_ macros from
+ * the build system, and do not remove options: an incomplete configuration is rejected at compile
+ * time rather than silently misconfiguring the kernel.
  *
- * Laid out in three parts, most important first:
- *
- *   PART 1  CORE - always compiled in, so these always apply. Set them first.
- *   PART 2  OPTIONAL FEATURES - one section per feature, each holding its
- *           _ENABLE switch together with the sizing that switch controls, so
- *           turning a feature off tells you exactly which values stop
- *           mattering. Same order as PART 2 of ahura.h.
+ *   PART 1  CORE - always compiled in. Set these first.
+ *   PART 2  OPTIONAL FEATURES - one section per feature, each holding its _ENABLE switch with the
+ *           sizing that switch controls. Same order as PART 2 of ahura.h.
  *   PART 3  PLATFORM - target properties (TrustZone, core count, tickless).
- *           Dictated by the hardware, not by application design.
  *
  * @copyright (c) 2026 Ahura Project Contributors
  *            SPDX-License-Identifier: MIT
@@ -396,48 +386,24 @@
 */
 
 /**
- * Number of cores that schedule tasks (max 31). Every scheduling core runs
- * its own PendSV/idle task and pulls from the shared ready lists honoring
- * each task's core_affinity mask; core 0 owns the time base and secondary
- * cores enter the scheduler through os_core_start(). The SoC layer must
- * provide os_arch_core_id_get_cb() (plus the IPI callback, and the hardware
- * spinlock callbacks on cores without LDREX/STREX, e.g. Cortex-M0+ SoCs);
- * see os_cb_template.c and the README "Multi-core" section.
+ * Number of cores that schedule tasks (max 31). Each runs its own PendSV and idle task and pulls
+ * from the shared ready lists honoring core_affinity; core 0 owns the time base, and secondary
+ * cores enter through os_core_start(). The SoC layer must supply os_arch_core_id_get_cb(), the IPI
+ * callback, and - on cores without LDREX/STREX - the spinlock callbacks. See os_cb_template.c.
  *
- * Two more preconditions the kernel cannot verify or provide for on its own
- * - both are SoC/hardware properties, not something a portable C source file
- * can guarantee - so satisfying them is the SoC integrator's responsibility
- * before setting this above 1:
+ * Two preconditions the kernel cannot verify, both SoC properties, before setting this above 1:
  *
- *   1. Global exclusive monitor. The kernel's inter-core spinlock
- *      (os_arch_port_common.h) is built on LDREX/STREX whenever the target
- *      has them (all v7-M/v8-M cores). STREX only excludes another core when
- *      the interconnect implements a GLOBAL exclusive monitor for the lock's
- *      address AND that address is Shareable-mapped; both are SoC/MPU
- *      choices. Without them, both cores' local monitors can grant STREX
- *      success simultaneously and the "lock" silently stops excluding
- *      anything - no fault, just corruption. Verify your SoC's TRM documents
- *      a global monitor for the memory region the spinlock lives in (a
- *      static in this library's .bss), and mark that region Shareable.
- *   2. Cache coherency. Cortex-M has no inter-core cache coherency. On D-cache
- *      cores (M7, M55, M85) a volatile store to write-back-cacheable SRAM
- *      only reaches the local cache; DSB is not cache maintenance. Every
- *      cross-core shared kernel object (the ready/delay lists, the work/timer
- *      registries, os_task_current[], the spinlock word itself) must live in
- *      a non-cacheable or cache-coherent region, or the SoC must bracket
- *      cross-core handoffs with explicit clean/invalidate - typically done by
- *      placing the whole kernel's shared statics in a dedicated non-cacheable
- *      MPU region via the linker script.
+ *   1. Global exclusive monitor. The inter-core spinlock uses LDREX/STREX, which only excludes
+ *      another core when the interconnect implements a GLOBAL monitor for that address AND the
+ *      address is Shareable-mapped. Without both, two cores can succeed at once and the lock
+ *      silently stops excluding anything. OS_CONFIG_MULTICORE_SPINLOCK_SOC_BACKEND routes it
+ *      through your own hardware semaphore instead.
+ *   2. Cache coherency. Cortex-M has none between cores, and DSB is not cache maintenance. Every
+ *      shared kernel object (ready/delay lists, the registries, os_task_current[], the spinlock
+ *      word) must sit in a non-cacheable or coherent region - typically the whole kernel's shared
+ *      statics placed in one non-cacheable MPU region by the linker script. No portable fallback.
  *
- * Neither precondition has a portable fallback for cache coherency - that
- * still requires SoC-specific MPU/linker placement. The exclusive-monitor
- * precondition does have one: set OS_CONFIG_MULTICORE_SPINLOCK_SOC_BACKEND
- * below to route the kernel spinlock through your own hardware semaphore
- * (os_arch_spinlock_acquire_cb/_release_cb in os_cb_template.c) instead of
- * the built-in LDREX/STREX backend.
- *
- * The kernel service tasks are placed with OS_CONFIG_WORK_CORE_AFFINITY and
- * OS_CONFIG_TIMER_CORE_AFFINITY (PART 2).
+ * Service tasks are placed with OS_CONFIG_WORK_CORE_AFFINITY / OS_CONFIG_TIMER_CORE_AFFINITY.
  */
 
 #define OS_CONFIG_CORE_COUNT                1U

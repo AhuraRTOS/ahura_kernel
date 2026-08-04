@@ -4756,6 +4756,204 @@ static void test_unsupported_features(void)
 
 /*
  * ***********************************************************************************************************
+ * Regressions for fixed defects
+ * ***********************************************************************************************************
+ *
+ * What these share is a method rather than a subsystem: each needs an interleaving the scheduler
+ * would not normally produce, and os_scheduler_lock is what makes those reachable on target - it
+ * holds a woken task in READY, with the tick and every interrupt still running, for as long as
+ * the test needs. Messages are kept short here: this suite is already close to the flash limit.
+*/
+
+#if (OS_CONFIG_SEMAPHORE_ENABLE == 1U)
+static os_semaphore_t os_test_reg_sem;
+static __IO uint32_t  os_test_reg_order   = 0U;
+static __IO uint32_t  os_test_reg_a_order = 0U;
+static __IO os_status os_test_reg_a_st    = OS_STATUS_ERROR;
+static __IO os_status os_test_reg_b_st    = OS_STATUS_ERROR;
+
+static void test_reg_waiter_b(void *context)
+{
+    (void)context;
+    os_test_reg_b_st = os_semaphore_take(&os_test_reg_sem, 400U);
+    (void)++os_test_reg_order;
+}
+
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+static os_mutex_t os_test_reg_mutex;
+
+/* Low priority: holds the mutex, then queues on the semaphore behind a higher-priority waiter.
+ * The boost it takes while blocked there is what must re-sort it to the head of that queue. */
+static void test_reg_boosted_entry(void *context)
+{
+    (void)context;
+
+    if (os_mutex_lock(&os_test_reg_mutex, 200U) != OS_STATUS_OK)
+    {
+        return;
+    }
+
+    os_test_reg_a_st    = os_semaphore_take(&os_test_reg_sem, 400U);
+    os_test_reg_a_order = ++os_test_reg_order;
+
+    (void)os_mutex_unlock(&os_test_reg_mutex);
+}
+
+/* Highest priority: contends the mutex purely to trigger the inheritance boost. */
+static void test_reg_booster_entry(void *context)
+{
+    (void)context;
+
+    if (os_mutex_lock(&os_test_reg_mutex, 400U) == OS_STATUS_OK)
+    {
+        (void)os_mutex_unlock(&os_test_reg_mutex);
+    }
+}
+#endif /* OS_CONFIG_MUTEX_ENABLE */
+#endif /* OS_CONFIG_SEMAPHORE_ENABLE */
+
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
+static void test_reg_timer_cb(void *context)
+{
+    (void)context;
+}
+#endif
+
+/******************************************************************************************************/
+/**
+ * @brief Regression checks: tick saturation, wake handoff on pause, priority-boost re-ordering,
+ *        timer restart with an undrained expiry, and timer registry slot release.
+ */
+static void test_regressions(void)
+{
+    test_print_section("Regressions");
+
+    /* A duration too large for the tick range must clamp, never wrap to a small plausible count
+     * and never land on the "wait forever" sentinel by accident. */
+    AHURA_TEST_CHECK(OS_TICKS_FROM_MS(0xFFFFFFFFU) == (OS_WAIT_FOREVER - 1U), "ms conversion saturates");
+    AHURA_TEST_CHECK(OS_TICKS_FROM_S(0xFFFFFFFFU) == (OS_WAIT_FOREVER - 1U), "s conversion saturates");
+
+#if (OS_CONFIG_SEMAPHORE_ENABLE == 1U)
+    /* An unconsumed wake is handed on, not lost with the task that never used it. */
+    {
+        os_test_reg_b_st = OS_STATUS_ERROR;
+        (void)os_semaphore_init(&os_test_reg_sem, 0U, 2U);
+
+        (void)os_task_create(&helper, OS_TASK_CONFIG(test_reg_waiter_b, NULL, TEST_PRIO_LOW));
+        (void)os_task_start(&helper);
+        (void)os_task_create(&helper2, OS_TASK_CONFIG(test_reg_waiter_b, NULL, TEST_PRIO_LOW));
+        (void)os_task_start(&helper2);
+        os_delay_ms(20U);   /* both are below this task, so they queue while it sleeps */
+
+        /* The window: give() wakes the first waiter, the lock stops it running, and the pause
+         * removes it before it can consume the token. */
+        os_scheduler_lock();
+        (void)os_semaphore_give(&os_test_reg_sem);
+        (void)os_task_pause(&helper);
+        os_scheduler_unlock();
+
+        os_delay_ms(40U);
+        AHURA_TEST_CHECK(os_test_reg_b_st == OS_STATUS_OK, "paused task's wake passed to the next waiter");
+        AHURA_TEST_CHECK(os_task_state_get(&helper) == OS_TASK_STATE_SUSPENDED, "paused task stayed paused");
+
+        (void)os_task_delete(&helper);
+        (void)test_wait_inactive(&helper2, 500U);
+    }
+
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+#if ((OS_CONFIG_TEST_PRIORITY + 2U) <= OS_TASK_PRIO_USER_MAX)
+    /* A boost must re-sort a task already queued on some OTHER object. */
+    {
+        os_test_reg_order   = 0U;
+        os_test_reg_a_order = 0U;
+        os_test_reg_a_st    = OS_STATUS_ERROR;
+        os_test_reg_b_st    = OS_STATUS_ERROR;
+
+        (void)os_semaphore_init(&os_test_reg_sem, 0U, 2U);
+        (void)os_mutex_init(&os_test_reg_mutex);
+
+        (void)os_task_create(&helper, OS_TASK_CONFIG(test_reg_boosted_entry, NULL, TEST_PRIO_LOW));
+        (void)os_task_start(&helper);
+        os_delay_ms(20U);   /* holds the mutex, now queued on the semaphore */
+
+        /* Higher priority, so the waiter list puts it AHEAD of the low-priority holder. */
+        (void)os_task_create(&helper2, OS_TASK_CONFIG(test_reg_waiter_b, NULL, TEST_PRIO_HIGH));
+        (void)os_task_start(&helper2);
+        os_delay_ms(20U);
+
+        /* Contending the mutex boosts its owner above that waiter. */
+        (void)os_task_create(&helper3,
+                             OS_TASK_CONFIG(test_reg_booster_entry, NULL, OS_CONFIG_TEST_PRIORITY + 2U));
+        (void)os_task_start(&helper3);
+        os_delay_ms(20U);
+
+        (void)os_semaphore_give(&os_test_reg_sem);
+        os_delay_ms(30U);
+
+        AHURA_TEST_CHECK(os_test_reg_a_order == 1U, "boosted waiter woken first (order=%lu)",
+                          (unsigned long)os_test_reg_a_order);
+
+        (void)os_semaphore_give(&os_test_reg_sem);
+        AHURA_TEST_CHECK(test_wait_inactive(&helper, 500U) && test_wait_inactive(&helper2, 500U) &&
+                          test_wait_inactive(&helper3, 500U), "all three helpers finished");
+    }
+#endif
+#endif /* OS_CONFIG_MUTEX_ENABLE */
+#endif /* OS_CONFIG_SEMAPHORE_ENABLE */
+
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
+    /* Restart must discard an expiry the tick noted but the timer task has not drained. */
+    {
+        os_test_oneshot_fired = 0U;
+        (void)os_timer_init(&os_test_timer_oneshot, OS_TICKS_FROM_MS(30U), OS_TIMER_MODE_ONE_SHOT,
+                            timer_oneshot_cb, NULL);
+        (void)os_timer_start(&os_test_timer_oneshot);
+
+        /* The lock keeps the timer service task off the CPU while the tick keeps running, so the
+         * expiry is flagged and left undrained - the state a restart used to inherit. */
+        os_scheduler_lock();
+        os_delay_ms(45U);   /* busy-waits under the lock; ticks still arrive */
+        (void)os_timer_restart(&os_test_timer_oneshot);
+        os_scheduler_unlock();
+
+        os_delay_ms(15U);
+        AHURA_TEST_CHECK(os_test_oneshot_fired == 0U, "restart dropped the undrained expiry");
+        os_delay_ms(40U);
+        AHURA_TEST_CHECK(os_test_oneshot_fired == 1U, "and fired a full period later");
+        (void)os_timer_stop(&os_test_timer_oneshot);
+    }
+
+    /* Re-initializing a started timer must return its registry slot. */
+    {
+        uint32_t index;
+
+        for (index = 0U; index < OS_CONFIG_MAX_TIMERS; index++)
+        {
+            /* Far longer than this section runs, so none of them can fire and disturb it. */
+            (void)os_timer_init(&os_test_tflood[index], OS_TICKS_FROM_MS(60000U),
+                                OS_TIMER_MODE_PERIODIC, test_reg_timer_cb, NULL);
+            (void)os_timer_start(&os_test_tflood[index]);
+        }
+
+        (void)os_timer_init(&os_test_tflood_extra, OS_TICKS_FROM_MS(60000U), OS_TIMER_MODE_PERIODIC,
+                            test_reg_timer_cb, NULL);
+        AHURA_TEST_CHECK(os_timer_start(&os_test_tflood_extra) == OS_STATUS_FULL, "registry full");
+
+        (void)os_timer_init(&os_test_tflood[0], OS_TICKS_FROM_MS(60000U), OS_TIMER_MODE_PERIODIC,
+                            test_reg_timer_cb, NULL);
+        AHURA_TEST_CHECK(os_timer_start(&os_test_tflood_extra) == OS_STATUS_OK, "re-init freed its slot");
+
+        (void)os_timer_stop(&os_test_tflood_extra);
+        for (index = 0U; index < OS_CONFIG_MAX_TIMERS; index++)
+        {
+            (void)os_timer_stop(&os_test_tflood[index]);
+        }
+    }
+#endif /* OS_CONFIG_TIMER_ENABLE */
+}
+
+/*
+ * ***********************************************************************************************************
  * Public function implementations
  * ***********************************************************************************************************
 */
@@ -4879,6 +5077,7 @@ void os_test(void)
     test_tickless_hooks();
     test_tickless_sleep();
     test_list();
+    test_regressions();
     test_unsupported_features();
 
     printf("\r\n========================================\r\n");

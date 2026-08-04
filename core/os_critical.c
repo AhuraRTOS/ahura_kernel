@@ -2,15 +2,11 @@
  * @file os_critical.c
  * @brief Critical section module implementation (kernel interrupt mask based, nesting aware).
  *
- * The interrupt mask is the port's kernel mask: PRIMASK (all interrupts) by
- * default, or BASEPRI up to OS_CONFIG_MAX_SYSCALL_INTERRUPT_PRIORITY when
- * that option is nonzero - interrupts above the threshold then keep zero
- * kernel latency but must never call a kernel API (see os_arch_port_common.h).
- *
- * On multi-core builds (OS_CONFIG_CORE_COUNT > 1) the outermost enter also
- * takes the global kernel spinlock, so a critical section excludes the other
- * cores as well as local interrupts. Nesting is tracked per core. On
- * single-core builds the spinlock and core-id lookups compile to nothing.
+ * The interrupt mask is the port's kernel mask: PRIMASK by default, or BASEPRI up to
+ * OS_CONFIG_MAX_SYSCALL_INTERRUPT_PRIORITY when that is nonzero (interrupts above the threshold
+ * keep zero kernel latency but must never call a kernel API). On multi-core builds the outermost
+ * enter also takes the global kernel spinlock, so a critical section excludes the other cores
+ * too; nesting is per core, and both compile to nothing on single-core builds.
  *
  * @copyright (c) 2026 Ahura Project Contributors
  *            SPDX-License-Identifier: MIT
@@ -115,10 +111,9 @@ void os_critical_exit(void)
  *        lists and registries, but manage their local mask themselves rather than going
  *        through the nesting-counted os_critical_enter/exit pair).
  *
- * Never call this while already holding the lock via os_critical_enter, or while it will
- * still be held when calling a function that itself calls os_critical_enter (e.g.
- * os_task_wake): the spinlock is not recursive and the second acquire on the same core
- * spins forever. Compiles to nothing on single-core builds (see os_internal.h).
+ * Never call this while already holding the lock via os_critical_enter, or while it will still be
+ * held across a call that takes it itself (e.g. os_task_wake): it is not recursive, so the second
+ * acquire on the same core spins forever. Compiles to nothing on single-core builds.
  *
  * @return None.
  */

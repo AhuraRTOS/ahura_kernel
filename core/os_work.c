@@ -92,15 +92,11 @@ static uint32_t   os_work_registry_slot_free(void);
  * ISR-safe. delay_ms == 0 makes the call ready immediately; because the work task runs at the
  * highest priority, it preempts any user task as soon as the scheduler is invoked.
  *
- * The handler AND the payload are copied into a free registry slot, so the caller owns nothing
- * that has to stay alive until the call runs - a local buffer may go out of scope the moment this
- * returns. Each submission is independent: two submissions of the same handler run it twice, and
- * neither can be cancelled or inspected afterwards.
- *
- * The copy happens inside the critical section, so keep payloads small; OS_CONFIG_WORK_PAYLOAD_SIZE
- * bounds them, and anything larger is refused rather than truncated. Submitting a pointer (and
- * sizeof that pointer) is the way to hand over more, which puts the lifetime question back in the
- * caller's hands visibly instead of by default.
+ * The handler AND the payload are copied into a free slot, so a local buffer may go out of scope
+ * the moment this returns. Each submission is independent and none can be cancelled afterwards.
+ * The copy runs inside the critical section, so keep payloads small: OS_CONFIG_WORK_PAYLOAD_SIZE
+ * bounds them and anything larger is refused rather than truncated. Pass a pointer to hand over
+ * more, which puts the lifetime question visibly back in the caller's hands.
  *
  * @param[in] handler   Function to run on the kernel work task.
  * @param[in] data      Payload to copy, or NULL when len is 0.

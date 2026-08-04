@@ -2,24 +2,16 @@
  * @file os_atomic.c
  * @brief Atomic operations on a single word.
  *
- * Portable half of the atomic API. Nothing here knows how a word is made to update indivisibly -
- * that is the core's business and lives entirely in the port, which is what lets a core with
- * LDREX/STREX stay lock-free while one without pays interrupt latency instead, with no trace of
- * either choice in this file.
+ * Portable half of the atomic API: argument validation, plus the operations that are just another
+ * one renamed (increment is an add of 1, clearing a bit is an AND with its complement). How a word
+ * updates indivisibly is the port's business, which lets a core with LDREX/STREX stay lock-free
+ * while one without pays interrupt latency instead.
  *
- * What is left over is genuinely portable: argument validation, and the handful of operations that
- * are just another one under a different name - increment is an add of 1, clearing a bit is an AND
- * with its complement. Composing those here rather than in each port keeps the set a port has to
- * implement small, and keeps their behaviour identical on every core by construction.
+ * Each function validates and makes exactly one call into the port rather than layering on another
+ * os_atomic_*: the port is a separate translation unit, so without LTO every layer would be a real
+ * branch and stack frame. The cost is the NULL check written out repeatedly below.
  *
- * Each function validates and then makes exactly one call into the port, rather than routing
- * through another os_atomic_* function that would validate the same pointer again. The port is a
- * separate translation unit, so without link-time optimization nothing here can be inlined into
- * its caller and every layer is a real branch and stack frame: os_atomic_set_bit built on
- * os_atomic_test_and_set_bit built on os_atomic_or would be three of them to reach a single
- * instruction's worth of work. The cost is that the NULL check is written out repeatedly below.
- *
- * All of them return the value the word held BEFORE the operation, not after it.
+ * All of them return the value the word held BEFORE the operation.
  *
  * @copyright (c) 2026 Ahura Project Contributors
  *            SPDX-License-Identifier: MIT
@@ -274,14 +266,11 @@ int32_t os_atomic_nand(os_atomic_t *target, int32_t value)
 /**
  * @brief Compare-and-swap: store desired only if the word still holds expected.
  *
- * Unlike everything above, this does NOT retry. A false return is the answer the caller asked
- * for - the word no longer held expected - and is what makes CAS the building block for
- * lock-free algorithms the kernel does not know about.
- *
- * The port's primitive may also fail spuriously when it loses exclusive access, so a false return
- * does not by itself prove another writer won. Callers that only care about the final state
- * should loop; callers implementing "try once, otherwise do something else" should re-read the
- * value to find out which happened.
+ * Unlike everything above, this does NOT retry: a false return is the answer the caller asked for,
+ * which is what makes CAS the building block for lock-free algorithms the kernel knows nothing
+ * about. The port's primitive may also fail spuriously on losing exclusive access, so a false
+ * return does not by itself prove another writer won - loop if only the final state matters,
+ * re-read the value to tell the two cases apart.
  *
  * @param[in,out] target    Word to update.
  * @param[in]     expected  Value the caller believes the word holds.

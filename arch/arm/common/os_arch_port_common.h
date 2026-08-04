@@ -507,19 +507,13 @@ uint32_t os_arch_elapsed_ticks_get(void);
  * ***********************************************************************************************************
  *
  * The complete set the portable os_atomic_* API rests on, rather than one primitive it composes
- * from, because how a word is updated indivisibly is a property of the core. Each port implements
- * all of them, in whichever way its instruction set allows:
+ * from, because how a word updates indivisibly is a property of the core:
  *
- *   os_arch_port_v7m.c / _v8m.c   One LDREX/STREX retry loop per operation, each a single
- *                                 inline-assembly block. Lock-free; interrupts stay enabled.
- *   os_arch_port_v6m.c            No exclusives exist, so each operation runs inside
- *                                 os_critical_enter/exit instead.
+ *   os_arch_port_v7m.c / _v8m.c   One LDREX/STREX retry loop per operation. Lock-free.
+ *   os_arch_port_v6m.c            No exclusives, so each runs inside os_critical_enter/exit.
  *
- * Written out per port rather than shared behind a selector, so each is the instruction sequence
- * that core actually wants, at every optimization level, with nothing to fold away first.
- *
- * Every read-modify-write below returns the value the word held BEFORE the operation. All of them
- * take a pointer to a naturally aligned 32-bit word and are safe from tasks and from ISRs.
+ * Every read-modify-write below returns the value the word held BEFORE the operation, takes a
+ * pointer to a naturally aligned 32-bit word, and is safe from tasks and from ISRs.
 */
 
 /* Kernel services the port itself calls. Declared here because the port translation unit does not

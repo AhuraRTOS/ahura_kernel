@@ -2,18 +2,15 @@
  * @file os_cb_template.c
  * @brief Template for the application-side kernel callbacks (_cb functions).
  *
- * NOT part of the kernel build (and it must never be added to it): copy this
- * file into the application source tree as os_cb.c, add that copy to the
- * application build and adapt the bodies to the platform. Every function
- * here overrides a weak kernel default, so both the file and every single
- * function in it are optional — delete what you do not need.
+ * NOT part of the kernel build, and it must never be added to it: copy this file into the
+ * application source tree as os_cb.c, add that copy to the application build, and adapt the bodies
+ * to the platform.
  *
- * Functions guarded by configuration (#if blocks) only exist when the
- * matching OS_CONFIG_ option is enabled, so the file compiles cleanly under
- * any configuration. One guard per group, in the same order as PART 2 of
- * ahura.h and of os_config.h, and each guard is the exact condition under
- * which the kernel calls the group — see the spinlock note below for why
- * that matters.
+ * Some of these are MANDATORY when their feature is enabled - the kernel declares them and defines
+ * nothing, so a missing one is a link error rather than a silently empty hook. Each block below
+ * says which it is. The #if guards match the exact condition under which the kernel calls the
+ * group, in the same order as PART 2 of ahura.h and os_config.h, so the file compiles cleanly
+ * under any configuration.
  *
  * @copyright (c) 2026 Ahura Project Contributors
  *            SPDX-License-Identifier: MIT
@@ -212,21 +209,17 @@ void os_arch_spinlock_release_cb(os_arch_spinlock_t *lock)
  * ***********************************************************************************************************
  * Tickless idle hooks (OS_CONFIG_TICKLESS_ENABLE only)
  *
- * Both are MANDATORY when OS_CONFIG_TICKLESS_ENABLE is 1: the kernel declares them but defines
- * neither, so a missing one is a link error rather than a silently empty hook. Delete the pair
- * (and this block) when tickless idle is off.
+ * Both MANDATORY when tickless idle is on: the kernel declares them and defines neither, so a
+ * missing one is a link error. Delete the pair (and this block) when it is off.
  *
- * A common trap worth checking before leaving pre-sleep empty: if the vendor HAL drives its own
- * periodic tick from a separate timer, that interrupt wakes the WFI at its own period no matter
- * how long the kernel planned to sleep, so every suppressed sleep is cut short. Suspending it here
- * and resuming it in the post-sleep hook is what makes tickless idle actually save power.
+ * Worth checking before leaving pre-sleep empty: a vendor HAL driving its own periodic tick from a
+ * separate timer wakes the WFI at that timer's period, cutting every suppressed sleep short.
+ * Suspending it here and resuming it post-sleep is what makes tickless idle save power.
  *
- * BOTH hooks run with the kernel's interrupts masked. That is what stops an ISR from moving a
- * deadline after the sleep length has been decided but before the WFI. The consequence for these
- * functions is that polling a hardware flag is fine, but waiting on anything an interrupt has to
- * deliver - a DMA completion callback, an RTOS object, a HAL call that spins on HAL_GetTick() -
- * will hang, because the interrupt that would end the wait cannot run. Keep both short: their
- * duration is added directly to interrupt latency.
+ * BOTH run with the kernel's interrupts masked, which is what stops an ISR from moving a deadline
+ * between the sleep length being decided and the WFI. So polling a hardware flag is fine, but
+ * waiting on anything an interrupt must deliver (a DMA callback, HAL_GetTick()) will hang. Keep
+ * both short - their duration adds directly to interrupt latency.
  * ***********************************************************************************************************
 */
 

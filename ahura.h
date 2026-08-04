@@ -241,23 +241,17 @@ typedef enum
 
 /** Define a task: its handle, its stack, and the storage descriptor tying the two together.
  *
- *  The handle is declared as plain "task_name" - the object every os_task_* call references - and
- *  the backing stack gets the decorated "task_name_STACK", which nothing should name by hand. The
- *  size is in bytes, rounded up to an 8-byte multiple so os_task_create's alignment check cannot
- *  fail, and must be at least OS_CONFIG_MIN_STACK_SIZE.
+ *  The handle is plain "task_name"; the stack gets the decorated "task_name_STACK", which nothing
+ *  should name by hand. stack_size is in bytes, rounded up to a multiple of 8, and must be at
+ *  least OS_CONFIG_MIN_STACK_SIZE.
  *
  *      OS_TASK_DEFINE(worker, 512U);
- *      ...
  *      status = os_task_create(&worker, OS_TASK_CONFIG(worker_entry, NULL, OS_TASK_PRIO_1));
- *      status = os_task_start(&worker);
  *
- *  The task's name and stack are recorded here, in the handle, rather than being passed to
- *  os_task_create - which is why the name is written once. Handing one task's handle another
- *  task's stack is not something the API can express any more; it used to be a matching pair the
- *  caller had to keep in step, and a mismatched one still compiled.
- *
- *  Parameters are task_name and stack_size, not name and stack_bytes, because a macro parameter
- *  named after a struct field would be substituted inside the designated initializers below. */
+ *  Name and stack live in the handle rather than in os_task_create's arguments, so handing one
+ *  task's handle another task's stack is no longer expressible. (Parameters are task_name and
+ *  stack_size, not name and stack_bytes: a parameter named after a struct field would be
+ *  substituted inside the initializers below.) */
 #define OS_TASK_DEFINE(task_name, stack_size)                                        \
     static uint8_t task_name##_STACK[(((stack_size) + 7U) & ~7U)] OS_STACK_ALIGNED;  \
     static const os_task_storage_t task_name##_STORAGE = {                           \
@@ -274,15 +268,11 @@ typedef enum
  *    single-core  OS_TASK_CONFIG(entry, context, priority)
  *    multi-core   OS_TASK_CONFIG(entry, context, priority, core_affinity)
  *
- *  There is nothing to place a task on when the build has one core, so the argument does not exist
- *  there rather than being an ignored constant. On a multi-core build it is required, which makes
- *  every task state where it may run instead of silently defaulting: core_affinity is a bitmask
- *  (OS_TASK_CORE(n), OR-combinable; OS_TASK_CORE_ANY = any core), and bits naming cores beyond
- *  OS_CONFIG_CORE_COUNT make os_task_create fail with OS_STATUS_INVALID_ARG, so a stale pin is
- *  caught, not silently ignored.
- *
- *  Initialized positionally: every parameter here shares a name with the field it fills, so
- *  designated initializers would be substituted the same way the note above describes. */
+ *  A single-core build has nowhere to place a task, so the argument does not exist there rather
+ *  than being an ignored constant; on multi-core it is required, so every task states where it may
+ *  run. core_affinity is a bitmask (OS_TASK_CORE(n), OR-combinable; OS_TASK_CORE_ANY = any), and
+ *  bits naming cores beyond OS_CONFIG_CORE_COUNT fail with OS_STATUS_INVALID_ARG rather than being
+ *  ignored. Initialized positionally, for the substitution reason noted above. */
 #if (OS_CONFIG_CORE_COUNT > 1U)
 #define OS_TASK_CONFIG(entry, context, priority, core_affinity) \
     &(os_task_config_t) { \
@@ -445,20 +435,13 @@ void os_critical_exit(void);
  * Scheduler lock
  * ***********************************************************************************************************
  *
- * The other preemption barrier, and the cheaper one when what you are protecting against is another
- * TASK rather than an interrupt. os_critical_enter stops the world - the tick, every driver, every
- * latency budget that depends on them - because masking interrupts is the only tool it has.
- * os_scheduler_lock stops the scheduler alone: interrupts keep running and keep waking tasks, and
- * those tasks simply wait for the CPU until the outermost unlock hands it over.
+ * The other preemption barrier, and the cheaper one when what you are guarding against is another
+ * TASK. Pick by what shares the data:
+ *   task <-> task   os_scheduler_lock; interrupt latency is unaffected.
+ *   task <-> ISR    os_critical_enter (or an atomic) - a scheduler lock excludes no interrupt.
+ *   core <-> core   os_critical_enter, whose outermost level takes the cross-core spinlock.
  *
- * Pick by what shares the data:
- *   task <-> task   os_scheduler_lock, and interrupt latency is unaffected.
- *   task <-> ISR    os_critical_enter (or an atomic). A scheduler lock excludes no interrupt.
- *   core <-> core   os_critical_enter, whose outermost level takes the cross-core spinlock. The
- *                   scheduler lock is per core and holds back nobody else's scheduling.
- *
- * Both nest, and neither may be held across a blocking call - see os_scheduler_lock for what a
- * blocking primitive does when it finds the scheduler locked.
+ * Both nest, and neither may be held across a blocking call.
 */
 
 /******************************************************************************************************/
@@ -648,9 +631,8 @@ os_status os_semaphore_take(os_semaphore_t *semaphore, uint32_t timeout_ms);
  * Queue              - OS_CONFIG_QUEUE_ENABLE
  * ***********************************************************************************************************
  *
- * A queue is an object plus an item buffer. Which macro declares it decides
- * where that buffer comes from, and that is the only difference between the
- * three kinds. Declared below in that order, then the operations they all share.
+ * A queue is an object plus an item buffer. Which macro declares it decides where that buffer
+ * comes from, and that is the only difference between the three kinds:
  *
  *   STATIC    OS_QUEUE_DEFINE_STATIC(sensor_q, sample_t, 8);
  *             / the macro declares the buffer too; usable where it stands
@@ -664,12 +646,9 @@ os_status os_semaphore_take(os_semaphore_t *semaphore, uint32_t timeout_ms);
  *             os_queue_init_dynamic(&log_q, item_size, capacity);
  *             / file scope declares only the object; the call obtains the buffer
  *
- * Only the dynamic kind has an init call, because only it has work that cannot
- * happen until run time. The other two are initialized where they are declared,
- * and neither takes an item size or a capacity: both are read off the array, so
- * they cannot disagree with the storage that actually exists.
- *
- * From there every call is the same for all three, teardown included.
+ * Only the dynamic kind has an init call; the other two are initialized where they are declared
+ * and take no geometry, since both values are read off the array. Every call after that is the
+ * same for all three, teardown included.
 */
 
 #if (OS_CONFIG_QUEUE_ENABLE == 1U)
@@ -728,19 +707,15 @@ typedef struct
  *  object is declared as plain "name" (what every os_queue_* call takes the address of), and the
  *  backing array gets the decorated "name_BUFFER", which nothing should name by hand.
  *
- *  There is deliberately no init call to pair this with, and no item size or capacity to pass
- *  anywhere: both are read off the array, so they cannot disagree with the storage that actually
- *  exists - handing a queue a geometry larger than its buffer is otherwise an easy and silent way
- *  to read or write past the end of it. "type" is the item type rather than a byte count, so the
- *  buffer is typed and the compiler checks what goes into it.
+ *  No init call to pair it with, and no geometry to pass: both values are read off the array, so
+ *  they cannot disagree with the storage that exists. "type" is the item type, not a byte count,
+ *  so the buffer is typed and the compiler checks what goes into it.
  *
  *      OS_QUEUE_DEFINE_STATIC(sensor_q, sensor_sample_t, 8);
- *      ...
  *      status = os_queue_send(&sensor_q, &sample, 10U);
  *
- *  Both objects are static, so this belongs at file scope. To place the buffer somewhere
- *  particular, declare it yourself and use OS_QUEUE_DEFINE_BUFFER; for a geometry not known until
- *  run time, use OS_QUEUE_DEFINE_DYNAMIC. */
+ *  Both objects are static, so this belongs at file scope. Use OS_QUEUE_DEFINE_BUFFER to place the
+ *  buffer yourself, or OS_QUEUE_DEFINE_DYNAMIC for a run-time geometry. */
 #define OS_QUEUE_DEFINE_STATIC(name, type, item_count)    \
     static type       name##_BUFFER[(item_count)];        \
     static os_queue_t name = OS_QUEUE_INITIALIZER(name##_BUFFER)
@@ -990,20 +965,15 @@ typedef void (*os_work_handler_t)(void *data, size_t len);
 /**
  * @brief Submit a function to run later on the kernel work task (0 ms = as soon as possible).
  *
- * There is nothing to declare, initialize or keep alive. The handler and the len bytes at data are
- * copied into one of the kernel's OS_CONFIG_MAX_WORKS slots, so the submission is complete in
- * itself: the caller's buffer may be a local that goes out of scope the moment this returns. The
- * slot is released as the handler starts, and the handler receives the kernel's copy.
+ * Nothing to declare, initialize or keep alive: the handler and the len bytes at data are copied
+ * into one of OS_CONFIG_MAX_WORKS slots, so the caller's buffer may be a local that goes out of
+ * scope the moment this returns. Pass data = NULL and len = 0 when there is no payload; to hand
+ * over more than OS_CONFIG_WORK_PAYLOAD_SIZE, submit a POINTER to it, which makes the target's
+ * lifetime visibly yours to manage.
  *
- * Pass data = NULL and len = 0 for a call that needs no payload. To hand over something larger
- * than OS_CONFIG_WORK_PAYLOAD_SIZE, submit a POINTER to it - os_work_submit(h, &p, sizeof(p), 0) -
- * which makes the fact that the target's lifetime is now yours to manage explicit at the call
- * site, rather than the silent default.
- *
- * The consequences of having no handle are worth stating outright. Each call queues its own
- * execution: submitting the same handler twice runs it twice, rather than the second submission
- * rescheduling the first. And a submission cannot be cancelled or inspected once made - if a
- * handler must be able to change its mind, give it something in its payload it can re-read.
+ * Having no handle has consequences worth stating: each call queues its own execution (the same
+ * handler submitted twice runs twice), and a submission cannot be cancelled or inspected once
+ * made - give the handler something in its payload to re-read if it must change its mind.
  *
  * @return OS_STATUS_OK; OS_STATUS_INVALID_ARG for a NULL handler, OS_WAIT_FOREVER, a len above
  *         OS_CONFIG_WORK_PAYLOAD_SIZE, or a NULL data with a nonzero len; OS_STATUS_FULL when all

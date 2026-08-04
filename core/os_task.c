@@ -496,30 +496,15 @@ void os_task_yield(void)
 /**
  * @brief Defer context switches on the calling core, leaving interrupts enabled (nesting counted).
  *
- * The preemption barrier that os_critical_enter is not. A critical section stops interrupts, and
- * therefore stops everything: the tick, the drivers, and any latency budget that depends on them.
- * This stops only the scheduler. Interrupts keep running and keep waking tasks; those tasks simply
- * do not get the CPU until the outermost unlock, at which point the switch the lock swallowed is
- * issued immediately.
+ * The preemption barrier os_critical_enter is not: a critical section stops interrupts and so stops
+ * everything, this stops only the scheduler. Interrupts keep running and keep waking tasks; they
+ * just do not get the CPU until the outermost unlock, which then issues the switch it swallowed.
+ * Use it against other TASKS - data an ISR or another core also touches still needs a critical
+ * section, since this lock excludes neither.
  *
- * Use it for a sequence that must not be interrupted BY ANOTHER TASK - rebuilding a shared
- * structure several tasks read, keeping a group of related updates consistent - where masking
- * interrupts for the same span would be the wrong price.
- *
- * What it does NOT do, and what a critical section is still for:
- *   - It excludes no ISR. An interrupt can run at any point inside a locked region, so data an ISR
- *     also touches still needs os_critical_enter (or an atomic).
- *   - It excludes no other core. The lock is per core: another core keeps scheduling its own tasks
- *     normally. Cross-core state is still the cross-core spinlock's job.
- *
- * While the lock is held the calling task cannot block: every blocking primitive behaves as though
- * it had been called with OS_WAIT_NOTHING (BUSY/EMPTY/FULL instead of waiting), os_delay_ms
- * busy-waits instead of sleeping, and os_task_pause/os_task_delete aimed at the CALLING task return
- * OS_STATUS_BUSY. Blocking would mean switching away, which is precisely what the lock forbids, so
- * the alternative to refusing is a task that keeps running while the kernel believes it is blocked.
- * Keep locked regions short and free of blocking calls, exactly as with a critical section.
- *
- * A no-op from interrupt context: an ISR already runs to completion with respect to tasks.
+ * The calling task cannot block while it holds one: blocking primitives behave as if given
+ * OS_WAIT_NOTHING, os_delay_ms busy-waits, and pause/delete of the CALLER return OS_STATUS_BUSY.
+ * Blocking means switching away, which is what the lock forbids. No-op from interrupt context.
  *
  * @return None.
  */
@@ -995,17 +980,13 @@ void os_task_wait_begin(os_list_t *waiters, uint32_t timeout_ticks)
  * @brief Drop the calling task's pending-wake state: call on every path where a blocking
  *        primitive stops retrying and returns to its caller, signaled or not.
  *
- * This is what makes os_task_wake_compensate's window narrow. Between a waker
- * handing this task a notification and this call, the task counts as holding
- * an unconsumed wake that a pause or a delete must pass on to the next waiter;
- * from here on the primitive has finished with the object (it either took the
- * resource or gave up on it), so the notification is spent and the waiter list
- * it came from is none of this task's business any more - it may even have
- * ceased to exist by the time the task blocks on something else.
+ * This is what keeps os_task_wake_compensate's window narrow. Until this call the task counts as
+ * holding an unconsumed wake that a pause or delete must pass on; from here the primitive has
+ * finished with the object, so the notification is spent and the list it came from is no longer
+ * this task's business - it may not even exist by the time the task blocks on something else.
  *
- * No-op from interrupt context: an ISR borrows the identity of whichever task
- * it interrupted, and a non-blocking primitive call from one must not discard
- * that task's own wait state.
+ * No-op from interrupt context: an ISR borrows the interrupted task's identity and must not
+ * discard that task's own wait state.
  *
  * @return None.
  */
@@ -1243,15 +1224,11 @@ void os_task_mutex_priority_inherit(uint32_t owner_task_id)
  *        effective priority as max(base_priority, highest waiter still queued on any mutex it
  *        still holds) - correct even when the task holds several mutexes at once.
  *
- * The owner is resolved from the id the caller passes, never from the running task: os_mutex_unlock
- * reaches here for a non-owner too (it can only enforce ownership when both sides are identifiable
- * tasks), and working on the caller instead would splice this node out of the REAL owner's list
- * while updating the CALLER's head and tail - two corrupted lists, plus a boost left on the owner
- * that nothing can recompute away afterwards.
- *
- * An owner that cannot be resolved has nothing to undo: id 0 never had a list entry (see
- * os_task_mutex_owner_link), and a deleted task's entries were detached by os_task_tcb_clear
- * before its slot was released.
+ * The owner comes from the id passed in, never from the running task: os_mutex_unlock reaches here
+ * for a non-owner too, and working on the caller would splice this node out of the REAL owner's
+ * list while updating the CALLER's head and tail - two corrupted lists, plus a boost left behind
+ * that nothing can recompute away. An unresolvable owner has nothing to undo: id 0 never had a
+ * list entry, and a deleted task's entries were detached by os_task_tcb_clear.
  *
  * @param[in]     owner_id    Id the mutex recorded for its owner (captured before the unlock cleared it).
  * @param[in,out] owner_node  The mutex's own owner_node link (already unlocked by the caller).
@@ -1309,15 +1286,10 @@ bool os_task_current_is_idle(void)
 /**
  * @brief Whether a PendSV on this core would actually switch or round-robin (ISR-safe).
  *
- * The running task is never queued in a ready list, so a bit above its own
- * priority can only belong to another task, and a real preemption is due.
- * The task's own priority bit means an equal-priority peer is waiting to
- * round-robin, which happens only once the running task has used up its time
- * slice (OS_CONFIG_TIME_SLICE_TICKS). A locked scheduler answers false
- * outright: a PendSV would hand the same task straight back.
- *
- * Used by the tick handler to skip the full PendSV round trip on a tick that
- * would not switch - which, with a quantum above one tick, is most of them.
+ * The running task is never queued, so a bit above its priority means a real preemption is due,
+ * and its own priority bit means a peer is waiting to round-robin - which only counts once the
+ * time slice is used up. A locked scheduler answers false outright. Lets the tick skip the PendSV
+ * round trip on a tick that would not switch, which with a quantum above 1 is most of them.
  *
  * @return bool  True when a reschedule is currently possible on this core.
  */
@@ -1606,20 +1578,11 @@ void os_task_stack_save_current(uint32_t *stack_ptr)
 #endif
     }
 
-    /* Scheduler locked on this core: this PendSV must not switch. Requests
-     * raised while the lock is held never pend one (os_task_switch_request),
-     * so getting here means it was already pending when the lock was taken,
-     * or another core sent an IPI. Leave the task RUNNING and still owning
-     * this core - os_task_stack_select_next then hands the frame just saved
-     * straight back, making the round trip a no-op - and remember the switch
-     * so the outermost os_scheduler_unlock issues it for real.
-     *
-     * Only for a task that is still RUNNING, which is the same condition
-     * os_task_stack_select_next re-checks before handing it back. Nothing the
-     * kernel allows under a lock parks the calling task (every blocking
-     * primitive degrades to non-blocking, and self-pause/self-delete are
-     * refused), but if one ever did, taking the shortcut would strand it:
-     * still owning this core, yet not the task the scheduler would pick. */
+    /* Scheduler locked: this PendSV must not switch. Requests raised under the lock never pend
+     * one, so getting here means it was already pending when the lock was taken (or an IPI
+     * arrived). Leave the task RUNNING and owning this core - select_next hands the frame just
+     * saved straight back - and remember the switch for the outermost os_scheduler_unlock.
+     * Only for a still-RUNNING task, the same condition select_next re-checks. */
     if ((current_task != NULL) && (current_task->state == OS_TASK_STATE_RUNNING) &&
         (os_task_scheduler_lock[core] != 0U))
     {
@@ -1924,22 +1887,12 @@ static void os_task_stack_guard_set(uint8_t *stack_base)
 /**
  * @brief Check a task's stack for overflow at switch-out; never returns if one is found.
  *
- * Two tests, because they catch different failures:
- *
- *   The stack pointer below stack_base means the task is executing outside its own stack right
- *   now - the frame just saved is already in someone else's memory.
- *
- *   A clobbered guard word means it went too deep at some point and came back. The pointer is
- *   respectable again by the time of the switch, so nothing else would notice, but whatever lives
- *   below that stack has been written through.
- *
- * On a hit the kernel does not try to continue: memory outside the task's stack has been modified
- * and there is no way to know whose. os_stack_overflow_cb gets one chance to report it, then the
- * core parks exactly as a failed OS_ASSERT does.
- *
- * Runs inside PendSV with the kernel mask raised and, on multi-core builds, the cross-core
- * spinlock held - so the callback must not call kernel APIs, and parking here stops the other
- * cores too. Both are the right trade when the alternative is scheduling on a corrupt frame.
+ * Two tests, catching different failures: a stack pointer below stack_base means the task is
+ * executing outside its own stack right now, and a clobbered guard word means it went too deep and
+ * came back, which nothing else would notice. On a hit there is no continuing - memory outside the
+ * stack is already modified - so os_stack_overflow_cb reports it and the core parks, as a failed
+ * OS_ASSERT does. Runs inside PendSV with the kernel mask raised and the cross-core spinlock held,
+ * so the callback must not call kernel APIs.
  *
  * @param[in] tcb        Task being switched out.
  * @param[in] stack_ptr  Stack pointer just saved for it.
@@ -2296,22 +2249,12 @@ static void os_task_wake_locked(os_task_tcb_t *tcb)
 /**
  * @brief Pass on an unconsumed wake before a READY task is suspended or deleted.
  *
- * woken_from names the list a notification came from and is live only between
- * os_task_waiters_wake_one/wake_match handing this task that notification and
- * the task's own primitive finishing with it: re-blocking clears it in
- * os_task_wait_begin, and returning to the caller clears it in
- * os_task_wait_end - whether the retry took the resource or gave up on it.
- * Inside that window the task may well be READY rather than RUNNING (it can
- * be preempted before it retries), so the pair (wait_signaled, woken_from) is
- * what identifies an unconsumed notification, not the state on its own.
- * Without this, pausing or deleting the task in that window would strand the
- * resource's availability (e.g. an item already sitting in a queue) with
- * nobody left to signal the next waiter.
- *
- * The clears are what keep woken_from from outliving its object: a task that
- * has finished waiting must not carry a pointer into a queue, semaphore or
- * event it no longer has any relationship with, since that object may
- * be released or leave scope long before the task is paused or deleted.
+ * woken_from is live only between a waker handing this task a notification and the task's own
+ * primitive finishing with it (os_task_wait_begin clears it on a re-block, os_task_wait_end on
+ * return). The task may be READY rather than RUNNING inside that window, so the pair
+ * (wait_signaled, woken_from) is what marks an unconsumed notification, not the state alone.
+ * Without this, pausing or deleting there would strand the resource with nobody left to signal
+ * the next waiter; the clears are what stop woken_from outliving the object it points into.
  *
  * @param[in,out] tcb  Task about to be suspended or deleted.
  * @return None.

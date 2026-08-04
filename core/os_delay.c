@@ -49,10 +49,8 @@ static void os_delay_cycle_wait(uint64_t cycle_count);
  * falls back to a busy-wait before os_start or from interrupt context.
  * OS_WAIT_FOREVER parks the calling task permanently (never returns).
  *
- * Returns nothing: a delay either waits or the caller asked for something the
- * platform cannot express, and the second case is a programming or
- * configuration error that OS_ASSERT reports far more usefully than a status
- * nobody reads. See os_delay_ticks for the two conditions that can arise.
+ * Returns nothing: a delay either waits, or the request was one the platform cannot express -
+ * a configuration error OS_ASSERT reports more usefully than a status nobody reads.
  *
  * @param[in] milliseconds  Delay duration in milliseconds, or OS_WAIT_FOREVER.
  * @return None.

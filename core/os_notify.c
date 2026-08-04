@@ -3,16 +3,12 @@
  * @brief Direct-to-task notifications: a one-word mailbox built into every task, delivered
  *        without any intermediate object.
  *
- * The lightest signal the kernel offers. A semaphore or a queue is a thing that has to be
- * created, sized, and kept alive by whoever both sides can reach; a notification is addressed to
- * the task itself, so an ISR that already holds a task handle can signal it with nothing else in
- * between. The mailbox is one value with overwrite semantics - last give wins - which is what
- * makes it a signal rather than a stream: for anything that must not be lost, use a queue.
+ * The lightest signal the kernel offers: no object to create, size or keep alive, since it is
+ * addressed to the task itself. One value with overwrite semantics - last give wins - which makes
+ * it a signal rather than a stream; use a queue for anything that must not be lost.
  *
- * The mailbox lives in the TCB, since it belongs to the task rather than to this module. os_task.c
- * hands out the slot (os_task_notify_slot) and the two facts about a task this module needs
- * (os_task_tcb_current, os_task_tcb_is_blocked); everything about what a notification MEANS is
- * here.
+ * The mailbox lives in the TCB because it belongs to the task, not to this module: os_task.c hands
+ * out the slot and the two facts about a task needed here (current, blocked).
  *
  * @copyright (c) 2026 Ahura Project Contributors
  *            SPDX-License-Identifier: MIT
@@ -92,12 +88,9 @@ os_status os_notify_give(os_task_t *task, uint32_t value)
 /**
  * @brief Wait for this task's own notification mailbox, up to timeout_ms.
  *
- * Task-only, like os_mutex_lock: an ISR has no task identity of its own to wait as.
- *
- * value_out may be NULL, for the common case of a notification used as a plain "something
- * happened" signal where the value carries nothing. The notification is consumed either way -
- * what is discarded is the copy, not the delivery - so a NULL here cannot leave the mailbox full
- * and make the next wait return at once.
+ * Task-only, like os_mutex_lock: an ISR has no task identity of its own to wait as. value_out may
+ * be NULL when only the wake-up matters; the notification is consumed either way (what is dropped
+ * is the copy, not the delivery), so a NULL cannot leave the mailbox full.
  *
  * @param[in]  timeout_ms  OS_WAIT_NOTHING, a duration in ms, or OS_WAIT_FOREVER.
  * @param[out] value_out   Set to the delivered value on OS_STATUS_OK; NULL to discard it.

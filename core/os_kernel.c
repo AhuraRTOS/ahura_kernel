@@ -102,10 +102,10 @@ void os_init(void)
  */
 void os_start(void)
 {
-    if (!os_task_idle_is_created())
-    {
-        (void)os_task_idle_create();
-    }
+    /* os_init() created it, and os_task_idle_create is idempotent - so a missing one here means
+     * that creation failed and a retry would fail identically. Assert rather than re-create:
+     * without an idle task the first switch restores through a NULL stack_ptr and hard faults. */
+    OS_ASSERT(os_task_idle_is_created());
 
     os_kernel_running = true;
     os_arch_start_first_task();
@@ -180,30 +180,7 @@ void os_assert_failed(const char *file, uint32_t line)
     }
 }
 
-/*
- * os_assert_failed_cb() is deliberately NOT defined here, not even as a weak stub. A stub that
- * did nothing would make the one thing an assertion exists to do - tell you where it fired -
- * silently unavailable, leaving only an unexplained halt. Enabling assertions therefore requires
- * the application to say what happens on failure (see os_cb_template.c), and forgetting to is a
- * link error rather than a debugging session spent wondering why the core stopped.
- */
 #endif /* OS_CONFIG_ASSERT_ENABLE */
-
-/*
- * os_main() and os_test() are deliberately NOT defined here, not even as weak stubs.
- *
- * os_main() is the application's own code, supplied by its os_main.c (copied from
- * os_main_template.c). A weak "idle forever" stub would let a project that simply forgot the
- * file link and boot into a task that does nothing, which is far harder to diagnose than the
- * undefined-reference error the linker gives instead. It is only referenced when
- * OS_CONFIG_TEST_ENABLE is 0, so a self-test build needs no os_main.c at all.
- *
- * os_test() comes from the ahura_kernel/test library. Leaving it undefined here is also what
- * makes plain static-library linking work: the reference below is unresolved, so the linker has
- * a reason to pull os_test.c.o out of libos_test.a. A weak stub would satisfy the reference
- * first and the archive would never be searched, silently dropping the entire suite - which is
- * why linking it used to require -Wl,--whole-archive.
- */
 
 /*
  * ***********************************************************************************************************

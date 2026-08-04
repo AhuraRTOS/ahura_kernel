@@ -31,15 +31,10 @@
 /**
  * @brief Bind a queue to an item buffer at run time.
  *
- * Not public, and deliberately so. A queue over storage the application declares is set up at
- * compile time by OS_QUEUE_DEFINE_STATIC or OS_QUEUE_DEFINE_BUFFER, which read the item size and
- * capacity off the array; exposing this as an API would mean asking callers to pass a geometry
- * back that the array already states, and every such pair is a chance for the two to disagree.
- *
- * What is left is one genuine run-time case - a buffer that does not exist until the heap hands it
- * over - so os_queue_init_dynamic() is the only caller. Keeping it a function rather than folding
- * it into that one means the field set a queue starts life holding is written in exactly one place
- * for the run-time path, matching what OS_QUEUE_INITIALIZER writes for the compile-time ones.
+ * Not public, deliberately: the compile-time macros read item size and capacity off the array, so
+ * an API taking them again would only be a chance for the two to disagree. That leaves one genuine
+ * run-time case - a buffer the heap hands over - so os_queue_init_dynamic is the only caller, and
+ * keeping it separate writes a queue's initial field set in exactly one place.
  *
  * @param[in,out] queue      Queue object to initialize.
  * @param[in]     buffer     Backing storage buffer.
@@ -305,14 +300,10 @@ size_t os_queue_free_get(const os_queue_t *queue)
 /**
  * @brief Initialize a queue over an item buffer allocated from the kernel heap.
  *
- * The counterpart to OS_QUEUE_DEFINE_STATIC, for queues whose geometry is not known until run
- * time: OS_QUEUE_DEFINE_DYNAMIC declares the object, this call gives it a buffer. Everything else
- * about the queue behaves identically; the only difference is that os_queue_cleanup() releases the
- * buffer, because this call is what obtained it.
- *
- * The queue object itself is still the caller's, exactly as with the compile-time macros: only the
- * item buffer comes from the heap. That keeps the object's lifetime obvious and lets it live
- * wherever suits the application, and it means a failed call leaves nothing to clean up.
+ * For a geometry not known until run time: OS_QUEUE_DEFINE_DYNAMIC declares the object, this gives
+ * it a buffer, and os_queue_cleanup releases that buffer because this is what obtained it.
+ * Everything else behaves identically. The object itself is still the caller's - only the buffer
+ * comes from the heap - so a failed call leaves nothing to clean up.
  *
  * @param[out] queue      Queue object, on zero-initialized storage (OS_QUEUE_DEFINE_DYNAMIC).
  * @param[in]  item_size  Size of one item in bytes.
@@ -390,24 +381,15 @@ os_status os_queue_init_dynamic(os_queue_t *queue, size_t item_size, size_t capa
 /**
  * @brief Tear down a queue of any storage kind.
  *
- * Every path converges here, which is why this is not named after the heap and why it is not
- * compiled out with it: emptying a queue costs nothing and is just as meaningful on a heapless
- * build. What happens to the storage depends on who owns it, so a caller tearing down a mixed set
- * of queues does not have to track which kind each one is:
+ * Every kind converges here, so a caller tearing down a mixed set need not track which is which.
+ * A heap buffer (os_queue_init_dynamic) goes back with its geometry, and re-use means another
+ * init call; a buffer from the compile-time macros has nothing to release, so the queue is left
+ * empty and immediately usable - which is what makes their "never needs an init call" promise hold
+ * in both directions.
  *
- *   - Buffer from os_queue_init_dynamic. It goes back to the heap, and the geometry goes with it,
- *     because the memory it described is no longer the queue's. Re-use means another
- *     os_queue_init_dynamic call.
- *   - Buffer from OS_QUEUE_DEFINE_STATIC or OS_QUEUE_DEFINE_BUFFER. There is nothing to release,
- *     so the queue keeps its storage and is left empty and immediately usable. That is what makes
- *     the compile-time macros' promise hold in both directions: such a queue never needs an init
- *     call, before this or after it.
- *
- * Refuses while tasks are blocked on the queue. Freeing underneath them would leave those tasks
- * parked on list nodes inside memory the heap is free to hand out again, and waking them instead
- * would mean inventing a status for "the object you were waiting on disappeared" that senders and
- * receivers have no way to distinguish from a real transfer. Drain the queue and let the waiters
- * time out first.
+ * Refuses while tasks are blocked on it: freeing underneath them would park them on list nodes in
+ * memory the heap can hand out again, and waking them would need a status senders and receivers
+ * cannot tell from a real transfer. Drain it and let the waiters time out first.
  *
  * @param[in,out] queue  Queue to tear down.
  * @return os_status  OS_STATUS_OK, OS_STATUS_INVALID_ARG for NULL, or OS_STATUS_BUSY if any task

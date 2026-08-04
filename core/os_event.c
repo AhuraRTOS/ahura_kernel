@@ -94,12 +94,10 @@ os_status os_event_init(os_event_t *event)
 /**
  * @brief Set event bits (ISR-safe).
  *
- * Every waiter's condition is evaluated HERE, against one snapshot of the
- * flags, and satisfied waiters receive their matched bits atomically with
- * the set - a later clear cannot revoke a delivery, and only satisfied
- * waiters are woken (no thundering herd). Bits requested by satisfied
- * clear-on-exit waiters are cleared after the walk, so several waiters
- * satisfied by the same set all get delivery.
+ * Every waiter's condition is evaluated HERE against one snapshot of the flags, so a later clear
+ * cannot revoke a delivery and only satisfied waiters are woken (no thundering herd). Bits taken
+ * by satisfied clear-on-exit waiters are cleared after the walk, so several waiters satisfied by
+ * the same set all get their delivery.
  *
  * @param[in,out] event  Event object.
  * @param[in]     bits   Bits to set.
@@ -156,12 +154,10 @@ os_status os_event_clear_bits(os_event_t *event, uint32_t bits)
 /**
  * @brief Wait for event bits, waiting up to timeout_ms until they match.
  *
- * With clear_on_exit true the matched consumption is ATOMIC: an immediate
- * match clears the requested bits inside the same critical section that
- * observed them, and a match delivered by set_bits is cleared by the setter
- * itself - a set landing between wait-return and a separate manual clear can
- * no longer be lost. Nonzero timeouts are only honored from task context
- * after os_start.
+ * With clear_on_exit the consumption is ATOMIC with the match: an immediate match clears inside
+ * the same critical section that observed it, and a delivered match is cleared by the setter, so
+ * a set landing between the wait returning and a manual clear cannot be lost. Nonzero timeouts
+ * are only honored from task context after os_start.
  *
  * @param[in]  event          Event object.
  * @param[in]  bits           Bits to wait for.

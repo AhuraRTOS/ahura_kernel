@@ -60,9 +60,9 @@ static uint32_t    os_timer_registry_slot_acquire(const os_timer_t *timer);
 /**
  * @brief Initialize a software timer as one-shot or periodic.
  *
- * Re-initializing a timer that was already started is allowed and behaves like a stop followed by
- * the new configuration: the registry slot goes back, so repeated re-initialisation cannot exhaust
- * the registry, and the tick can no longer reach the object while its fields are being rewritten.
+ * Re-initializing a started timer behaves like a stop plus the new configuration: the registry
+ * slot goes back, so repeated re-init cannot exhaust the registry, and the tick cannot reach the
+ * object while its fields are rewritten.
  *
  * @param[in,out] timer         Timer object.
  * @param[in]     period_ticks  Timer period in ticks (see OS_TICKS_FROM_MS).
@@ -143,14 +143,11 @@ os_status os_timer_restart(os_timer_t *timer)
 /**
  * @brief Halt a running timer, keeping the time it had left.
  *
- * The countdown stops where it is and os_timer_start resumes from there. The registry slot is kept,
- * so a pause cannot fail for want of one and a resume cannot be refused later - which also means a
- * paused timer still costs a slot, unlike a stopped one.
- *
- * A pause does not cancel an expiry the tick has already noted: that callback is owed and still
- * runs. Only os_timer_stop discards it. Pausing a timer that is not running reports
- * OS_STATUS_ERROR rather than quietly doing nothing, since a later os_timer_start would then begin
- * a full period instead of the resume the caller was expecting.
+ * The countdown stops where it is and os_timer_start resumes from there. The registry slot is
+ * kept, so a resume can never be refused - a paused timer still costs a slot, unlike a stopped
+ * one. An expiry the tick already noted is still owed and runs; only os_timer_stop discards it.
+ * Pausing a timer that is not running reports OS_STATUS_ERROR rather than quietly doing nothing,
+ * since a later start would then begin a full period instead of the expected resume.
  *
  * @param[in,out] timer  Timer object.
  * @return os_status  OK when paused (or already paused), OS_STATUS_ERROR when not running.
@@ -218,16 +215,13 @@ os_status os_timer_stop(os_timer_t *timer)
 /**
  * @brief Stop a timer and leave the object needing os_timer_init before it can be used again.
  *
- * Everything os_timer_stop does, plus clearing what makes the object a timer at all: period, mode
- * and callback go, so os_timer_start and os_timer_restart refuse it with OS_STATUS_INVALID_ARG
- * until it is initialized afresh. That is the whole difference - stop is "not now", delete is
- * "done with this one" - and it is what turns a use-after-delete from a timer that quietly fires
- * again into a status code at the call that tried.
+ * Everything os_timer_stop does, plus clearing what makes the object a timer: period, mode and
+ * callback go, so start and restart refuse it with OS_STATUS_INVALID_ARG until it is initialized
+ * afresh. Stop is "not now", delete is "done with this one" - which turns a use-after-delete into
+ * a status code instead of a timer that quietly fires again.
  *
- * Safe to call while the timer task is delivering this timer's callback: that call took its own
- * copy of the callback and context before releasing the critical section, so it neither reads nor
- * writes the object here. It does mean a callback already in delivery still completes - a delete
- * cancels a pending expiry, not one that is already running.
+ * Safe to call while the timer task is delivering this timer's callback (that call copied what it
+ * needs first), though a delivery already running still completes.
  *
  * @param[in,out] timer  Timer object.
  * @return os_status  OS_STATUS_OK, or OS_STATUS_INVALID_ARG for NULL.
@@ -463,11 +457,9 @@ static void os_timer_task_entry(void *context)
  * A finished one-shot releases its registry slot before the callback runs, so the callback may
  * safely restart its own timer.
  *
- * The callback and context are copied out here, inside the critical section, rather than the timer
- * pointer being handed back for the caller to dereference afterwards. That is what lets
- * os_timer_delete clear the object at any moment: by the time the critical section is released the
- * kernel no longer needs the timer, so a delete racing with delivery cannot turn into a call
- * through a NULL callback.
+ * The callback and context are copied out inside the critical section rather than the timer
+ * pointer being handed back: by the time it is released the kernel no longer needs the object, so
+ * a delete racing with delivery cannot turn into a call through a NULL callback.
  *
  * @param[out] callback_out  Callback to invoke, written only when true is returned.
  * @param[out] context_out   Context to pass it, written only when true is returned.

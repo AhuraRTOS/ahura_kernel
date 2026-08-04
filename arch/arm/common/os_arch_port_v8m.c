@@ -1,24 +1,14 @@
 /**
  * @file os_arch_port_v8m.c
- * @brief Shared port implementation for ARMv8-M mainline (Cortex-M33, M35P)
- *        and ARMv8.1-M (Cortex-M52, M55, M85) cores. Superset of the v7m
- *        port: FPU support stays compile-time conditional, and the port adds
- *        per-task PSPLIM stack-overflow detection plus an MSPLIM guard for
- *        the handler stack (when the linker script provides the stack-bottom
- *        symbol). Helium (MVE) needs no extra handling: the callee-saved
- *        vector registers Q4-Q7 alias s16-s31 (already saved) and the
- *        hardware lazy-stacks s0-s15/FPSCR/VPR in the extended frame.
+ * @brief Shared port for ARMv8-M mainline (Cortex-M33, M35P) and ARMv8.1-M (M52, M55, M85). A
+ *        superset of the v7m port: it adds per-task PSPLIM overflow detection and an MSPLIM guard
+ *        for the handler stack. Helium (MVE) needs no extra handling - Q4-Q7 alias s16-s31, which
+ *        are already saved, and the hardware lazy-stacks the rest.
  *
- * This file is textually included by each variant's os_arch_port.c wrapper.
- * ARMv8-M baseline (Cortex-M23) executes the Thumb-1 subset and therefore
- * lives in os_arch_port_v6m.c, not here.
- *
- * TrustZone (ARMv8-M Security Extension), selected with OS_CONFIG_TRUSTZONE:
- * disabled (default), secure (whole kernel compiled with -mcmse, tasks run
- * secure) or non-secure (kernel runs non-secure beside secure firmware; the
- * context switch banks per-task secure state through the weak
- * os_arch_tz_context_save_cb / os_arch_tz_context_restore_cb callbacks and
- * the initial frames use the non-secure EXC_RETURN).
+ * Textually included by each variant's os_arch_port.c wrapper; ARMv8-M baseline (Cortex-M23) runs
+ * the Thumb-1 subset and lives in os_arch_port_v6m.c instead. TrustZone (via OS_CONFIG_TRUSTZONE)
+ * may be disabled, secure, or non-secure - in which case the context switch banks per-task secure
+ * state through the tz_context callbacks and the initial frames use the non-secure EXC_RETURN.
  *
  * @copyright (c) 2026 Ahura Project Contributors
  *            SPDX-License-Identifier: MIT
@@ -577,19 +567,11 @@ static uint64_t os_arch_max_window_ticks_get(void)
  * go round again if it did not. Nothing is masked, so an ISR - or another core - landing in the
  * middle costs a second pass rather than costing anyone correctness.
  *
- * Written out per operation rather than funnelled through a shared helper or a compare-and-swap
- * loop, for two reasons that pull the same way:
- *
- *   Speed. The whole sequence is five instructions. Routing it through CAS would load the word a
- *   second time and compare it, when the reservation already carries exactly that information;
- *   routing it through a shared helper would leave the compiler to decide whether the operation
- *   selector folds away, which it only reliably does with optimization on.
- *
- *   Safety. Keeping each loop inside one asm block means it is the same five instructions at -O0
- *   as at -O2, and no compiler-generated spill can land between the LDREX and the STREX. ARM
- *   guarantees only one outstanding reservation per core and leaves it implementation-defined
- *   whether unrelated memory accesses clear it, so the fewer of them inside the window, the fewer
- *   implementations this has to be lucky on.
+ * Written out per operation rather than funnelled through a shared helper or a CAS loop. Speed:
+ * the whole sequence is five instructions, and CAS would re-load and compare what the reservation
+ * already tells us. Safety: one asm block per loop is the same five instructions at -O0 as at -O2,
+ * with no compiler spill between the LDREX and the STREX - ARM allows only one reservation per
+ * core and leaves it implementation-defined whether other accesses clear it.
  *
  * "1:" and "1b" are local numeric labels, so each block stays correct even if the compiler emits
  * it more than once. Every operation returns the value the word held BEFORE it ran.

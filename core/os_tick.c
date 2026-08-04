@@ -315,23 +315,11 @@ void os_tickless_idle_process(void)
 
     OS_ARCH_SLEEP(planned_idle_ticks);
 
-    /* Wake path, in this order for a reason. A suppression-capable port holds the kernel interrupt
-     * mask from os_arch_sleep_prepare all the way to os_arch_sleep_finish, so everything between
-     * the WFI and that call runs with the kernel's own interrupts still masked.
-     *
-     * 1. Measure first, while the counter still holds the sleep. os_arch_elapsed_ticks_get also
-     *    restores the normal tick cadence.
-     * 2. Let the application put its hardware back (clocks, regulator, its own tick source) before
-     *    any kernel work depends on it.
-     * 3. Announce, so os_tick_count, timers, work and task delays all catch up on the sleep.
-     * 4. Only now release the mask.
-     *
-     * Announcing after the release, or before the restore, both break. Between the WFI and step 3
-     * os_tick_count is short by the entire sleep - hundreds of ticks - so any tick or timer
-     * processing let through early decides against a clock far behind reality. And os_tick_announce
-     * can pend a context switch: with interrupts already live it could be taken immediately,
-     * switching away from the idle task before step 2 ever ran and leaving SLEEPDEEP set or the
-     * application's tick source suspended. */
+    /* Wake path, in this order for a reason: measure while the counter still holds the sleep,
+     * let the application restore its hardware, announce so the clock catches up, and only then
+     * release the mask. Announcing after the release, or before the restore, both break -
+     * os_tick_count is short by the whole sleep until step 3, and the switch os_tick_announce can
+     * pend would otherwise be taken while the idle task still has SLEEPDEEP set. */
     elapsed_ticks = os_arch_elapsed_ticks_get();
 
     os_tickless_post_sleep_cb();

@@ -1,20 +1,13 @@
 /**
  * @file os_arch_port_v6m.c
- * @brief Shared port implementation for ARMv6-M (Cortex-M0, M0+) and
- *        ARMv8-M baseline (Cortex-M23) cores. Thumb-1 subset only, no FPU,
- *        no DWT cycle counter (synthesized from SysTick). Non-secure ARMv8-M
- *        baseline has no stack-limit registers, so there is no PSPLIM
- *        handling here.
+ * @brief Shared port for ARMv6-M (Cortex-M0, M0+) and ARMv8-M baseline (Cortex-M23): Thumb-1
+ *        subset only, no FPU, no DWT (the cycle counter is synthesized from SysTick), and no
+ *        PSPLIM - non-secure ARMv8-M baseline has no stack-limit registers.
  *
- * This file is textually included by each variant's os_arch_port.c wrapper.
- *
- * TrustZone (ARMv8-M baseline, Cortex-M23), selected with OS_CONFIG_TRUSTZONE:
- * disabled (default; the only choice on ARMv6-M cores), secure (whole kernel
- * compiled with -mcmse, tasks run secure) or non-secure (kernel runs
- * non-secure beside secure firmware; the context switch banks per-task secure
- * state through the weak os_arch_tz_context_save_cb /
- * os_arch_tz_context_restore_cb callbacks and the initial frames use the
- * non-secure EXC_RETURN).
+ * Textually included by each variant's os_arch_port.c wrapper. TrustZone (Cortex-M23 only, via
+ * OS_CONFIG_TRUSTZONE) may be disabled, secure, or non-secure - in which case the context switch
+ * banks per-task secure state through the tz_context callbacks and the initial frames use the
+ * non-secure EXC_RETURN.
  *
  * @copyright (c) 2026 Ahura Project Contributors
  *            SPDX-License-Identifier: MIT
@@ -437,24 +430,15 @@ void os_arch_sleep_finish(void)
  * Atomics
  * ***********************************************************************************************************
  *
- * ARMv6-M has no LDREX/STREX, so there is no way to DETECT that something else touched the word
- * mid-update - it has to be PREVENTED. Each operation runs inside os_critical_enter/exit, which
- * masks this core's kernel interrupts and, on a multi-core build, locks out the other cores.
+ * ARMv6-M has no LDREX/STREX, so interference cannot be DETECTED - it has to be PREVENTED. Each
+ * operation runs inside os_critical_enter/exit, which costs the length of the update in interrupt
+ * latency and, on multi-core, can wait on unrelated kernel work holding the same lock. Reusing the
+ * kernel's critical section rather than a second private lock is deliberate: two locks over the
+ * same data is how lock-ordering bugs start. No retry loop is needed, since nothing can interfere
+ * while the section is held.
  *
- * Two consequences worth knowing before putting an atomic in a hot path here. It adds the length
- * of the update to interrupt latency, unlike the exclusives ports where interrupts stay enabled
- * throughout. And on a multi-core build it can wait on unrelated kernel work holding the same
- * lock - reusing the kernel's critical section rather than a second private lock is deliberate,
- * since two independent locks over the same data is how lock-ordering bugs start.
- *
- * No retry loop and no second read, unlike the exclusives ports: nothing can interfere while the
- * section is held, so the value read is still the value in memory when it is written back.
- *
- * ADD and SUB compute in the unsigned domain and convert back. Signed overflow is undefined
- * behaviour the moment a counter runs past INT32_MAX - not merely a negative-looking result, but
- * licence for the compiler to assume it cannot happen and optimise accordingly. Unsigned
- * arithmetic wraps with defined behaviour, and the conversion back reproduces the same
- * two's-complement bit pattern the hardware would have stored anyway.
+ * ADD and SUB compute in the unsigned domain and convert back: signed overflow is undefined
+ * behaviour, and unsigned wrapping reproduces the same two's-complement pattern anyway.
  *
  * Every operation returns the value the word held BEFORE it ran.
  *

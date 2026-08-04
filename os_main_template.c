@@ -2,24 +2,16 @@
  * @file os_main_template.c
  * @brief Template for the application's default task body.
  *
- * NOT part of the kernel build (like os_cb_template.c): copy this file into
- * the application source tree as os_main.c, add it to the APPLICATION
- * build, and write the application's own code inside os_main(). Its
- * prototype already lives in ahura.h, so no separate header is needed for
- * this one.
+ * NOT part of the kernel build (like os_cb_template.c): copy this file into the application source
+ * tree as os_main.c, add it to the APPLICATION build, and write the application's own code inside
+ * os_main(). Its prototype is already in ahura.h.
  *
- * os_main() is deliberately not named with the "_cb" suffix used elsewhere
- * in this kernel: that suffix is reserved for callbacks the kernel queries
- * for platform behavior (os_tickless_pre_sleep_cb, os_arch_core_id_get_cb, ...).
- * os_main() is different in kind - it is where the application's own code
- * runs, not a query the kernel makes about the platform - even though it is
- * supplied the same way (declared in ahura.h, defined here).
+ * The "_cb" suffix used elsewhere is reserved for callbacks the kernel queries for platform
+ * behaviour; os_main() is different in kind - it is where the application's code runs - even
+ * though it is supplied the same way.
  *
- * Task creation itself lives in the kernel (os_kernel.c's os_main_system_init(),
- * called from os_init()) and is unconditional except in self-test builds
- * (OS_CONFIG_TEST_ENABLE=1, see the kernel README "Self-test suite") -
- * nothing to call from main(). Sized by OS_CONFIG_MAIN_TASK_STACK_SIZE /
- * OS_CONFIG_MAIN_TASK_PRIORITY in os_config.h.
+ * The task itself is created by os_init(), unconditionally except in self-test builds, and sized
+ * by OS_CONFIG_MAIN_TASK_STACK_SIZE / OS_CONFIG_MAIN_TASK_PRIORITY. Nothing to call from main().
  *
  * @copyright (c) 2026 Ahura Project Contributors
  *            SPDX-License-Identifier: MIT

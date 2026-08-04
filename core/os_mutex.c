@@ -64,11 +64,9 @@ os_status os_mutex_init(os_mutex_t *mutex)
 /**
  * @brief Acquire a mutex, waiting up to timeout_ms when contended.
  *
- * A mutex is an ownership object, so it is task-only: calls from interrupt
- * context are rejected (an ISR has no identity of its own - it would
- * silently borrow the identity of whichever task it interrupted). The
- * mutex is not recursive: locking a mutex the caller already holds fails
- * with OS_STATUS_BUSY instead of deadlocking.
+ * Task-only: an ISR has no identity of its own and would silently borrow the interrupted task's.
+ * Not recursive either - relocking one the caller already holds fails with OS_STATUS_BUSY rather
+ * than deadlocking.
  *
  * @param[in,out] mutex       Mutex object.
  * @param[in]     timeout_ms  OS_WAIT_NOTHING, a duration in ms, or OS_WAIT_FOREVER.

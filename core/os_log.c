@@ -3,11 +3,10 @@
  * @brief Buffered debug logging: printf-style calls queue into a ring buffer and a
  *        low-priority kernel task hands finished bytes to the application.
  *
- * The point of the buffer is that a log call must not cost the caller a UART transmission.
- * Formatting happens at the call site (cheap, bounded by OS_CONFIG_LOG_LINE_MAX), the bytes go
- * into the ring, and os_log_write returns. The kernel log task drains the ring in the
- * background at OS_CONFIG_LOG_TASK_PRIORITY - deliberately low, so logging never preempts real
- * work - and calls os_log_output_cb, which owns the transport (polled, interrupt, or DMA).
+ * The point of the buffer is that a log call must not cost the caller a UART transmission:
+ * formatting happens at the call site (bounded by OS_CONFIG_LOG_LINE_MAX), the bytes go into the
+ * ring, and os_log_write returns. The log task drains it at OS_CONFIG_LOG_TASK_PRIORITY -
+ * deliberately low - and calls os_log_output_cb, which owns the transport.
  *
  * @copyright (c) 2026 Ahura Project Contributors
  *            SPDX-License-Identifier: MIT
@@ -351,14 +350,11 @@ static void os_log_queue(const char *data, size_t length)
 /**
  * @brief Emit the "N log lines dropped" notice, formatted without libc.
  *
- * Deliberately does NOT call os_log_write. That path costs its own 180-byte frame plus whatever
- * newlib's vsnprintf needs on top - several hundred bytes more - and it would be running on
- * OS_CONFIG_LOG_TASK_STACK_SIZE, which is sized for the output callback, not for the formatter.
- * Calling it from here overflowed the log task stack and faulted exactly when the first drop
- * happened, which is to say only under the load that makes logging interesting. Hand-formatting a
- * fixed line keeps the log task's worst-case stack shallow and independent of libc.
- *
- * Only ever called with the ring empty, so the notice itself cannot be the line that gets dropped.
+ * Deliberately does NOT call os_log_write: that path costs its own frame plus whatever vsnprintf
+ * needs, on a stack sized for the output callback rather than the formatter - it overflowed the
+ * log task and faulted exactly when the first drop happened. Hand-formatting keeps the worst-case
+ * stack shallow and independent of libc. Only called with the ring empty, so the notice itself
+ * cannot be the line that gets dropped.
  *
  * @param[in] dropped  Number of lines lost while the buffer was full.
  * @return None.
