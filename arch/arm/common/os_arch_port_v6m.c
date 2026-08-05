@@ -665,52 +665,34 @@ uint32_t os_arch_max_suppressed_ticks_get(void)
 
 /*
  * ***********************************************************************************************************
- * TrustZone glue and multi-core weak callback defaults
+ * TrustZone context-switch glue
  * ***********************************************************************************************************
 */
 
 #if (OS_CONFIG_TRUSTZONE == OS_CONFIG_TRUSTZONE_NON_SECURE)
-/* os_arch_tz_context_save_cb() and os_arch_tz_context_restore_cb() are deliberately NOT defined
- * here, not even as weak stubs - the same rule as os_assert_failed_cb and os_stack_overflow_cb.
- *
- * Banking a secure context is the secure firmware's business: which gateway to call, what a task's
- * secure stack even is. The kernel cannot guess it, and a do-nothing default would let a build
- * select OS_CONFIG_TRUSTZONE_NON_SECURE, link cleanly, and switch tasks while their secure state
- * silently stayed behind - corruption that surfaces far from its cause. With no default, forgetting
- * them is a link error naming the missing function.
- *
- * Define both in the application's os_cb.c (see os_cb_template.c) whenever the non-secure mode is
- * selected. */
-
 /******************************************************************************************************/
 /**
- * @brief Context-switch trampolines called from the SVC/PendSV handlers. Save runs while
- *        os_task_current still names the outgoing task; restore runs after selection.
+ * @brief Bank the outgoing task's secure context; called from the SVC/PendSV handlers while
+ *        os_task_current still names that task.
+ *
+ * @return None.
  */
 void os_arch_tz_context_save(void)
 {
     os_arch_tz_context_save_cb(os_task_current_id_get());
 }
 
+/******************************************************************************************************/
+/**
+ * @brief Restore the incoming task's secure context; called once the scheduler has selected it.
+ *
+ * @return None.
+ */
 void os_arch_tz_context_restore(void)
 {
     os_arch_tz_context_restore_cb(os_task_current_id_get());
 }
 #endif /* OS_CONFIG_TRUSTZONE_NON_SECURE */
-
-#if (OS_CONFIG_CORE_COUNT > 1U)
-/* os_arch_core_id_get_cb() and os_arch_core_ipi_request_cb() are deliberately NOT defined here,
- * not even as weak stubs.
- *
- * Cortex-M has no architectural core id and no architectural IPI, so both are SoC-specific (SIO
- * CPUID and the inter-core FIFO on an RP2040, for instance). Defaults would be worse than absent:
- * an id fixed at 0 makes every core believe it is core 0 and share one current-task slot, and a
- * do-nothing IPI leaves cross-core wakeups waiting for the next tick. Both look like a working
- * build that schedules wrongly.
- *
- * Define them in the application's os_cb.c (see os_cb_template.c) whenever OS_CONFIG_CORE_COUNT
- * is above 1. */
-#endif /* OS_CONFIG_CORE_COUNT > 1U */
 
 /*
  * ***********************************************************************************************************

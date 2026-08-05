@@ -1939,16 +1939,6 @@ static void os_task_stack_guard_check(const os_task_tcb_t *tcb, const uint32_t *
     }
 }
 
-/* os_stack_overflow_cb() is deliberately NOT defined here.
- *
- * It belongs to the application, like os_assert_failed_cb and the tickless hooks: it describes how
- * THIS product reports a blown stack - a breakpoint, a direct UART write, a flag in no-init RAM for
- * the bootloader to find. A weak do-nothing default in the kernel would let a project enable
- * OS_CONFIG_STACK_CHECK_ENABLE, link cleanly, and detect overflows that report to nobody.
- *
- * With no default, forgetting it is a link error naming the missing function - the one message that
- * cannot be overlooked. Copy the definition from os_cb_template.c into the application's os_cb.c
- * whenever the stack check is enabled. */
 #endif /* OS_CONFIG_STACK_CHECK_ENABLE */
 
 /******************************************************************************************************/
