@@ -1,7 +1,7 @@
 /**
  * @file os_timer.c
  * @brief Software timers: expiry detected by the kernel tick, callbacks run on
- *        a kernel timer task at the highest priority.
+ *        a kernel timer task at OS_CONFIG_TIMER_PRIORITY (the highest priority by default).
  *
  * @copyright (c) 2026 Ahura Project Contributors
  *            SPDX-License-Identifier: MIT
@@ -17,6 +17,13 @@
 #include "os_internal.h"
 
 #if (OS_CONFIG_TIMER_ENABLE == 1U)
+
+/* Checked here rather than with #if: a priority may be given as an os_task_priority_t name, and an
+ * enum constant is not a macro - the preprocessor would read it as 0 and reject a valid setting.
+ * 0 belongs to the idle task, which the timer task must outrank to be dispatched at all. */
+_Static_assert((OS_CONFIG_TIMER_PRIORITY >= OS_TASK_PRIO_USER_MIN) &&
+               (OS_CONFIG_TIMER_PRIORITY <= OS_TASK_PRIO_MAX),
+               "OS_CONFIG_TIMER_PRIORITY must be OS_TASK_PRIO_USER_MIN..OS_TASK_PRIO_MAX");
 
 /*
  * ***********************************************************************************************************
@@ -271,7 +278,7 @@ os_status os_timer_system_init(void)
     {
         os_timer_task_entry,
         NULL,
-        OS_TASK_PRIO_MAX,
+        OS_CONFIG_TIMER_PRIORITY,
         OS_CONFIG_TIMER_CORE_AFFINITY
     };
 

@@ -39,6 +39,14 @@ static void      os_test_task_entry(void *context);
 
 static __IO bool os_kernel_running = false;
 
+/* Scheduler lock, per core. Nonzero means this core defers its own context switches with
+ * interrupts left fully live; the pending flag remembers a switch that was swallowed while
+ * it was held, so the outermost unlock can issue it. Not static: the scheduler reads both
+ * on its hot paths in os_task.c (declared in os_internal.h), where a call would cost more
+ * than the check itself. __IO because the tick and PendSV read them from ISR context. */
+__IO uint32_t os_kernel_lock_count[OS_CONFIG_CORE_COUNT];
+__IO bool     os_kernel_switch_pending[OS_CONFIG_CORE_COUNT];
+
 #if (OS_CONFIG_TEST_ENABLE == 0U)
 OS_TASK_DEFINE(tsk_main, OS_CONFIG_MAIN_TASK_STACK_SIZE);
 #endif
@@ -65,8 +73,9 @@ void os_init(void)
     os_task_system_init();
     (void)os_task_idle_create();
 
-    /* Kernel service tasks at the reserved highest priority: the work queue
-     * and the timer callback task. */
+    /* Kernel service tasks, at OS_CONFIG_WORK_PRIORITY and OS_CONFIG_TIMER_PRIORITY: the work
+     * queue and the timer callback task. Both are created as system tasks, so the application
+     * cannot pause or delete them whatever priority they are given. */
 #if (OS_CONFIG_WORK_ENABLE == 1U)
     (void)os_work_system_init();
 #endif
@@ -151,6 +160,99 @@ void os_core_start(void)
 bool os_kernel_is_running(void)
 {
     return os_kernel_running;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Defer context switches on the calling core, leaving interrupts enabled (nesting counted).
+ *
+ * The preemption barrier os_critical_enter is not: a critical section stops interrupts and so stops
+ * everything, this stops only the scheduler. Interrupts keep running and keep waking tasks; they
+ * just do not get the CPU until the outermost unlock, which then issues the switch it swallowed.
+ * Use it against other TASKS - data an ISR or another core also touches still needs a critical
+ * section, since this lock excludes neither.
+ *
+ * The calling task cannot block while it holds one: blocking primitives behave as if given
+ * OS_WAIT_NOTHING, os_delay_ms busy-waits, and pause/delete of the CALLER return OS_STATUS_BUSY.
+ * Blocking means switching away, which is what the lock forbids. No-op from interrupt context.
+ *
+ * @return None.
+ */
+void os_kernel_lock(void)
+{
+    uint32_t mask_state;
+
+    if (os_arch_in_isr())
+    {
+        return;
+    }
+
+    mask_state = os_arch_kernel_mask_save();
+    os_kernel_lock_count[os_arch_core_id_get()]++;
+    os_arch_kernel_mask_restore(mask_state);
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Release one level of scheduler lock; at the outermost level, take any switch that was
+ *        deferred while it was held.
+ *
+ * The deferred switch is issued after the count reaches zero, so the PendSV it pends finds the
+ * scheduler open and really does switch. Unbalanced calls are an OS_ASSERT (with assertions off,
+ * a call without a matching lock is ignored rather than wrapping the counter).
+ *
+ * @return None.
+ */
+void os_kernel_unlock(void)
+{
+    uint32_t mask_state;
+    uint32_t core;
+    bool     switch_due = false;
+
+    if (os_arch_in_isr())
+    {
+        return;
+    }
+
+    mask_state = os_arch_kernel_mask_save();
+
+    core = os_arch_core_id_get();
+
+    /* An unlock with no matching lock means the pairing is broken somewhere, exactly as in
+     * os_critical_exit: decrementing anyway would wrap the counter and lock the scheduler for
+     * ~4 billion nested unlocks. */
+    OS_ASSERT(os_kernel_lock_count[core] != 0U);
+
+    if (os_kernel_lock_count[core] != 0U)
+    {
+        os_kernel_lock_count[core]--;
+
+        if (os_kernel_lock_count[core] == 0U)
+        {
+            switch_due                   = os_kernel_switch_pending[core];
+            os_kernel_switch_pending[core] = false;
+        }
+    }
+
+    os_arch_kernel_mask_restore(mask_state);
+
+    /* Outside the mask: the switch is due now, and pending it under the mask
+     * would only delay it to the restore above. */
+    if (switch_due && os_kernel_is_running())
+    {
+        OS_ARCH_CONTEXT_SWITCH_REQUEST();
+    }
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Whether the calling core currently has its scheduler locked (ISR-safe).
+ *
+ * @return bool  True while at least one os_kernel_lock is outstanding on this core.
+ */
+bool os_kernel_is_locked(void)
+{
+    return (os_kernel_lock_count[os_arch_core_id_get()] != 0U);
 }
 
 #if (OS_CONFIG_ASSERT_ENABLE == 1U)

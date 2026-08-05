@@ -127,15 +127,13 @@ static uint32_t                os_task_ready_bitmap = 0U;
 static os_list_t               os_task_delay_list;
 
 /* Scheduler lock: while nonzero, the owning core defers its own context
- * switches with interrupts left fully live (os_scheduler_lock). Per core and
+ * switches with interrupts left fully live (os_kernel_lock). Per core and
  * read from ISR context (the tick's reschedule check, PendSV), hence __IO.
  *
  * A deferred switch is remembered rather than dropped: whoever wanted it sets
- * the pending flag, and the outermost os_scheduler_unlock issues the PendSV
+ * the pending flag, and the outermost os_kernel_unlock issues the PendSV
  * the lock swallowed. The flag is also set by the switch path itself, which
  * catches a PendSV that was already pending when the lock was taken. */
-static __IO uint32_t           os_task_scheduler_lock[OS_CONFIG_CORE_COUNT];
-static __IO bool               os_task_switch_pending[OS_CONFIG_CORE_COUNT];
 
 #if (OS_CONFIG_TIME_SLICE_TICKS > 0U)
 /* Ticks left in the running task's round-robin quantum, per core. Reloaded
@@ -169,9 +167,7 @@ static void           os_task_preempt_request(const os_task_tcb_t *tcb);
 static uint32_t       os_task_running_core(const os_task_tcb_t *tcb);
 static void           os_task_wake_compensate(os_task_tcb_t *tcb);
 static void           os_task_wake_locked(os_task_tcb_t *tcb);
-#if (OS_CONFIG_MUTEX_ENABLE == 1U)
 static void           os_task_effective_priority_set(os_task_tcb_t *tcb, uint32_t new_priority);
-#endif
 
 /*
  * ***********************************************************************************************************
@@ -183,8 +179,8 @@ static void           os_task_effective_priority_set(os_task_tcb_t *tcb, uint32_
 /**
  * @brief Create a task using the provided configuration.
  *
- * Priority 0 (idle) and OS_TASK_PRIO_MAX (kernel work/timer service
- * tasks) are reserved: user tasks must use OS_TASK_PRIO_USER_MIN to
+ * Priority 0 (idle) and OS_TASK_PRIO_MAX (where the kernel's service tasks
+ * run by default) are reserved: user tasks must use OS_TASK_PRIO_USER_MIN to
  * OS_TASK_PRIO_USER_MAX.
  *
  * @param[out] task    Output task handle.
@@ -345,7 +341,7 @@ os_status os_task_pause(os_task_t *task)
      * a scheduler lock defers - it would keep running while marked SUSPENDED.
      * Refused rather than deferred, so the caller learns it happened. Pausing
      * any OTHER task needs no switch and stays allowed. */
-    if (is_self && (os_task_scheduler_lock[core] != 0U))
+    if (is_self && (os_kernel_lock_count[core] != 0U))
     {
         os_critical_exit();
         return OS_STATUS_BUSY;
@@ -445,7 +441,7 @@ os_status os_task_delete(os_task_t *task)
     /* See os_task_pause: deleting the CALLING task requires switching away
      * from it, and a locked scheduler cannot. Tearing its TCB down and then
      * letting it run on would be far worse than refusing. */
-    if (is_self && (os_task_scheduler_lock[core] != 0U))
+    if (is_self && (os_kernel_lock_count[core] != 0U))
     {
         os_critical_exit();
         return OS_STATUS_BUSY;
@@ -494,95 +490,117 @@ void os_task_yield(void)
 
 /******************************************************************************************************/
 /**
- * @brief Defer context switches on the calling core, leaving interrupts enabled (nesting counted).
+ * @brief Change a task's priority (NULL means the calling task).
  *
- * The preemption barrier os_critical_enter is not: a critical section stops interrupts and so stops
- * everything, this stops only the scheduler. Interrupts keep running and keep waking tasks; they
- * just do not get the CPU until the outermost unlock, which then issues the switch it swallowed.
- * Use it against other TASKS - data an ISR or another core also touches still needs a critical
- * section, since this lock excludes neither.
+ * Only user priorities are accepted: 0 belongs to the idle task and OS_TASK_PRIO_MAX to the kernel
+ * service tasks, so neither is the application's to hand out. The idle task and the kernel's own
+ * tasks are refused outright, exactly as os_task_pause and os_task_delete refuse them.
  *
- * The calling task cannot block while it holds one: blocking primitives behave as if given
- * OS_WAIT_NOTHING, os_delay_ms busy-waits, and pause/delete of the CALLER return OS_STATUS_BUSY.
- * Blocking means switching away, which is what the lock forbids. No-op from interrupt context.
+ * Takes effect immediately, whatever the task is doing: a READY task moves between ready lists, a
+ * RUNNING one may be preempted on the spot, and a task blocked on a mutex, semaphore, queue or
+ * event is re-sorted in that object's waiter list so it is woken in its new priority order.
  *
- * @return None.
+ * A task currently holding a priority-inheritance boost keeps it. The new value becomes its base
+ * priority - what it returns to when it releases the mutex - and only takes effect now if it is
+ * HIGHER than the boost. Lowering a boosted task immediately would hand back the very inversion
+ * the boost exists to prevent.
+ *
+ * @param[in,out] task      Task handle, or NULL for the calling task.
+ * @param[in]     priority  New priority: OS_TASK_PRIO_1..OS_TASK_PRIO_30 (or any value in that range).
+ * @return os_status  OK; INVALID_ARG for an unknown handle or an out-of-range priority;
+ *                    BUSY for the idle task or a kernel service task.
  */
-void os_scheduler_lock(void)
+os_status os_task_priority_set(os_task_t *task, os_task_priority_t priority)
 {
-    uint32_t mask_state;
+    uint32_t      core  = os_arch_core_id_get();
+    uint32_t      value = (uint32_t)priority;
+    os_task_tcb_t *tcb;
 
-    if (os_arch_in_isr())
+    /* Compared as the unsigned level the scheduler stores, not as the enum: the range constants
+     * are unsigned, and an enum is a signed int on this target. */
+    if ((value < OS_TASK_PRIO_USER_MIN) || (value > OS_TASK_PRIO_USER_MAX))
     {
-        return;
+        return OS_STATUS_INVALID_ARG;
     }
 
-    mask_state = os_arch_kernel_mask_save();
-    os_task_scheduler_lock[os_arch_core_id_get()]++;
-    os_arch_kernel_mask_restore(mask_state);
-}
+    os_critical_enter();
 
-/******************************************************************************************************/
-/**
- * @brief Release one level of scheduler lock; at the outermost level, take any switch that was
- *        deferred while it was held.
- *
- * The deferred switch is issued after the count reaches zero, so the PendSV it pends finds the
- * scheduler open and really does switch. Unbalanced calls are an OS_ASSERT (with assertions off,
- * a call without a matching lock is ignored rather than wrapping the counter).
- *
- * @return None.
- */
-void os_scheduler_unlock(void)
-{
-    uint32_t mask_state;
-    uint32_t core;
-    bool     switch_due = false;
+    tcb = (task == NULL) ? os_task_current[core]
+                         : ((task->id == 0U) ? NULL : os_task_find_by_id(task->id));
 
-    if (os_arch_in_isr())
+    if ((tcb == NULL) || (tcb == &os_task_idle_tcb[core]))
     {
-        return;
+        os_critical_exit();
+        return (tcb == NULL) ? OS_STATUS_INVALID_ARG : OS_STATUS_BUSY;
     }
 
-    mask_state = os_arch_kernel_mask_save();
-
-    core = os_arch_core_id_get();
-
-    /* An unlock with no matching lock means the pairing is broken somewhere, exactly as in
-     * os_critical_exit: decrementing anyway would wrap the counter and lock the scheduler for
-     * ~4 billion nested unlocks. */
-    OS_ASSERT(os_task_scheduler_lock[core] != 0U);
-
-    if (os_task_scheduler_lock[core] != 0U)
+    if (tcb->system_task)
     {
-        os_task_scheduler_lock[core]--;
+        os_critical_exit();
+        return OS_STATUS_BUSY;
+    }
 
-        if (os_task_scheduler_lock[core] == 0U)
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+    {
+        /* Boosted exactly when the effective priority has been raised above the base. */
+        bool boosted = (tcb->priority > tcb->base_priority);
+
+        tcb->base_priority = value;
+
+        if (!boosted || (value > tcb->priority))
         {
-            switch_due                   = os_task_switch_pending[core];
-            os_task_switch_pending[core] = false;
+            os_task_effective_priority_set(tcb, value);
         }
     }
+#else
+    os_task_effective_priority_set(tcb, value);
+#endif
 
-    os_arch_kernel_mask_restore(mask_state);
-
-    /* Outside the mask: the switch is due now, and pending it under the mask
-     * would only delay it to the restore above. */
-    if (switch_due && os_kernel_is_running())
-    {
-        OS_ARCH_CONTEXT_SWITCH_REQUEST();
-    }
+    os_critical_exit();
+    return OS_STATUS_OK;
 }
 
 /******************************************************************************************************/
 /**
- * @brief Whether the calling core currently has its scheduler locked (ISR-safe).
+ * @brief Get a task's priority (NULL means the calling task).
  *
- * @return bool  True while at least one os_scheduler_lock is outstanding on this core.
+ * Reports the priority the application set, not a priority-inheritance boost that may be in force
+ * right now. That is what makes the value safe to save and restore around a section: a boost is
+ * transient and belongs to the kernel, and writing one back later would make it permanent.
+ *
+ * @param[in]  task          Task handle, or NULL for the calling task.
+ * @param[out] priority_out  Receives the task's priority.
+ * @return os_status  OK, or INVALID_ARG for an unknown handle or a NULL output.
  */
-bool os_scheduler_is_locked(void)
+os_status os_task_priority_get(const os_task_t *task, os_task_priority_t *priority_out)
 {
-    return (os_task_scheduler_lock[os_arch_core_id_get()] != 0U);
+    uint32_t            core = os_arch_core_id_get();
+    const os_task_tcb_t *tcb;
+
+    if (priority_out == NULL)
+    {
+        return OS_STATUS_INVALID_ARG;
+    }
+
+    os_critical_enter();
+
+    tcb = (task == NULL) ? os_task_current[core]
+                         : ((task->id == 0U) ? NULL : os_task_find_by_id(task->id));
+
+    if (tcb == NULL)
+    {
+        os_critical_exit();
+        return OS_STATUS_INVALID_ARG;
+    }
+
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+    *priority_out = (os_task_priority_t)tcb->base_priority;
+#else
+    *priority_out = (os_task_priority_t)tcb->priority;
+#endif
+
+    os_critical_exit();
+    return OS_STATUS_OK;
 }
 
 /******************************************************************************************************/
@@ -852,7 +870,7 @@ void os_task_sleep_ticks(uint32_t ticks)
      * the same "could not block" behaviour they get from an ISR - os_delay
      * busy-waits instead. */
     if (!os_kernel_is_running() || os_arch_in_isr() ||
-        (os_task_scheduler_lock[core] != 0U) ||
+        (os_kernel_lock_count[core] != 0U) ||
         (current == NULL) || (current == &os_task_idle_tcb[core]))
     {
         os_critical_exit();
@@ -1305,7 +1323,7 @@ bool os_task_reschedule_possible(void)
     core    = os_arch_core_id_get();
     current = os_task_current[core];
 
-    if (os_task_scheduler_lock[core] != 0U)
+    if (os_kernel_lock_count[core] != 0U)
     {
         result = false;
     }
@@ -1532,8 +1550,8 @@ void os_task_system_init(void)
     for (core = 0U; core < OS_CONFIG_CORE_COUNT; core++)
     {
         os_task_current[core]        = NULL;
-        os_task_scheduler_lock[core] = 0U;
-        os_task_switch_pending[core] = false;
+        os_kernel_lock_count[core] = 0U;
+        os_kernel_switch_pending[core] = false;
 #if (OS_CONFIG_TIME_SLICE_TICKS > 0U)
         os_task_slice_left[core]     = OS_CONFIG_TIME_SLICE_TICKS;
 #endif
@@ -1581,12 +1599,12 @@ void os_task_stack_save_current(uint32_t *stack_ptr)
     /* Scheduler locked: this PendSV must not switch. Requests raised under the lock never pend
      * one, so getting here means it was already pending when the lock was taken (or an IPI
      * arrived). Leave the task RUNNING and owning this core - select_next hands the frame just
-     * saved straight back - and remember the switch for the outermost os_scheduler_unlock.
+     * saved straight back - and remember the switch for the outermost os_kernel_unlock.
      * Only for a still-RUNNING task, the same condition select_next re-checks. */
     if ((current_task != NULL) && (current_task->state == OS_TASK_STATE_RUNNING) &&
-        (os_task_scheduler_lock[core] != 0U))
+        (os_kernel_lock_count[core] != 0U))
     {
-        os_task_switch_pending[core] = true;
+        os_kernel_switch_pending[core] = true;
 
         os_critical_multicore_unlock();
         os_arch_kernel_mask_restore(mask_state);
@@ -1655,7 +1673,7 @@ uint32_t* os_task_stack_select_next(void)
     {
         os_task_tcb_t *locked_current = os_task_current[core];
 
-        if ((os_task_scheduler_lock[core] != 0U) && (locked_current != NULL) &&
+        if ((os_kernel_lock_count[core] != 0U) && (locked_current != NULL) &&
             (locked_current->state == OS_TASK_STATE_RUNNING))
         {
             os_critical_multicore_unlock();
@@ -2121,7 +2139,7 @@ static void os_task_wait_node_insert(os_list_t *waiters, os_task_tcb_t *tcb)
  *
  * Every LOCAL switch request in the kernel goes through here rather than pending PendSV directly,
  * so a scheduler-locked core pays no PendSV round trip per request (and none per tick). The cost of
- * swallowing one is a flag: os_scheduler_unlock re-issues it. Cross-core IPI requests are NOT routed
+ * swallowing one is a flag: os_kernel_unlock re-issues it. Cross-core IPI requests are NOT routed
  * through this - another core's scheduling is not this core's lock to hold.
  *
  * @return None.
@@ -2130,9 +2148,9 @@ static void os_task_switch_request(void)
 {
     uint32_t core = os_arch_core_id_get();
 
-    if (os_task_scheduler_lock[core] != 0U)
+    if (os_kernel_lock_count[core] != 0U)
     {
-        os_task_switch_pending[core] = true;
+        os_kernel_switch_pending[core] = true;
         return;
     }
 
@@ -2292,7 +2310,6 @@ static uint32_t os_task_running_core(const os_task_tcb_t *tcb)
     return OS_CONFIG_CORE_COUNT;
 }
 
-#if (OS_CONFIG_MUTEX_ENABLE == 1U)
 /******************************************************************************************************/
 /**
  * @brief Change a task's effective (scheduled) priority, moving it between ready-list buckets,
@@ -2377,5 +2394,4 @@ static void os_task_effective_priority_set(os_task_tcb_t *tcb, uint32_t new_prio
         os_task_wait_node_insert(tcb->wait_list, tcb);
     }
 }
-#endif /* OS_CONFIG_MUTEX_ENABLE */
 

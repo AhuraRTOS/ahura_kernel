@@ -178,24 +178,6 @@ uint32_t os_log_dropped_get(void)
 
 /******************************************************************************************************/
 /**
- * @brief Weak default output hook: discards everything.
- *
- * Logging therefore costs nothing until the application defines this function (see
- * os_cb_template.c) - the buffer still drains, so a project that never provides a transport
- * cannot fill up and start dropping.
- *
- * @param[in] data    Bytes to transmit.
- * @param[in] length  Number of bytes.
- * @return None.
- */
-OS_WEAK void os_log_output_cb(const uint8_t *data, size_t length)
-{
-    (void)data;
-    (void)length;
-}
-
-/******************************************************************************************************/
-/**
  * @brief Create and start the kernel log service task. Called from os_init.
  *
  * @return os_status  Status code.

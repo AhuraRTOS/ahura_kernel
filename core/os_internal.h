@@ -42,6 +42,16 @@ extern "C"
  */
 void os_task_system_init(void);
 
+/*
+ * Scheduler-lock state, defined in os_kernel.c and read directly here rather than through
+ * os_kernel_is_locked(): the scheduler tests it on its hot paths - every PendSV, every tick
+ * that considers a reschedule - where a cross-module call would cost more than the check.
+ * os_kernel_lock_count is nonzero while that core defers its switches; os_kernel_switch_pending
+ * records a switch swallowed while it was held, for the outermost unlock to issue.
+ */
+extern __IO uint32_t os_kernel_lock_count[OS_CONFIG_CORE_COUNT];
+extern __IO bool     os_kernel_switch_pending[OS_CONFIG_CORE_COUNT];
+
 /******************************************************************************************************/
 /**
  * @brief Create the mandatory idle task (os_task.c).
@@ -314,7 +324,8 @@ static inline void os_critical_multicore_unlock(void) { }
  */
 static inline bool os_internal_can_block(void)
 {
-    return (os_kernel_is_running() && !os_arch_in_isr() && !os_scheduler_is_locked());
+    return (os_kernel_is_running() && !os_arch_in_isr() &&
+            (os_kernel_lock_count[os_arch_core_id_get()] == 0U));
 }
 
 /******************************************************************************************************/

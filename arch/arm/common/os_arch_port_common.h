@@ -55,7 +55,7 @@
     !defined(OS_CONFIG_MAX_USER_TASKS) ||                                                              \
     !defined(OS_CONFIG_MAX_TIMERS) || !defined(OS_CONFIG_MAX_WORKS) ||                                 \
     !defined(OS_CONFIG_WORK_PAYLOAD_SIZE) ||                                                           \
-    !defined(OS_CONFIG_MIN_STACK_SIZE) || !defined(OS_CONFIG_WORK_STACK_SIZE) ||                       \
+    !defined(OS_CONFIG_MIN_STACK_SIZE) || !defined(OS_CONFIG_WORK_STACK_SIZE) ||                           !defined(OS_CONFIG_TIMER_PRIORITY) || !defined(OS_CONFIG_WORK_PRIORITY) ||                         \
     !defined(OS_CONFIG_TIMER_STACK_SIZE) || !defined(OS_CONFIG_WORK_CORE_AFFINITY) ||                  \
     !defined(OS_CONFIG_TIMER_CORE_AFFINITY) ||                                                         \
     !defined(OS_CONFIG_MAIN_TASK_STACK_SIZE) || !defined(OS_CONFIG_MAIN_TASK_PRIORITY) ||               \
@@ -621,14 +621,15 @@ uint32_t os_arch_max_suppressed_ticks_get(void);
 #if (OS_CONFIG_CORE_COUNT > 1U)
 /******************************************************************************************************/
 /**
- * @brief SoC callback: return the index of the calling core (0-based). Weak default returns 0.
+ * @brief SoC callback: return the index of the calling core (0-based). No default is provided:
+ *        an id fixed at 0 would make every core believe it is core 0.
  */
 uint32_t os_arch_core_id_get_cb(void);
 
 /******************************************************************************************************/
 /**
- * @brief SoC callback: interrupt another core so it re-evaluates scheduling. Weak default does nothing
- *        (the target core then reacts at its next tick).
+ * @brief SoC callback: interrupt another core so it re-evaluates scheduling. No default is
+ *        provided: a do-nothing IPI leaves every cross-core wakeup waiting for the next tick.
  */
 void os_arch_core_ipi_request_cb(uint32_t core_id);
 #endif /* OS_CONFIG_CORE_COUNT > 1U */
@@ -737,14 +738,15 @@ static inline void os_arch_spinlock_release(os_arch_spinlock_t *lock)
 /**
  * @brief Application callback: bank the secure-side context of the task being switched out.
  *        Called from the context-switch handler; task_id 0 means the idle task (no secure
- *        context). Weak default does nothing.
+ *        context). REQUIRED in this mode: the kernel ships no default, so a missing one is a
+ *        link error rather than a task switched without its secure state.
  */
 void os_arch_tz_context_save_cb(uint32_t task_id);
 
 /******************************************************************************************************/
 /**
  * @brief Application callback: restore the secure-side context of the task being switched in.
- *        Weak default does nothing.
+ *        REQUIRED in this mode, like its save counterpart above.
  */
 void os_arch_tz_context_restore_cb(uint32_t task_id);
 #endif /* OS_CONFIG_TRUSTZONE_NON_SECURE */

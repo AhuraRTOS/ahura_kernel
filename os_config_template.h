@@ -99,7 +99,6 @@
  * and this is the only detection available. */
 #define OS_CONFIG_STACK_CHECK_ENABLE        1U
 
-
 /*
  * ***********************************************************************************************************
  * Default application task
@@ -194,6 +193,18 @@
 #define OS_CONFIG_MAX_TIMERS                8U
 #define OS_CONFIG_TIMER_STACK_SIZE          512U
 
+/* Priority of the timer service task, and so of every timer callback.
+ *
+ * OS_TASK_PRIO_MAX (31) by default, above every user task: an expiry then reaches its callback as
+ * soon as the tick notes it, which is what makes a timer's timing depend on the timer rather than
+ * on what else is runnable. Lower it when callbacks matter less than some user task - they run at
+ * this priority for their whole duration, so a slow callback at 31 delays everything.
+ *
+ * Any level from OS_TASK_PRIO_USER_MIN to OS_TASK_PRIO_MAX is allowed, including levels user
+ * tasks also use; the timer task is a kernel service task either way, so os_task_pause and
+ * os_task_delete keep refusing it whatever this is set to. */
+#define OS_CONFIG_TIMER_PRIORITY            OS_TASK_PRIO_MAX
+
 /* Which cores the timer task (and so the timer callbacks) may run on:
  * a core-affinity bitmask, 0 = any core. Only meaningful when
  * OS_CONFIG_CORE_COUNT (PART 3) > 1; keep 0 on single-core builds. */
@@ -212,13 +223,19 @@
 #define OS_CONFIG_MAX_WORKS                 8U
 #define OS_CONFIG_WORK_STACK_SIZE           512U
 
+/* Priority of the work service task, and so of every work handler. Same rule as
+ * OS_CONFIG_TIMER_PRIORITY above: OS_TASK_PRIO_MAX by default so deferred work runs promptly,
+ * lower it when a user task should outrank it, and it stays a kernel service task - protected
+ * from os_task_pause and os_task_delete - at any setting. */
+#define OS_CONFIG_WORK_PRIORITY             OS_TASK_PRIO_MAX
+
 /* Largest payload os_work_submit may copy into a slot, in bytes. The submitted
  * data is copied, so nothing the caller owns has to outlive the deferred call;
  * the cost is OS_CONFIG_MAX_WORKS * this many bytes of RAM, plus this much again
  * on the work task's stack while a handler runs. A submission larger than this
  * is refused with OS_STATUS_INVALID_ARG. To hand over something bigger, submit a
  * POINTER to it (sizeof of the pointer) and keep the target alive yourself. */
-#define OS_CONFIG_WORK_PAYLOAD_SIZE         32U
+#define OS_CONFIG_WORK_PAYLOAD_SIZE         4U
 
 /* Which cores the work task (and so the work handlers) may run on: a
  * core-affinity bitmask, 0 = any core. Only meaningful when

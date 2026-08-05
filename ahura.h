@@ -138,24 +138,32 @@ typedef struct
 /** Timeout value: do not wait, fail immediately when unavailable. */
 #define OS_WAIT_NOTHING         0U
 
-/** Number of priority levels, fixed (not application-configurable): the
- *  scheduler's ready bitmap is a single 32-bit word, one bit per priority,
- *  so 31 is the most this port can ever support. */
-#define OS_TASK_PRIO_MAX        31U
-
-/** User task priority range: 0 is idle, OS_TASK_PRIO_MAX is reserved
- *  for the kernel work/timer service tasks. */
+/** User task priority range: 0 is the idle task's, and OS_TASK_PRIO_MAX is kept out of reach of
+ *  os_task_create so the kernel's service tasks have a level nothing else can claim - it is where
+ *  OS_CONFIG_TIMER_PRIORITY and OS_CONFIG_WORK_PRIORITY put them by default, though either may be
+ *  lowered into the user range.
+ *
+ *  Plain literals, not derived from OS_TASK_PRIO_MAX: that is an enum constant, and the
+ *  preprocessor reads an enum name as 0, so `(OS_TASK_PRIO_MAX - 1U)` would be -1 inside any #if
+ *  and every range test built on it would quietly give the wrong answer. The static assertion
+ *  below is what keeps these two in step with the enum instead. */
 #define OS_TASK_PRIO_USER_MIN   1U
-#define OS_TASK_PRIO_USER_MAX   (OS_TASK_PRIO_MAX - 1U)
+#define OS_TASK_PRIO_USER_MAX   30U
 
-/** Named task priority levels: one name per level, OS_TASK_PRIO_1 (lowest)
- *  through OS_TASK_PRIO_30 (highest a user task may request) - matching
- *  OS_TASK_PRIO_USER_MIN..OS_TASK_PRIO_USER_MAX exactly, level N = value N.
- *  Safe to enumerate directly like this because OS_TASK_PRIO_MAX is a fixed
- *  kernel constant (not application-configurable), so this range never
- *  changes. Using a name here is purely a style choice - a plain number in
- *  OS_TASK_PRIO_USER_MIN..OS_TASK_PRIO_USER_MAX works exactly the same,
- *  since os_task_config_t.priority remains a plain uint32_t. */
+/** Named task priority levels, one per level, value N for level N. OS_TASK_PRIO_1 (lowest)
+ *  through OS_TASK_PRIO_30 are the user range, matching
+ *  OS_TASK_PRIO_USER_MIN..OS_TASK_PRIO_USER_MAX exactly; OS_TASK_PRIO_MAX is the level above it,
+ *  which os_task_create refuses but OS_CONFIG_TIMER_PRIORITY and OS_CONFIG_WORK_PRIORITY accept,
+ *  so the enum names every level the scheduler has.
+ *
+ *  Safe to enumerate directly like this because the number of levels is a fixed kernel constant
+ *  (not application-configurable), so the range never changes. Using a name is a style choice:
+ *  a plain number works the same, since os_task_config_t.priority is a plain uint32_t.
+ *
+ *  One thing a name cannot do is survive the preprocessor. An enum constant is not a macro, so
+ *  #if reads it as 0 - which is why the range limits above are literals, why a configured
+ *  priority written as a name must be checked with _Static_assert rather than #if (see
+ *  os_timer.c), and why application code should not test one in #if either. */
 typedef enum
 {
     OS_TASK_PRIO_1_LOWEST   = 1U,
@@ -189,9 +197,21 @@ typedef enum
     OS_TASK_PRIO_28         = 28U,
     OS_TASK_PRIO_29         = 29U,
     OS_TASK_PRIO_30         = 30U,
-    OS_TASK_PRIO_30_HIGHEST = 30U
+    OS_TASK_PRIO_30_HIGHEST = 30U,  /**< Highest a user task may request. */
+
+    /* Above the user range: os_task_create rejects it, and it is what
+     * OS_CONFIG_TIMER_PRIORITY / OS_CONFIG_WORK_PRIORITY default to. */
+    OS_TASK_PRIO_MAX        = 31U
 
 } os_task_priority_t;
+
+/* The literals above must stay the enum's user range. Checked here rather than derived, so that
+ * changing one and not the other fails to build instead of quietly shifting what a user task may
+ * ask for. */
+_Static_assert((OS_TASK_PRIO_USER_MIN == (uint32_t)OS_TASK_PRIO_1) &&
+               (OS_TASK_PRIO_USER_MAX == (uint32_t)OS_TASK_PRIO_30) &&
+               (OS_TASK_PRIO_USER_MAX == ((uint32_t)OS_TASK_PRIO_MAX - 1U)),
+               "OS_TASK_PRIO_USER_MIN/MAX must match os_task_priority_t");
 
 /** Core affinity: the task may run on any core (multi-core builds; the
  *  affinity is a bitmask otherwise, bit n = may run on core n). */
@@ -254,6 +274,32 @@ typedef enum
  *  substituted inside the initializers below.) */
 #define OS_TASK_DEFINE(task_name, stack_size)                                        \
     static uint8_t task_name##_STACK[(((stack_size) + 7U) & ~7U)] OS_STACK_ALIGNED;  \
+    static const os_task_storage_t task_name##_STORAGE = {                           \
+        .name         = #task_name,                                                  \
+        .stack_memory = (void *)(task_name##_STACK),                                 \
+        .stack_bytes  = sizeof(task_name##_STACK)                                    \
+    };                                                                               \
+    static os_task_t task_name = { .storage = &task_name##_STORAGE }
+
+/** OS_TASK_DEFINE, plus attributes on the stack - for when WHERE the stack lives matters as much
+ *  as how big it is: fast on-chip RAM (DTCM, CCM), a no-init section that survives a reset, a
+ *  region an MPU covers, an address the linker script pins. OS_TASK_DEFINE puts its stack in
+ *  ordinary .bss with no way to say otherwise; this puts whatever you pass on that same array.
+ *
+ *      OS_TASK_ATTR_DEFINE(rx_task, 1024U, __attribute__((section(".dtcm"))));
+ *      status = os_task_create(&rx_task, OS_TASK_CONFIG(rx_entry, NULL, OS_TASK_PRIO_3));
+ *
+ *  Identical to OS_TASK_DEFINE in every other way - same handle, same rounding to a multiple of
+ *  8, same OS_STACK_ALIGNED already applied, so an attribute that only names a section cannot
+ *  silently cost the stack its alignment. The named section still has to exist in the linker
+ *  script; nothing here can create it.
+ *
+ *  Variadic on purpose: attributes are taken as the rest of the line, so several may be given
+ *  (__attribute__((aligned(32))) __attribute__((section(".noinit")))) whatever commas they
+ *  contain. */
+#define OS_TASK_ATTR_DEFINE(task_name, stack_size, ...)                              \
+    static uint8_t task_name##_STACK[(((stack_size) + 7U) & ~7U)]                    \
+        OS_STACK_ALIGNED __VA_ARGS__;                                                \
     static const os_task_storage_t task_name##_STORAGE = {                           \
         .name         = #task_name,                                                  \
         .stack_memory = (void *)(task_name##_STACK),                                 \
@@ -369,6 +415,23 @@ void os_task_yield(void);
 
 /******************************************************************************************************/
 /**
+ * @brief Change a task's priority (NULL means the calling task); takes effect immediately, including
+ *        for a task already queued on a mutex, semaphore, queue or event. Accepts only
+ *        OS_TASK_PRIO_USER_MIN..OS_TASK_PRIO_USER_MAX; OS_STATUS_BUSY for the idle task and the
+ *        kernel's service tasks. A priority-inheritance boost in force is kept - the new value
+ *        becomes the base the task returns to.
+ */
+os_status os_task_priority_set(os_task_t *task, os_task_priority_t priority);
+
+/******************************************************************************************************/
+/**
+ * @brief Get a task's priority (NULL means the calling task): the priority the application set,
+ *        not a priority-inheritance boost that may be in force right now.
+ */
+os_status os_task_priority_get(const os_task_t *task, os_task_priority_t *priority_out);
+
+/******************************************************************************************************/
+/**
  * @brief Get the current state of a task (NULL means current running task).
  */
 os_task_state_t os_task_state_get(const os_task_t *task);
@@ -437,7 +500,7 @@ void os_critical_exit(void);
  *
  * The other preemption barrier, and the cheaper one when what you are guarding against is another
  * TASK. Pick by what shares the data:
- *   task <-> task   os_scheduler_lock; interrupt latency is unaffected.
+ *   task <-> task   os_kernel_lock; interrupt latency is unaffected.
  *   task <-> ISR    os_critical_enter (or an atomic) - a scheduler lock excludes no interrupt.
  *   core <-> core   os_critical_enter, whose outermost level takes the cross-core spinlock.
  *
@@ -449,19 +512,19 @@ void os_critical_exit(void);
  * @brief Defer context switches on the calling core, leaving interrupts enabled (nesting counted).
  *        Blocking calls degrade to non-blocking while held; a no-op from an ISR.
  */
-void os_scheduler_lock(void);
+void os_kernel_lock(void);
 
 /******************************************************************************************************/
 /**
  * @brief Release one level of scheduler lock, taking any switch deferred while it was held.
  */
-void os_scheduler_unlock(void);
+void os_kernel_unlock(void);
 
 /******************************************************************************************************/
 /**
  * @brief Whether the calling core currently has its scheduler locked (ISR-safe).
  */
-bool os_scheduler_is_locked(void);
+bool os_kernel_is_locked(void);
 
 /*
  * ***********************************************************************************************************
@@ -1217,9 +1280,9 @@ os_status os_task_stack_watermark_get(const os_task_t *task, size_t *min_free_by
 /******************************************************************************************************/
 /**
  * @brief Reported when a task is found to have overrun its stack, at the moment it is switched
- *        out. Optional: the weak default does nothing, and the kernel parks the core immediately
- *        afterwards either way, so a missing hook loses the diagnosis but never lets execution
- *        continue on memory that has already been corrupted.
+ *        out. REQUIRED when OS_CONFIG_STACK_CHECK_ENABLE is 1: the kernel ships no default, so a
+ *        missing one is a link error. The core parks immediately afterwards either way, which
+ *        makes this the only chance to record which task it was.
  *
  *        Runs inside PendSV with the kernel's interrupts masked, so it must NOT call any kernel
  *        API. Write the name to a UART, latch it somewhere the debugger can find, and return.
@@ -1361,7 +1424,8 @@ uint32_t os_log_dropped_get(void);
 /**
  * @brief Application hook that transmits finished log bytes; called from the kernel log task,
  *        never from an ISR or a critical section, so it may block or start a DMA transfer.
- *        Weak default discards everything, so logging costs nothing until this is provided.
+ *        REQUIRED when OS_CONFIG_LOG_ENABLE is 1: the kernel ships no default, so a log with
+ *        nowhere to go is a link error rather than silence.
  *
  * @param[in] data    Bytes to transmit; valid only for the duration of the call.
  * @param[in] length  Number of bytes.
@@ -1409,14 +1473,15 @@ void os_test(void);
 /******************************************************************************************************/
 /**
  * @brief TrustZone callback: bank the secure-side context of the task being switched out
- *        (task_id 0 = idle task, no secure context). Weak default does nothing.
+ *        (task_id 0 = idle task, no secure context). You define it; the kernel ships no default,
+ *        so leaving it out is a link error.
  */
 void os_arch_tz_context_save_cb(uint32_t task_id);
 
 /******************************************************************************************************/
 /**
  * @brief TrustZone callback: restore the secure-side context of the task being switched in.
- *        Weak default does nothing.
+ *        You define it; the kernel ships no default.
  */
 void os_arch_tz_context_restore_cb(uint32_t task_id);
 #endif /* OS_CONFIG_TRUSTZONE_NON_SECURE */
@@ -1450,14 +1515,14 @@ os_status os_task_core_affinity_set(os_task_t *task, uint32_t core_affinity);
 /******************************************************************************************************/
 /**
  * @brief Multi-core SoC callback: return the index of the calling core (0-based).
- *        Weak default returns 0.
+ *        REQUIRED when OS_CONFIG_CORE_COUNT is above 1; the kernel ships no default.
  */
 uint32_t os_arch_core_id_get_cb(void);
 
 /******************************************************************************************************/
 /**
  * @brief Multi-core SoC callback: interrupt another core so it re-evaluates scheduling.
- *        Weak default does nothing (the core then reacts at its next tick).
+ *        REQUIRED when OS_CONFIG_CORE_COUNT is above 1; the kernel ships no default.
  */
 void os_arch_core_ipi_request_cb(uint32_t core_id);
 

@@ -702,20 +702,17 @@ uint32_t os_arch_max_suppressed_ticks_get(void)
 */
 
 #if (OS_CONFIG_CORE_COUNT > 1U)
-/******************************************************************************************************/
-/**
- * @brief Weak defaults for the SoC multi-core callbacks: single-core behavior (core 0, no IPI;
- *        cross-core wakeups then happen at the next tick).
- */
-OS_WEAK uint32_t os_arch_core_id_get_cb(void)
-{
-    return 0U;
-}
-
-OS_WEAK void os_arch_core_ipi_request_cb(uint32_t core_id)
-{
-    (void)core_id;
-}
+/* os_arch_core_id_get_cb() and os_arch_core_ipi_request_cb() are deliberately NOT defined here,
+ * not even as weak stubs.
+ *
+ * Cortex-M has no architectural core id and no architectural IPI, so both are SoC-specific (SIO
+ * CPUID and the inter-core FIFO on an RP2040, for instance). Defaults would be worse than absent:
+ * an id fixed at 0 makes every core believe it is core 0 and share one current-task slot, and a
+ * do-nothing IPI leaves cross-core wakeups waiting for the next tick. Both look like a working
+ * build that schedules wrongly.
+ *
+ * Define them in the application's os_cb.c (see os_cb_template.c) whenever OS_CONFIG_CORE_COUNT
+ * is above 1. */
 #endif /* OS_CONFIG_CORE_COUNT > 1U */
 
 /*

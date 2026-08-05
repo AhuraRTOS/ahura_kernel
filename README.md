@@ -166,10 +166,10 @@ compiles away entirely when its `OS_CONFIG_<FEATURE>_ENABLE` is 0.
 | Group | Functions |
 |---|---|
 | **Lifecycle** | `os_init` · `os_start` · `os_kernel_is_running` · `os_core_start` |
-| **Tasks** | `os_task_create` · `os_task_start` · `os_task_pause` · `os_task_delete` · `os_task_yield` · `os_task_state_get` · `os_task_core_affinity_set` |
+| **Tasks** | `os_task_create` · `os_task_start` · `os_task_pause` · `os_task_delete` · `os_task_yield` · `os_task_state_get` · `os_task_priority_get` · `os_task_priority_set` · `os_task_core_affinity_set` |
 | **Delays and time** | `os_delay_ms` · `os_delay_us` · `os_delay_s` · `os_tick_get` |
 | **Critical sections** | `os_critical_enter` · `os_critical_exit` |
-| **Scheduler lock** | `os_scheduler_lock` · `os_scheduler_unlock` · `os_scheduler_is_locked` |
+| **Scheduler lock** | `os_kernel_lock` · `os_kernel_unlock` · `os_kernel_is_locked` |
 | **Atomics** | `os_atomic_get` · `os_atomic_set` · `os_atomic_add` · `os_atomic_sub` · `os_atomic_inc` · `os_atomic_dec` · `os_atomic_or` · `os_atomic_and` · `os_atomic_xor` · `os_atomic_nand` · `os_atomic_clear` · `os_atomic_cas` · `os_atomic_test_bit` · `os_atomic_set_bit` · `os_atomic_clear_bit` · `os_atomic_test_and_set_bit` · `os_atomic_test_and_clear_bit` · `os_atomic_set_bit_to` |
 | **Mutex** | `os_mutex_init` · `os_mutex_lock` · `os_mutex_try_lock` · `os_mutex_unlock` |
 | **Semaphore** | `os_semaphore_init` · `os_semaphore_give` · `os_semaphore_take` |
@@ -200,7 +200,7 @@ os_task_start(&worker);
 
 `OS_TASK_DEFINE` records what the task is called and where its stack lives, and
 binds both to the handle at compile time. `OS_TASK_CONFIG` carries only what the
-task *does* — entry, context, priority — so there is no name to repeat and no
+task *does* - entry, context, priority - so there is no name to repeat and no
 stack to match up. Giving one task another task's stack is not something the API
 can express.
 
@@ -259,26 +259,31 @@ called in that build.
 ### Task priorities
 
 - `0` is the idle task, owned by the kernel.
-- `OS_TASK_PRIO_MAX` is reserved for the kernel service tasks `tsk_work` and
-  `tsk_timer`, which `os_init()` creates automatically. They cost no
-  `OS_CONFIG_MAX_USER_TASKS` slots: the kernel reserves its service tasks' slots on
-  top of that number.
+- `OS_TASK_PRIO_MAX` is kept out of reach of `os_task_create`, so the kernel's
+  service tasks `tsk_work` and `tsk_timer` - which `os_init()` creates
+  automatically - have a level nothing else can claim. That is where
+  `OS_CONFIG_WORK_PRIORITY` and `OS_CONFIG_TIMER_PRIORITY` put them by default;
+  either may be lowered into the user range when a user task should outrank
+  deferred work or timer callbacks. They stay system tasks at any priority, so
+  `os_task_pause` and `os_task_delete` keep refusing them. They cost no
+  `OS_CONFIG_MAX_USER_TASKS` slots: the kernel reserves its service tasks' slots
+  on top of that number.
 - `OS_TASK_PRIO_USER_MIN` through `OS_TASK_PRIO_USER_MAX` (1 to MAX-1) are user
   tasks. `os_task_create` rejects anything outside this range.
 
 The default application task (`tsk_main`) and the self-test task (`tsk_test`)
 live in the user range too, at `OS_CONFIG_MAIN_TASK_PRIORITY` and
-`OS_CONFIG_TEST_PRIORITY`. Unlike `tsk_work` and `tsk_timer` they are not
-priority-reserved, so pick values that fit alongside the application's own tasks.
+`OS_CONFIG_TEST_PRIORITY`. Unlike `tsk_work` and `tsk_timer` they are ordinary
+application tasks, so pick values that fit alongside your own.
 
-The kernel's own service tasks — `tsk_timer`, `tsk_work` and `tsk_log` — are
+The kernel's own service tasks - `tsk_timer`, `tsk_work` and `tsk_log` - are
 also protected: `os_task_pause` and `os_task_delete` refuse them with
 `OS_STATUS_BUSY`, because the timer, work and log APIs are all built on one
 running and suspending it would turn every later call into a silent no-op that
 still reports success. `tsk_main` and `tsk_test` are ordinary application tasks
 and stay fully under the application's control. Note that the log task is *not*
-identifiable by priority — it runs at `OS_CONFIG_LOG_TASK_PRIORITY`, deliberately
-low — so the protection is a property of how the task was created, not of where
+identifiable by priority - it runs at `OS_CONFIG_LOG_TASK_PRIORITY`, deliberately
+low - so the protection is a property of how the task was created, not of where
 it sits in the priority range.
 
 Because mutexes always do priority inheritance, a task's effective priority can
@@ -295,7 +300,7 @@ how long one holds the CPU before its peers get a turn:
 | `N` | Rotate every N ticks. Fewer context switches, longer uninterrupted runs. |
 | `0` | No rotation: a task runs until it blocks, yields, or is preempted. |
 
-Only equal-priority tasks are affected — a higher-priority task always preempts
+Only equal-priority tasks are affected - a higher-priority task always preempts
 immediately, whatever the quantum. A task that blocks or yields gives up the
 rest of its slice, and a freshly dispatched task always starts a whole one.
 Raising the quantum also makes ticks cheaper: a tick that would only have
@@ -303,21 +308,21 @@ rotated now costs a bitmap check instead of a full `PendSV` round trip.
 
 ### Scheduler lock
 
-`os_scheduler_lock()` / `os_scheduler_unlock()` defer context switches on the
+`os_kernel_lock()` / `os_kernel_unlock()` defer context switches on the
 calling core **without masking interrupts**. Interrupts keep running and keep
 waking tasks; those tasks simply do not get the CPU until the outermost unlock,
 which then takes the switch it deferred straight away. Nesting is counted, and
-`os_scheduler_is_locked()` reports the current state.
+`os_kernel_is_locked()` reports the current state.
 
 This is the right tool when what you are guarding against is another *task*:
 
 | Data shared between | Use | Cost |
 |---|---|---|
-| task ↔ task | `os_scheduler_lock` | No interrupt latency at all. |
+| task ↔ task | `os_kernel_lock` | No interrupt latency at all. |
 | task ↔ ISR | `os_critical_enter` (or an atomic) | Interrupts masked for the region. |
 | core ↔ core | `os_critical_enter` | Masks locally, spins the other cores. |
 
-A scheduler lock excludes **no interrupt** and **no other core** — it is per
+A scheduler lock excludes **no interrupt** and **no other core** - it is per
 core, and another core keeps scheduling its own tasks normally. Anything an ISR
 also touches still needs a critical section.
 
@@ -430,12 +435,12 @@ os_queue_send(&sensor_q, &sample, 10U);          /* no init call, nothing to che
 
 There is deliberately no init call to pair it with. The item size and capacity
 come from the declaration itself, so they cannot disagree with the storage that
-actually exists — handing a queue a capacity larger than its buffer is otherwise
+actually exists - handing a queue a capacity larger than its buffer is otherwise
 easy to do and silently reads or writes past the end of it. The buffer is
 declared as `sensor_q_BUFFER` and should never be named by hand.
 
-Everything the macro leaves out of the initializer — head, tail, count, the
-waiter lists — is zero-initialized under the C rules for static storage, which
+Everything the macro leaves out of the initializer - head, tail, count, the
+waiter lists - is zero-initialized under the C rules for static storage, which
 is byte-for-byte the state an init call would have written. The cost is that the
 queue object lands in `.data` rather than `.bss`, so its initializer image
 occupies flash.
@@ -459,7 +464,7 @@ and a failed call leaves nothing to clean up. `os_queue_init_dynamic` returns
 it into a small allocation that later sends would index past.
 
 **Storage you lay out yourself.** For a buffer `OS_QUEUE_DEFINE_STATIC` cannot
-express — a named linker section, DMA-capable RAM, a particular alignment —
+express - a named linker section, DMA-capable RAM, a particular alignment -
 declare the array yourself and bind a queue to it. It is initialized at compile
 time exactly like the static kind, so there is still nothing to call:
 
@@ -473,7 +478,7 @@ os_queue_send(&rx_q, &sample, 10U);
 
 Item size and capacity come from the array, so there is nothing to keep in step
 by hand. Passing a *pointer* to the array instead of the array itself is a
-compile error rather than a silently wrong capacity — `sizeof` on a pointer
+compile error rather than a silently wrong capacity - `sizeof` on a pointer
 would derive nonsense and every send past the first would run off the end of the
 storage.
 
@@ -485,7 +490,7 @@ down a mixed set of queues does not need to track which kind each one is:
   goes with it. Re-use means another `os_queue_init_dynamic`.
 - A buffer from `OS_QUEUE_DEFINE_STATIC` or `OS_QUEUE_DEFINE_BUFFER` is not the
   kernel's to release, so the queue keeps its storage and is left empty and
-  immediately usable — a statically defined queue needs no init call after
+  immediately usable - a statically defined queue needs no init call after
   cleanup either, exactly as it needed none before.
 
 It is not compiled out with the heap, and returns `OS_STATUS_BUSY` while any
@@ -541,8 +546,8 @@ to call from tasks and from ISRs.
 
 Writing each operation out per port, instead of sharing one implementation
 behind a selector, is what keeps the emitted code to the five instructions the
-sequence actually is — at `-O0` as well as `-O2`, with nothing needing to fold
-away first — and keeps compiler-generated stack traffic from ever landing
+sequence actually is - at `-O0` as well as `-O2`, with nothing needing to fold
+away first - and keeps compiler-generated stack traffic from ever landing
 between an `LDREX` and its `STREX`.
 
 Portable code above the port only composes these: incrementing is an add of 1,
@@ -571,7 +576,7 @@ There is no work object to declare, initialize or keep alive, and **the payload
 is copied, not referenced**. The kernel takes the handler and the `len` bytes at
 `data` into one of its `OS_CONFIG_MAX_WORKS` slots, then releases the slot as the
 handler starts and hands it the copy. So the buffer above may go out of scope the
-moment `os_work_submit` returns — a submission is complete in itself.
+moment `os_work_submit` returns - a submission is complete in itself.
 
 `OS_CONFIG_WORK_PAYLOAD_SIZE` (default 32 bytes) bounds it; anything larger is
 refused with `OS_STATUS_INVALID_ARG` rather than truncated. To hand over
@@ -595,8 +600,9 @@ Two consequences of having no handle, both deliberate:
 larger than `OS_CONFIG_MAX_WORKS` is refused rather than silently dropped.
 
 Handlers and timer callbacks run in task context, so they may use kernel APIs,
-but they execute at the highest priority. Keep them short and do not block in
-them, or everything else starves.
+but at the default `OS_CONFIG_WORK_PRIORITY` / `OS_CONFIG_TIMER_PRIORITY` they
+execute above every user task. Keep them short and do not block in them, or
+everything else starves - or lower those priorities so they cannot.
 
 ### Kernel heap
 
@@ -629,7 +635,7 @@ os_task_stack_watermark_get(task, &min_free);   /* NULL task = calling task */
 ```
 
 reports the worst-case remaining stack in bytes since that task was created.
-It is a measurement you poll, not a detector — by the time a task has actually
+It is a measurement you poll, not a detector - by the time a task has actually
 overrun, the damage is already done. That is what the next option is for.
 
 **Stack overflow detection.** With `OS_CONFIG_STACK_CHECK_ENABLE` (default 1),
@@ -644,10 +650,10 @@ void os_stack_overflow_cb(const char *task_name);   /* you define it; no kernel 
 ```
 
 The kernel ships no default for it, so a build with the check enabled and no
-callback is a link error rather than an overflow detector reporting to nobody —
+callback is a link error rather than an overflow detector reporting to nobody -
 same rule as `os_assert_failed_cb`. Copy the definition from `os_cb_template.c`.
 
-and then parks the core, exactly as a failed `OS_ASSERT` does — there is no
+and then parks the core, exactly as a failed `OS_ASSERT` does - there is no
 attempt to continue, because memory outside the task has already been written
 and there is no way to know whose. The callback runs inside PendSV with
 interrupts masked, so it must not call kernel APIs; write to a UART directly or
@@ -656,7 +662,7 @@ switch.
 
 Worth knowing which cores need it: **ARMv8-M mainline** (M33, M35P, M52, M55,
 M85) already traps this in hardware through a per-task `PSPLIM`, whatever this
-option is set to. Every other supported core — M0, M0+, M23, M3, M4, M7 — has no
+option is set to. Every other supported core - M0, M0+, M23, M3, M4, M7 - has no
 stack-limit register, and this software check is the only detection available
 there.
 
@@ -791,8 +797,9 @@ template is deliberately absent from the CMakeLists), and adapt:
 
 - `os_assert_failed_cb` reports a failed assertion. **Required** when
   `OS_CONFIG_ASSERT_ENABLE` is 1, see [Debugging](#debugging).
-- `os_log_output_cb` transmits finished log bytes. Optional: the weak default
-  discards them, so logging costs nothing until a transport is provided.
+- `os_log_output_cb` transmits finished log bytes. **Required** when
+  `OS_CONFIG_LOG_ENABLE` is 1: a log with nowhere to go is a link error rather
+  than silence.
 - `os_tickless_pre_sleep_cb` and `os_tickless_post_sleep_cb` bracket the sleep.
 - `os_arch_tz_context_save_cb` and `os_arch_tz_context_restore_cb` handle
   TrustZone secure-context banking, for non-secure kernels only.
@@ -860,9 +867,11 @@ chosen mode.
   void os_arch_tz_context_restore_cb(uint32_t task_id);  /* after selection, incoming task   */
   ```
 
-  A `task_id` of 0 is the idle task, which never owns a secure context. Tasks
-  that never call secure functions need no handling at all, since the weak
-  defaults do nothing.
+  A `task_id` of 0 is the idle task, which never owns a secure context. Both are
+  REQUIRED in this mode - the kernel ships no defaults, so a missing one is a
+  link error rather than tasks switching with their secure state left behind. A
+  task that never calls secure functions still reaches the callback; it is the
+  application's place to return immediately for those ids.
 
 ### Multi-core (experimental)
 
@@ -877,8 +886,8 @@ task may run:
   core the new mask excludes is asked to reschedule, either locally or by IPI.
 - When a task becomes ready, through a wake or a start, the kernel preempts
   locally if the task's affinity allows this core. Otherwise it nudges the first
-  core in the mask through `os_arch_core_ipi_request_cb`, whose weak default
-  does nothing, in which case that core picks the task up at its own next tick.
+  core in the mask through `os_arch_core_ipi_request_cb`, which the SoC layer
+  must supply - without an IPI a woken task waits for that core's next tick.
 - Core 0 boots the kernel as usual with `os_init` and `os_start`. Each secondary
   core is booted by the SoC layer, with a vector table pointing at the kernel's
   SVC, PendSV, and SysTick handlers, then calls `os_core_start()`. That
@@ -895,8 +904,9 @@ task may run:
   multi-core SoCs such as the RP2040 must provide `os_arch_spinlock_acquire_cb`
   and `os_arch_spinlock_release_cb` backed by hardware spinlocks. A missing
   implementation fails at link time by design.
-- The SoC layer supplies `os_arch_core_id_get_cb()`, whose weak default returns
-  0, since Cortex-M has no architectural core-id register.
+- The SoC layer supplies `os_arch_core_id_get_cb()`, since Cortex-M has no
+  architectural core-id register. It has no default: every core reporting 0
+  would leave them sharing one current-task slot.
 
 There is one constraint worth knowing: a task currently executing on another
 core cannot be paused or deleted from this one, and the call returns
@@ -1056,8 +1066,8 @@ a different class of bug:
 
 | Tier | What it does |
 |---|---|
-| **Multi-primitive soak** | `test_stress_soak` — 4 tasks at distinct priorities hit a mutex, an under-provisioned semaphore and queue, an event and the heap *simultaneously* for many iterations, then check hard invariants (exact mutex-protected counter, exact token reconciliation, no leak, no corruption) |
-| **Create/destroy churn** | `test_stress_task_churn`, `test_stress_timer_churn` — one create/run/exit or init/start/stop path cycled 500 times, to shake out slot-reuse and list-corruption bugs |
+| **Multi-primitive soak** | `test_stress_soak` - 4 tasks at distinct priorities hit a mutex, an under-provisioned semaphore and queue, an event and the heap *simultaneously* for many iterations, then check hard invariants (exact mutex-protected counter, exact token reconciliation, no leak, no corruption) |
+| **Create/destroy churn** | `test_stress_task_churn`, `test_stress_timer_churn` - one create/run/exit or init/start/stop path cycled 500 times, to shake out slot-reuse and list-corruption bugs |
 | **Per-subsystem stress** | Nine tests, one subsystem each, at high volume with exact accounting (below) |
 
 The per-subsystem tier:
@@ -1065,14 +1075,14 @@ The per-subsystem tier:
 | Test | Invariant it enforces |
 |---|---|
 | `test_stress_queue_dynamic_churn` | 200 `os_queue_init_dynamic`/use/`os_queue_cleanup` cycles, geometry varying each time, leak nothing and corrupt no payload |
-| `test_stress_queue_dynamic_concurrent` | 3 producers × 32 items through a heap-allocated queue of capacity 2; every `(producer, sequence)` pair arrives exactly once — a lost send-waiter wakeup is a missing bit, a double delivery an already-set one |
+| `test_stress_queue_dynamic_concurrent` | 3 producers x 32 items through a heap-allocated queue of capacity 2; every `(producer, sequence)` pair arrives exactly once - a lost send-waiter wakeup is a missing bit, a double delivery an already-set one |
 | `test_stress_heap_fragmentation` | Freeing a block never disturbs a live neighbour; adjacent holes really coalesce; the heap recovers byte-exactly after being driven to exhaustion |
-| `test_stress_semaphore_pingpong` | 1000 round trips (2000 blocking handoffs) through two empty binary semaphores, so every take blocks and every give wakes a waiter — no token is ever already available to mask a lost wakeup |
+| `test_stress_semaphore_pingpong` | 1000 round trips (2000 blocking handoffs) through two empty binary semaphores, so every take blocks and every give wakes a waiter - no token is ever already available to mask a lost wakeup |
 | `test_stress_notify_storm` | 1000 notifications to a higher-priority waiter that consumes each before the next is written, so exact 1:1 accounting is meaningful for a last-write-wins mailbox |
-| `test_stress_event_bit_storm` | 4 tasks × 250 iterations of set/wait/clear-on-exit on their own bit of one group; all bits must end clear |
+| `test_stress_event_bit_storm` | 4 tasks x 250 iterations of set/wait/clear-on-exit on their own bit of one group; all bits must end clear |
 | `test_stress_work_flood` | Registry oversubscribed 2:1, half the accepted items cancelled; executed + cancelled + refused must reconcile exactly, then 20 more churn rounds |
 | `test_stress_timer_flood` | Every timer slot armed periodically at once, each at its own period; one past capacity refused with `FULL`; a stopped timer never fires again |
-| `test_stress_mutex_convoy` | 4 tasks × 200 acquisitions on one mutex, yielding *inside* the section — exclusivity checked from within, exact total from without, and no task starved |
+| `test_stress_mutex_convoy` | 4 tasks x 200 acquisitions on one mutex, yielding *inside* the section - exclusivity checked from within, exact total from without, and no task starved |
 
 Every count is exact rather than approximate, deliberately: a check that only
 asserts "roughly the right number of things happened" cannot tell a dropped
@@ -1086,8 +1096,8 @@ its PASS/FAIL messages. It is therefore compiled in whenever the build is
 optimized at all (`__OPTIMIZE__`, i.e. any `-O` above `-O0`) and skipped
 otherwise, with a run-time `[SKIP]` line naming the reason. That key is the
 optimization level rather than a hand-set switch because that is what actually
-decides whether it fits — an unoptimized build of a 128 KB part may well have no
-room — and because stress timings at `-O0` say little about shipped firmware
+decides whether it fits - an unoptimized build of a 128 KB part may well have no
+room - and because stress timings at `-O0` say little about shipped firmware
 anyway. Define `OS_TEST_STRESS_EXTENDED` to override in either direction.
 
 ### Examples
@@ -1100,9 +1110,10 @@ HAL headers.
 | Example | Demonstrates |
 |---|---|
 | `os_main_hello.c` | The minimal application: `os_main()`, `os_delay_ms`, `printf` |
-| `os_main_task.c` | Task lifecycle: create, start, pause, resume, delete |
+| `os_main_task.c` | Task lifecycle: create, start, pause, resume, delete; `os_task_priority_get/set`; `OS_TASK_ATTR_DEFINE` |
 | `os_main_delay.c` | `os_delay_ms`, `os_delay_us`, `os_delay_s` |
 | `os_main_critical.c` | Critical sections protecting a shared counter |
+| `os_main_kernel_lock.c` | Deferring preemption with `os_kernel_lock` while interrupts keep running |
 | `os_main_mutex.c` | Mutual exclusion with `os_mutex_*` |
 | `os_main_semaphore.c` | Counting semaphore, producer and consumer |
 | `os_main_queue.c` | Message queue, producer and consumer, both static (`OS_QUEUE_DEFINE_STATIC`) and dynamic (`os_queue_init_dynamic`) storage |
@@ -1158,10 +1169,10 @@ so copy any of them over the project's `os_main.c` to see it run.
   that always apply (tick rate, task table, default task, interrupt mask);
   **PART 2** one section per optional feature, each holding its `_ENABLE` switch
   next to the sizing that switch controls, so turning a feature off shows
-  exactly which values stop mattering — `OS_CONFIG_MAX_TIMERS` and
+  exactly which values stop mattering - `OS_CONFIG_MAX_TIMERS` and
   `OS_CONFIG_TIMER_STACK_SIZE` sit under the timer switch, the log sizing under
   `OS_CONFIG_LOG_ENABLE`, and so on; **PART 3** the platform properties
-  (TrustZone, core count, tickless). The option *set* is fixed regardless — the
+  (TrustZone, core count, tickless). The option *set* is fixed regardless - the
   kernel still rejects an `os_config.h` that is missing any of them.
 - `os_cb_template.c` is the template for the application-side callbacks, and is
   deliberately not compiled into the kernel. See [Application
@@ -1202,9 +1213,10 @@ All filenames are `os_`-prefixed:
 - `os_mutex.c`, `os_semaphore.c`, `os_queue.c`, and `os_event.c` are the sync
   and IPC primitives with `timeout_ms` waits.
 - `os_timer.c` holds the software timers. Expiry is detected by the tick and
-  callbacks run on the kernel timer task `tsk_timer` at the highest priority.
+  callbacks run on the kernel timer task `tsk_timer`, at
+  `OS_CONFIG_TIMER_PRIORITY`.
 - `os_work.c` is the deferrable work queue in the style of Zephyr. Items run on
-  the kernel work task `tsk_work`, also at the highest priority.
+  the kernel work task `tsk_work`, at `OS_CONFIG_WORK_PRIORITY`.
 - `os_list.c` is the intrusive doubly-linked list. It is always compiled, since
   the scheduler itself runs on it and it cannot be configured out, and it is
   also public API.

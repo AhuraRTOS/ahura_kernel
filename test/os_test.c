@@ -195,8 +195,8 @@ static __IO uint32_t os_test_work_run_count = 0U;
 #endif
 
 #if (OS_CONFIG_LOG_ENABLE == 1U)
-/* Capture buffer for test_log(): this file defines os_log_output_cb, overriding the kernel's
- * weak default, so the log task hands its bytes here instead of to a UART. Kept small on
+/* Capture buffer for test_log(): this file supplies os_log_output_cb - the kernel declares it and
+ * defines nothing - so the log task hands its bytes here instead of to a UART. Kept small on
  * purpose - only the most recent output needs inspecting. */
 /* Must hold everything a single drain can deliver after the capture is cleared: a full ring, plus
  * the dropped-lines notice tsk_log emits once that ring empties.
@@ -1051,7 +1051,7 @@ static void test_sched_lock_entry(void *context)
 
 /******************************************************************************************************/
 /**
- * @brief os_scheduler_lock() defers preemption without masking interrupts.
+ * @brief os_kernel_lock() defers preemption without masking interrupts.
  *
  * The claim under test is not "nothing ran" - a critical section would give that too - but that
  * nothing ran WHILE INTERRUPTS STAYED LIVE. The locked window is 200 us of real wall time
@@ -1074,7 +1074,7 @@ static void test_scheduler_lock(void)
 
     test_print_section("Scheduler Lock");
 
-    AHURA_TEST_CHECK(!os_scheduler_is_locked(), "the scheduler starts out unlocked");
+    AHURA_TEST_CHECK(!os_kernel_is_locked(), "the scheduler starts out unlocked");
 
     os_test_sched_lock_ran = false;
 
@@ -1087,9 +1087,9 @@ static void test_scheduler_lock(void)
     AHURA_TEST_CHECK(status == OS_STATUS_OK, "higher-priority task created (priority %u)",
                       (unsigned)TEST_PRIO_HIGH);
 
-    os_scheduler_lock();
+    os_kernel_lock();
 
-    locked_flag = os_scheduler_is_locked();
+    locked_flag = os_kernel_is_locked();
     (void)os_task_start(&helper);
     os_delay_us(200U);
     ran_while_locked = os_test_sched_lock_ran;
@@ -1097,15 +1097,15 @@ static void test_scheduler_lock(void)
     take_status = os_semaphore_take(&os_test_sched_lock_sem, 10U);
 #endif
 
-    os_scheduler_unlock();
+    os_kernel_unlock();
 
     /* The unlock issues the switch it deferred, and the task that outranks this one takes the CPU
      * before the next line runs - so by here it has already finished. */
-    AHURA_TEST_CHECK(locked_flag, "os_scheduler_is_locked() reports the lock while held");
+    AHURA_TEST_CHECK(locked_flag, "os_kernel_is_locked() reports the lock while held");
     AHURA_TEST_CHECK(!ran_while_locked,
                       "higher-priority task held back for 200 us of live-interrupt time");
-    AHURA_TEST_CHECK(os_test_sched_lock_ran, "os_scheduler_unlock() took the deferred switch at once");
-    AHURA_TEST_CHECK(!os_scheduler_is_locked(), "os_scheduler_unlock() released the lock");
+    AHURA_TEST_CHECK(os_test_sched_lock_ran, "os_kernel_unlock() took the deferred switch at once");
+    AHURA_TEST_CHECK(!os_kernel_is_locked(), "os_kernel_unlock() released the lock");
     AHURA_TEST_CHECK(test_wait_inactive(&helper, 200U), "the higher-priority task ran to completion");
 
 #if (OS_CONFIG_SEMAPHORE_ENABLE == 1U)
@@ -1118,20 +1118,20 @@ static void test_scheduler_lock(void)
 #endif
 
     /* Nesting: only the outermost unlock reopens the scheduler. */
-    os_scheduler_lock();
-    os_scheduler_lock();
-    os_scheduler_unlock();
-    locked_flag = os_scheduler_is_locked();
-    os_scheduler_unlock();
+    os_kernel_lock();
+    os_kernel_lock();
+    os_kernel_unlock();
+    locked_flag = os_kernel_is_locked();
+    os_kernel_unlock();
 
     AHURA_TEST_CHECK(locked_flag, "a nested unlock leaves the scheduler locked");
-    AHURA_TEST_CHECK(!os_scheduler_is_locked(), "the outermost unlock releases it");
+    AHURA_TEST_CHECK(!os_kernel_is_locked(), "the outermost unlock releases it");
 
     /* Self-suspension needs the switch the lock is holding back, so it is refused rather than
      * leaving this task running while the kernel marks it SUSPENDED. */
-    os_scheduler_lock();
+    os_kernel_lock();
     status = os_task_pause(NULL);
-    os_scheduler_unlock();
+    os_kernel_unlock();
 
     AHURA_TEST_CHECK(status == OS_STATUS_BUSY, "os_task_pause(self) is refused under the lock (status=%d)",
                       (int)status);
@@ -1788,23 +1788,30 @@ static void test_timer(void)
 */
 
 #if (OS_CONFIG_WORK_ENABLE == 1U)
-/* Payload copy check: a struct wide enough that a byte-aligned copy or a short memcpy shows up. */
-typedef struct
-{
-    uint32_t tag;
-    char     text[8];
-
-} test_work_payload_t;
+/* Payload copy check, sized to whatever the build allows so it exercises the largest submission
+ * the configuration accepts, whatever that is. Every byte differs from its neighbours, so a short
+ * memcpy, an off-by-one or a byte-swapped copy all show up rather than cancelling out. */
+#define TEST_WORK_PAYLOAD_BYTES  ((OS_CONFIG_WORK_PAYLOAD_SIZE > 0U) ? OS_CONFIG_WORK_PAYLOAD_SIZE : 1U)
+#define TEST_WORK_PAYLOAD_BYTE(i)  ((uint8_t)(0xA5U ^ (uint8_t)(i)))
 
 static __IO bool os_test_work_payload_ok = false;
 
 /******************************************************************************************************/
 static void test_work_payload_handler(void *data, size_t len)
 {
-    const test_work_payload_t *received = (const test_work_payload_t *)data;
+    const uint8_t *received = (const uint8_t *)data;
+    bool          ok        = (data != NULL) && (len == OS_CONFIG_WORK_PAYLOAD_SIZE);
+    size_t        index;
 
-    os_test_work_payload_ok = (data != NULL) && (len == sizeof(test_work_payload_t)) &&
-                        (received->tag == 0xA5A5A5A5UL) && (received->text[0] == 'c');
+    for (index = 0U; ok && (index < len); index++)
+    {
+        if (received[index] != TEST_WORK_PAYLOAD_BYTE(index))
+        {
+            ok = false;
+        }
+    }
+
+    os_test_work_payload_ok = ok;
 }
 
 /******************************************************************************************************/
@@ -1851,17 +1858,30 @@ static void test_work(void)
     AHURA_TEST_CHECK(os_work_submit(work_handler, "x", OS_CONFIG_WORK_PAYLOAD_SIZE + 1U, 0U) == OS_STATUS_INVALID_ARG,
                       "a payload past OS_CONFIG_WORK_PAYLOAD_SIZE is refused, not truncated");
 
-    /* The payload is copied, so a buffer that dies before the handler runs is still fine. */
+    /* The payload is copied, so a buffer that dies before the handler runs is still fine. Sized to
+     * the configured maximum, so this is also the widest copy the build can be asked for. */
     os_test_work_payload_ok = false;
     {
-        test_work_payload_t local = { 0xA5A5A5A5UL, "copied" };
+        uint8_t local[TEST_WORK_PAYLOAD_BYTES];
+        size_t  index;
 
-        (void)os_work_submit(test_work_payload_handler, &local, sizeof(local), 40U);
-        local.tag = 0xDEADBEEFUL;   /* clobbered after submit: the copy must be unaffected */
+        for (index = 0U; index < OS_CONFIG_WORK_PAYLOAD_SIZE; index++)
+        {
+            local[index] = TEST_WORK_PAYLOAD_BYTE(index);
+        }
+
+        (void)os_work_submit(test_work_payload_handler, local, OS_CONFIG_WORK_PAYLOAD_SIZE, 40U);
+
+        /* Clobbered after submit: the copy the kernel took must be unaffected. */
+        for (index = 0U; index < OS_CONFIG_WORK_PAYLOAD_SIZE; index++)
+        {
+            local[index] = 0xFFU;
+        }
     }
     os_delay_ms(100U);
     AHURA_TEST_CHECK(os_test_work_payload_ok,
-                      "the payload reached the handler intact from a buffer already out of scope");
+                      "all %u payload bytes reached the handler intact from a buffer already out of scope",
+                      (unsigned)OS_CONFIG_WORK_PAYLOAD_SIZE);
 
     /* Every slot filled, so the next submission has nowhere to go. Long delays keep them all
      * occupied while the registry is probed, then the wait lets them drain. */
@@ -4760,7 +4780,7 @@ static void test_unsupported_features(void)
  * ***********************************************************************************************************
  *
  * What these share is a method rather than a subsystem: each needs an interleaving the scheduler
- * would not normally produce, and os_scheduler_lock is what makes those reachable on target - it
+ * would not normally produce, and os_kernel_lock is what makes those reachable on target - it
  * holds a woken task in READY, with the tick and every interrupt still running, for as long as
  * the test needs. Messages are kept short here: this suite is already close to the flash limit.
 */
@@ -4821,6 +4841,146 @@ static void test_reg_timer_cb(void *context)
 
 /******************************************************************************************************/
 /**
+ * @brief Helper for the priority test: records that it ran, then returns. Deliberately has no
+ *        loop - a spinning helper raised above the suite's own task would never hand the CPU
+ *        back, whatever it yielded.
+ */
+static __IO uint32_t os_test_prio_ran = 0U;
+
+static void test_prio_entry(void *context)
+{
+    (void)context;
+    os_test_prio_ran++;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief The public priority API: read back what was set, refuse what is out of range, and take
+ *        effect immediately.
+ */
+static void test_priority_api(void)
+{
+    os_task_priority_t priority = OS_TASK_PRIO_1;
+    os_status          status;
+
+    test_print_section("Task Priority (get / set)");
+
+    status = os_task_create(&worker, OS_TASK_CONFIG(test_worker_entry, NULL, OS_TASK_PRIO_2));
+    AHURA_TEST_CHECK(status == OS_STATUS_OK, "worker created at priority 2");
+
+    AHURA_TEST_CHECK(os_task_priority_get(&worker, &priority) == OS_STATUS_OK, "priority read back");
+    AHURA_TEST_CHECK(priority == OS_TASK_PRIO_2, "it reports what creation asked for (%u)",
+                      (unsigned)priority);
+
+    AHURA_TEST_CHECK(os_task_priority_set(&worker, OS_TASK_PRIO_5) == OS_STATUS_OK, "priority raised to 5");
+    (void)os_task_priority_get(&worker, &priority);
+    AHURA_TEST_CHECK(priority == OS_TASK_PRIO_5, "the new priority is what comes back (%u)",
+                      (unsigned)priority);
+
+    /* The suite's own task must still be able to read and restore its own priority. */
+    AHURA_TEST_CHECK(os_task_priority_get(NULL, &priority) == OS_STATUS_OK,
+                      "NULL means the calling task");
+    AHURA_TEST_CHECK(priority == (os_task_priority_t)OS_CONFIG_TEST_PRIORITY,
+                      "and reports the suite's own configured priority (%u)", (unsigned)priority);
+
+    /* Levels outside the user range belong to the idle task and the kernel's service tasks. */
+    AHURA_TEST_CHECK(os_task_priority_set(&worker, (os_task_priority_t)0U) == OS_STATUS_INVALID_ARG,
+                      "priority 0 (idle) is refused");
+    AHURA_TEST_CHECK(os_task_priority_set(&worker, OS_TASK_PRIO_MAX) == OS_STATUS_INVALID_ARG,
+                      "OS_TASK_PRIO_MAX (kernel service level) is refused");
+    AHURA_TEST_CHECK(os_task_priority_get(&worker, NULL) == OS_STATUS_INVALID_ARG,
+                      "a NULL output pointer is refused");
+
+    /* A refused set must not have changed anything. */
+    (void)os_task_priority_get(&worker, &priority);
+    AHURA_TEST_CHECK(priority == OS_TASK_PRIO_5, "a refused set left the priority alone (%u)",
+                      (unsigned)priority);
+
+    (void)os_task_delete(&worker);
+
+    {
+        os_task_t stale = { 0 };
+
+        AHURA_TEST_CHECK(os_task_priority_get(&stale, &priority) == OS_STATUS_INVALID_ARG,
+                          "an unknown handle is refused by get");
+        AHURA_TEST_CHECK(os_task_priority_set(&stale, OS_TASK_PRIO_3) == OS_STATUS_INVALID_ARG,
+                          "an unknown handle is refused by set");
+    }
+
+    /* A change takes effect at once, not at the next dispatch. The helper runs to completion and
+     * exits on its own, so it can be raised above this task without being able to starve it. */
+    os_test_prio_ran = 0U;
+    (void)os_task_create(&worker, OS_TASK_CONFIG(test_prio_entry, NULL, TEST_PRIO_LOW));
+    (void)os_task_start(&worker);
+
+    AHURA_TEST_CHECK(os_test_prio_ran == 0U, "a task below this one stays ready without running");
+
+    (void)os_task_priority_set(&worker, (os_task_priority_t)TEST_PRIO_HIGH);
+
+    /* No delay here on purpose: had the switch waited for the next tick, this would still read 0. */
+    AHURA_TEST_CHECK(os_test_prio_ran == 1U,
+                      "raising it above this task ran it before the next line (ran=%lu)",
+                      (unsigned long)os_test_prio_ran);
+
+    (void)test_wait_inactive(&worker, 300U);
+}
+
+#if (OS_CONFIG_QUEUE_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Queue occupancy accounting: count and free must always agree with the capacity.
+ */
+static void test_queue_accounting(void)
+{
+    const size_t capacity = sizeof(os_test_queue_buf) / sizeof(os_test_queue_buf[0]);
+    uint32_t     item     = 0U;
+    size_t       sent     = 0U;
+    bool         held     = true;
+
+    test_print_section("Queue Accounting (count / free)");
+
+    (void)os_queue_cleanup(&os_test_queue);   /* empties it; the array is not the queue's to free */
+
+    AHURA_TEST_CHECK(os_queue_count_get(&os_test_queue) == 0U, "an emptied queue holds nothing");
+    AHURA_TEST_CHECK(os_queue_free_get(&os_test_queue) == capacity,
+                      "and reports its whole capacity free (%lu)", (unsigned long)capacity);
+
+    while (os_queue_send(&os_test_queue, &item, OS_WAIT_NOTHING) == OS_STATUS_OK)
+    {
+        item++;
+        sent++;
+
+        if ((os_queue_count_get(&os_test_queue) + os_queue_free_get(&os_test_queue)) != capacity)
+        {
+            held = false;
+        }
+    }
+
+    AHURA_TEST_CHECK(held, "count + free equalled capacity after every send");
+
+    AHURA_TEST_CHECK(sent == capacity, "it accepted exactly capacity items (%lu)", (unsigned long)sent);
+    AHURA_TEST_CHECK(os_queue_free_get(&os_test_queue) == 0U, "a full queue reports no free slots");
+    AHURA_TEST_CHECK(os_queue_count_get(&os_test_queue) == capacity, "and a count of capacity");
+
+    held = true;
+    while (os_queue_receive(&os_test_queue, &item, OS_WAIT_NOTHING) == OS_STATUS_OK)
+    {
+        if ((os_queue_count_get(&os_test_queue) + os_queue_free_get(&os_test_queue)) != capacity)
+        {
+            held = false;
+        }
+    }
+
+    AHURA_TEST_CHECK(held, "count + free equalled capacity after every receive");
+
+    AHURA_TEST_CHECK(os_queue_count_get(&os_test_queue) == 0U, "the drained queue holds nothing");
+    AHURA_TEST_CHECK(os_queue_free_get(&os_test_queue) == capacity, "and is all free again");
+}
+
+#endif /* OS_CONFIG_QUEUE_ENABLE */
+
+/******************************************************************************************************/
+/**
  * @brief Regression checks: tick saturation, wake handoff on pause, priority-boost re-ordering,
  *        timer restart with an undrained expiry, and timer registry slot release.
  */
@@ -4847,10 +5007,10 @@ static void test_regressions(void)
 
         /* The window: give() wakes the first waiter, the lock stops it running, and the pause
          * removes it before it can consume the token. */
-        os_scheduler_lock();
+        os_kernel_lock();
         (void)os_semaphore_give(&os_test_reg_sem);
         (void)os_task_pause(&helper);
-        os_scheduler_unlock();
+        os_kernel_unlock();
 
         os_delay_ms(40U);
         AHURA_TEST_CHECK(os_test_reg_b_st == OS_STATUS_OK, "paused task's wake passed to the next waiter");
@@ -4861,8 +5021,11 @@ static void test_regressions(void)
     }
 
 #if (OS_CONFIG_MUTEX_ENABLE == 1U)
-#if ((OS_CONFIG_TEST_PRIORITY + 2U) <= OS_TASK_PRIO_USER_MAX)
-    /* A boost must re-sort a task already queued on some OTHER object. */
+    /* A boost must re-sort a task already queued on some OTHER object.
+     *
+     * The three levels are fixed rather than derived from OS_CONFIG_TEST_PRIORITY: only their
+     * order matters, and the bottom three user levels exist in every build, so this runs whatever
+     * the suite itself is configured to run at. */
     {
         os_test_reg_order   = 0U;
         os_test_reg_a_order = 0U;
@@ -4872,18 +5035,17 @@ static void test_regressions(void)
         (void)os_semaphore_init(&os_test_reg_sem, 0U, 2U);
         (void)os_mutex_init(&os_test_reg_mutex);
 
-        (void)os_task_create(&helper, OS_TASK_CONFIG(test_reg_boosted_entry, NULL, TEST_PRIO_LOW));
+        (void)os_task_create(&helper, OS_TASK_CONFIG(test_reg_boosted_entry, NULL, OS_TASK_PRIO_1));
         (void)os_task_start(&helper);
         os_delay_ms(20U);   /* holds the mutex, now queued on the semaphore */
 
         /* Higher priority, so the waiter list puts it AHEAD of the low-priority holder. */
-        (void)os_task_create(&helper2, OS_TASK_CONFIG(test_reg_waiter_b, NULL, TEST_PRIO_HIGH));
+        (void)os_task_create(&helper2, OS_TASK_CONFIG(test_reg_waiter_b, NULL, OS_TASK_PRIO_2));
         (void)os_task_start(&helper2);
         os_delay_ms(20U);
 
         /* Contending the mutex boosts its owner above that waiter. */
-        (void)os_task_create(&helper3,
-                             OS_TASK_CONFIG(test_reg_booster_entry, NULL, OS_CONFIG_TEST_PRIORITY + 2U));
+        (void)os_task_create(&helper3, OS_TASK_CONFIG(test_reg_booster_entry, NULL, OS_TASK_PRIO_3));
         (void)os_task_start(&helper3);
         os_delay_ms(20U);
 
@@ -4897,7 +5059,6 @@ static void test_regressions(void)
         AHURA_TEST_CHECK(test_wait_inactive(&helper, 500U) && test_wait_inactive(&helper2, 500U) &&
                           test_wait_inactive(&helper3, 500U), "all three helpers finished");
     }
-#endif
 #endif /* OS_CONFIG_MUTEX_ENABLE */
 #endif /* OS_CONFIG_SEMAPHORE_ENABLE */
 
@@ -4911,10 +5072,10 @@ static void test_regressions(void)
 
         /* The lock keeps the timer service task off the CPU while the tick keeps running, so the
          * expiry is flagged and left undrained - the state a restart used to inherit. */
-        os_scheduler_lock();
+        os_kernel_lock();
         os_delay_ms(45U);   /* busy-waits under the lock; ticks still arrive */
         (void)os_timer_restart(&os_test_timer_oneshot);
-        os_scheduler_unlock();
+        os_kernel_unlock();
 
         os_delay_ms(15U);
         AHURA_TEST_CHECK(os_test_oneshot_fired == 0U, "restart dropped the undrained expiry");
@@ -5077,6 +5238,10 @@ void os_test(void)
     test_tickless_hooks();
     test_tickless_sleep();
     test_list();
+    test_priority_api();
+#if (OS_CONFIG_QUEUE_ENABLE == 1U)
+    test_queue_accounting();
+#endif
     test_regressions();
     test_unsupported_features();
 

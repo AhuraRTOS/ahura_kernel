@@ -136,6 +136,10 @@ void os_log_output_cb(const uint8_t *data, size_t length)
  * @brief Bank the secure-side context (secure stack / PSP_S) of the task being switched out.
  *        task_id 0 is the idle task (never owns a secure context). Typically calls a secure
  *        gateway (cmse_nonsecure_entry) provided by the secure firmware.
+ *
+ * REQUIRED while OS_CONFIG_TRUSTZONE is OS_CONFIG_TRUSTZONE_NON_SECURE: the kernel ships no
+ * default, so leaving this out is a link error rather than tasks switching with their secure
+ * state left behind.
  */
 void os_arch_tz_context_save_cb(uint32_t task_id)
 {
@@ -189,7 +193,7 @@ void os_arch_core_ipi_request_cb(uint32_t core_id)
 /******************************************************************************************************/
 /**
  * @brief Kernel spinlock backing when the built-in LDREX/STREX backend is unavailable or
- *        opted out of. MANDATORY then — route to the SoC's hardware spinlocks (e.g. RP2040
+ *        opted out of. MANDATORY then: route to the SoC's hardware spinlocks (e.g. RP2040
  *        SIO); the kernel deliberately ships no default, so leaving these out fails at
  *        link time.
  */

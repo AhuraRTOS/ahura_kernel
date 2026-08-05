@@ -1,6 +1,7 @@
 /**
  * @file os_work.c
- * @brief Deferrable work queue: items run on a kernel task at the highest priority.
+ * @brief Deferrable work queue: items run on a kernel task at OS_CONFIG_WORK_PRIORITY (the
+ *        highest priority by default).
  *
  * @copyright (c) 2026 Ahura Project Contributors
  *            SPDX-License-Identifier: MIT
@@ -18,6 +19,12 @@
 #include <string.h>
 
 #if (OS_CONFIG_WORK_ENABLE == 1U)
+
+/* See os_timer.c: checked with _Static_assert because an os_task_priority_t name is an enum
+ * constant, which the preprocessor would read as 0. */
+_Static_assert((OS_CONFIG_WORK_PRIORITY >= OS_TASK_PRIO_USER_MIN) &&
+               (OS_CONFIG_WORK_PRIORITY <= OS_TASK_PRIO_MAX),
+               "OS_CONFIG_WORK_PRIORITY must be OS_TASK_PRIO_USER_MIN..OS_TASK_PRIO_MAX");
 
 #if (OS_CONFIG_WORK_PAYLOAD_SIZE < 1U)
 #error "OS_CONFIG_WORK_PAYLOAD_SIZE must be at least 1; the work registry sizes its payload copy from it."
@@ -89,8 +96,9 @@ static uint32_t   os_work_registry_slot_free(void);
 /**
  * @brief Submit a function to run after delay_ms on the kernel work task.
  *
- * ISR-safe. delay_ms == 0 makes the call ready immediately; because the work task runs at the
- * highest priority, it preempts any user task as soon as the scheduler is invoked.
+ * ISR-safe. delay_ms == 0 makes the call ready immediately; at the default
+ * OS_CONFIG_WORK_PRIORITY the work task then preempts any user task as soon as the scheduler is
+ * invoked - lower that priority and it waits its turn like anything else.
  *
  * The handler AND the payload are copied into a free slot, so a local buffer may go out of scope
  * the moment this returns. Each submission is independent and none can be cancelled afterwards.
@@ -168,7 +176,7 @@ os_status os_work_system_init(void)
     {
         os_work_task_entry,
         NULL,
-        OS_TASK_PRIO_MAX,
+        OS_CONFIG_WORK_PRIORITY,
         OS_CONFIG_WORK_CORE_AFFINITY
     };
 

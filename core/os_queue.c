@@ -23,59 +23,14 @@
 
 /*
  * ***********************************************************************************************************
- * Private function implementations
+ * Private function prototypes
  * ***********************************************************************************************************
 */
 
-/******************************************************************************************************/
-/**
- * @brief Bind a queue to an item buffer at run time.
- *
- * Not public, deliberately: the compile-time macros read item size and capacity off the array, so
- * an API taking them again would only be a chance for the two to disagree. That leaves one genuine
- * run-time case - a buffer the heap hands over - so os_queue_init_dynamic is the only caller, and
- * keeping it separate writes a queue's initial field set in exactly one place.
- *
- * @param[in,out] queue      Queue object to initialize.
- * @param[in]     buffer     Backing storage buffer.
- * @param[in]     item_size  Size of one item in bytes.
- * @param[in]     capacity   Number of items buffer can hold.
- * @return os_status    Status code.
- */
-static os_status os_queue_bind_buffer(os_queue_t *queue, void *buffer, size_t item_size, size_t capacity)
-{
-    if ((queue == NULL) || (buffer == NULL) || (item_size == 0U) || (capacity == 0U))
-    {
-        return OS_STATUS_INVALID_ARG;
-    }
-
-    os_critical_enter();
-
-    /* Re-initializing with queued waiters would strand them on dangling
-     * intrusive nodes and corrupt the lists (first-time init must run on
-     * zero-initialized storage - static objects are). */
-    if ((queue->send_waiters.head != NULL) || (queue->receive_waiters.head != NULL))
-    {
-        os_critical_exit();
-        return OS_STATUS_BUSY;
-    }
-
-    queue->buffer       = (uint8_t *)buffer;
-    queue->item_size    = item_size;
-    queue->capacity     = capacity;
-    queue->head         = 0U;
-    queue->tail         = 0U;
-    queue->count        = 0U;
-    queue->buffer_owned = false; /* the caller claims ownership after this, inside its own critical
-                                  * section - see os_queue_init_dynamic */
-    os_list_init(&queue->send_waiters);
-    os_list_init(&queue->receive_waiters);
-
-    os_critical_exit();
-    return OS_STATUS_OK;
-}
+static os_status os_queue_bind_buffer(os_queue_t *queue, void *buffer, size_t item_size, size_t capacity);
 
 #endif /* OS_CONFIG_ALLOC_ENABLE */
+
 
 /*
  * ***********************************************************************************************************
@@ -101,6 +56,9 @@ os_status os_queue_send(os_queue_t *queue, const void *item, uint32_t timeout_ms
     uint32_t budget_ticks;
     uint32_t start_tick;
     uint32_t remaining_ticks;
+
+    OS_ASSERT(queue != NULL);
+    OS_ASSERT(item != NULL);
 
     if ((queue == NULL) || (item == NULL))
     {
@@ -179,6 +137,9 @@ os_status os_queue_receive(os_queue_t *queue, void *item_out, uint32_t timeout_m
     uint32_t start_tick;
     uint32_t remaining_ticks;
 
+    OS_ASSERT(queue != NULL);
+    OS_ASSERT(item_out != NULL);
+
     if ((queue == NULL) || (item_out == NULL))
     {
         return OS_STATUS_INVALID_ARG;
@@ -251,6 +212,8 @@ size_t os_queue_count_get(const os_queue_t *queue)
 {
     size_t count;
 
+    OS_ASSERT(queue != NULL);
+
     if (queue == NULL)
     {
         return 0U;
@@ -274,11 +237,13 @@ size_t os_queue_count_get(const os_queue_t *queue)
  * cannot report OS_STATUS_FULL.
  *
  * @param[in] queue  Queue object.
- * @return size_t    Free item slots; 0 for NULL, and 0 for a dynamic queue with no buffer bound yet.
+ * @return size_t    Free item slots; 0 for a dynamic queue with no buffer bound yet.
  */
 size_t os_queue_free_get(const os_queue_t *queue)
 {
     size_t free_slots;
+
+    OS_ASSERT(queue != NULL);
 
     if (queue == NULL)
     {
@@ -317,6 +282,8 @@ os_status os_queue_init_dynamic(os_queue_t *queue, size_t item_size, size_t capa
     void      *buffer;
     size_t    buffer_size;
     os_status status;
+
+    OS_ASSERT(queue != NULL);
 
     if ((queue == NULL) || (item_size == 0U) || (capacity == 0U))
     {
@@ -444,5 +411,63 @@ os_status os_queue_cleanup(os_queue_t *queue)
 
     return OS_STATUS_OK;
 }
+
+#if (OS_CONFIG_ALLOC_ENABLE == 1U)
+
+/*
+ * ***********************************************************************************************************
+ * Private function implementations
+ * ***********************************************************************************************************
+*/
+
+/******************************************************************************************************/
+/**
+ * @brief Bind a queue to an item buffer at run time.
+ *
+ * Not public, deliberately: the compile-time macros read item size and capacity off the array, so
+ * an API taking them again would only be a chance for the two to disagree. That leaves one genuine
+ * run-time case - a buffer the heap hands over - so os_queue_init_dynamic is the only caller, and
+ * keeping it separate writes a queue's initial field set in exactly one place.
+ *
+ * @param[in,out] queue      Queue object to initialize.
+ * @param[in]     buffer     Backing storage buffer.
+ * @param[in]     item_size  Size of one item in bytes.
+ * @param[in]     capacity   Number of items buffer can hold.
+ * @return os_status    Status code.
+ */
+static os_status os_queue_bind_buffer(os_queue_t *queue, void *buffer, size_t item_size, size_t capacity)
+{
+    if ((queue == NULL) || (buffer == NULL) || (item_size == 0U) || (capacity == 0U))
+    {
+        return OS_STATUS_INVALID_ARG;
+    }
+
+    os_critical_enter();
+
+    /* Re-initializing with queued waiters would strand them on dangling
+     * intrusive nodes and corrupt the lists (first-time init must run on
+     * zero-initialized storage - static objects are). */
+    if ((queue->send_waiters.head != NULL) || (queue->receive_waiters.head != NULL))
+    {
+        os_critical_exit();
+        return OS_STATUS_BUSY;
+    }
+
+    queue->buffer       = (uint8_t *)buffer;
+    queue->item_size    = item_size;
+    queue->capacity     = capacity;
+    queue->head         = 0U;
+    queue->tail         = 0U;
+    queue->count        = 0U;
+    queue->buffer_owned = false; /* the caller claims ownership after this, inside its own critical
+                                  * section - see os_queue_init_dynamic */
+    os_list_init(&queue->send_waiters);
+    os_list_init(&queue->receive_waiters);
+
+    os_critical_exit();
+    return OS_STATUS_OK;
+}
+
+#endif /* OS_CONFIG_ALLOC_ENABLE */
 
 #endif /* OS_CONFIG_QUEUE_ENABLE */
