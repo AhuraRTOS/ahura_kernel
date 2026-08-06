@@ -1967,11 +1967,11 @@ static void os_task_idle_entry(void *context)
  */
 static void os_task_tcb_clear(os_task_tcb_t *tcb)
 {
-    tcb->name        = NULL;
-    tcb->stack_base  = NULL;
-    tcb->stack_ptr   = NULL;
-    tcb->stack_bytes = 0U;
-    tcb->priority    = 0U;
+    tcb->name          = NULL;
+    tcb->stack_base    = NULL;
+    tcb->stack_ptr     = NULL;
+    tcb->stack_bytes   = 0U;
+    tcb->priority      = 0U;
     tcb->id            = 0U;
     tcb->delay_ticks   = 0U;
     tcb->core_affinity = OS_TASK_CORE_ANY;

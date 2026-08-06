@@ -34,6 +34,7 @@ static uint32_t os_test_fail_count = 0U;
         else      { os_test_fail_count++; printf("  [FAIL] " fmt "  (os_test.c:%d)\r\n", ##__VA_ARGS__, __LINE__); } \
     } while (0)
 
+/******************************************************************************************************/
 static void test_print_section(const char *title)
 {
     printf("\r\n--- %s ---\r\n", title);
@@ -1548,6 +1549,7 @@ static void test_queue_define_and_dynamic(void)
     (void)os_queue_receive(&os_test_defined_queue, &got, OS_WAIT_NOTHING);
 }
 
+/******************************************************************************************************/
 static void test_queue(void)
 {
     uint32_t  items[3] = { 0 };
@@ -1956,6 +1958,7 @@ static void test_notify_unrelated_block_entry(void *context)
 /******************************************************************************************************/
 /* Waits with value_out = NULL, then immediately re-checks the mailbox: the delivery must be
  * reported AND consumed, or the second wait would find it still full. */
+/******************************************************************************************************/
 static void test_notify_discard_entry(void *context)
 {
     (void)context;
@@ -4792,6 +4795,7 @@ static __IO uint32_t  os_test_reg_a_order = 0U;
 static __IO os_status os_test_reg_a_st    = OS_STATUS_ERROR;
 static __IO os_status os_test_reg_b_st    = OS_STATUS_ERROR;
 
+/******************************************************************************************************/
 static void test_reg_waiter_b(void *context)
 {
     (void)context;
@@ -4804,6 +4808,7 @@ static os_mutex_t os_test_reg_mutex;
 
 /* Low priority: holds the mutex, then queues on the semaphore behind a higher-priority waiter.
  * The boost it takes while blocked there is what must re-sort it to the head of that queue. */
+/******************************************************************************************************/
 static void test_reg_boosted_entry(void *context)
 {
     (void)context;
@@ -4820,6 +4825,7 @@ static void test_reg_boosted_entry(void *context)
 }
 
 /* Highest priority: contends the mutex purely to trigger the inheritance boost. */
+/******************************************************************************************************/
 static void test_reg_booster_entry(void *context)
 {
     (void)context;
@@ -4833,6 +4839,7 @@ static void test_reg_booster_entry(void *context)
 #endif /* OS_CONFIG_SEMAPHORE_ENABLE */
 
 #if (OS_CONFIG_TIMER_ENABLE == 1U)
+/******************************************************************************************************/
 static void test_reg_timer_cb(void *context)
 {
     (void)context;
@@ -4847,6 +4854,7 @@ static void test_reg_timer_cb(void *context)
  */
 static __IO uint32_t os_test_prio_ran = 0U;
 
+/******************************************************************************************************/
 static void test_prio_entry(void *context)
 {
     (void)context;

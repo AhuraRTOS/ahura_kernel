@@ -192,16 +192,22 @@ void os_arch_core_ipi_request_cb(uint32_t core_id)
 #if (OS_ARCH_SPINLOCK_USE_CB)
 /******************************************************************************************************/
 /**
- * @brief Kernel spinlock backing when the built-in LDREX/STREX backend is unavailable or
- *        opted out of. MANDATORY then: route to the SoC's hardware spinlocks (e.g. RP2040
- *        SIO); the kernel deliberately ships no default, so leaving these out fails at
- *        link time.
+ * @brief Take the kernel spinlock, busy-waiting until it is free. Route it to the SoC's hardware
+ *        spinlocks (e.g. RP2040 SIO). Called with interrupts already masked.
+ *
+ * MANDATORY when the built-in LDREX/STREX backend is unavailable or opted out of: the kernel
+ * ships no default, so leaving it out fails at link time.
  */
 void os_arch_spinlock_acquire_cb(os_arch_spinlock_t *lock)
 {
     (void)lock;
 }
 
+/******************************************************************************************************/
+/**
+ * @brief Release the kernel spinlock taken by os_arch_spinlock_acquire_cb. MANDATORY on the same
+ *        terms.
+ */
 void os_arch_spinlock_release_cb(os_arch_spinlock_t *lock)
 {
     (void)lock;
