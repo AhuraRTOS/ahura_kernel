@@ -475,8 +475,16 @@ static void      test_stress_timer_churn(void);
 #if (OS_CONFIG_LOG_ENABLE == 1U)
 /******************************************************************************************************/
 /**
- * @brief Strong override of the kernel's weak log output hook: captures what tsk_log would have
- *        transmitted so test_log() can inspect it, and echoes it to the console.
+ * @brief The log transport for a self-test build: captures what tsk_log hands over, into a buffer
+ *        the log tests can then search (test_log_capture_contains).
+ *
+ * The suite has to define this itself - there is no way to test the log without seeing what the
+ * kernel actually emitted - which means the APPLICATION must not also define it in a test build,
+ * or the two collide at link time. os_cb_template.c guards its copy with
+ * (OS_CONFIG_TEST_ENABLE == 0U) for exactly this reason; a project whose os_cb.c predates that
+ * guard needs the same condition adding.
+ *
+ * Note this captures only. The suite's own PASS/FAIL report goes to printf, not through here.
  *
  * Runs on tsk_log, outside any critical section, exactly as a real transport would.
  */
@@ -3267,6 +3275,18 @@ static void test_stress_timer_churn(void)
 #endif
 #endif
 
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
+/* Enough timers to fill the registry, plus one more that must therefore be refused.
+ *
+ * Declared out here, ahead of the OS_TEST_STRESS_EXTENDED block below, because BOTH the extended
+ * timer-flood stress test (inside that block, so compiled out in unoptimized builds) and
+ * test_regressions() (which runs in every build) fill the registry with them. Declaring them
+ * inside the block made the whole suite fail to compile at -O0 - precisely the build a board
+ * bring-up uses. */
+static os_timer_t os_test_tflood[OS_CONFIG_MAX_TIMERS];
+static os_timer_t os_test_tflood_extra;
+#endif
+
 #if (OS_TEST_STRESS_EXTENDED == 1U)
 
 /*
@@ -3983,8 +4003,9 @@ static void test_stress_work_flood(void)
 
 #define OS_TEST_TFLOOD_WINDOW 200U
 
-static os_timer_t    os_test_tflood[OS_CONFIG_MAX_TIMERS];
-static os_timer_t    os_test_tflood_extra;
+/* os_test_tflood[] and os_test_tflood_extra are declared further down, outside
+ * this OS_TEST_STRESS_EXTENDED block: test_regressions() fills the timer
+ * registry with them too, and that test always runs. */
 static __IO uint32_t os_test_tflood_fired[OS_CONFIG_MAX_TIMERS];
 
 /******************************************************************************************************/

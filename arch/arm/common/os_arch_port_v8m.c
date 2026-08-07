@@ -27,38 +27,33 @@
 #error "os_arch_port_v8m.c targets ARMv8-M mainline / ARMv8.1-M cores (check -mcpu / -march)."
 #endif
 
+/* Cycle counter used whenever DWT CYCCNT turns out to be unavailable on this
+ * device (see os_arch_cycle_count_get). Textual include, like this file itself. */
+#include "os_arch_cycle_systick.c"
+
 /*
  * ***********************************************************************************************************
  * Macros
  * ***********************************************************************************************************
 */
 
-#define OS_ARCH_REG_SHPR2                    (*(__IO uint32_t *)0xE000ED1CUL)
 #define OS_ARCH_REG_SHPR3                    (*(__IO uint32_t *)0xE000ED20UL)
 #define OS_ARCH_REG_AIRCR                    (*(__IO uint32_t *)0xE000ED0CUL)
 #define OS_ARCH_REG_DEMCR                    (*(__IO uint32_t *)0xE000EDFCUL)
 #define OS_ARCH_REG_DWT_CTRL                 (*(__IO uint32_t *)0xE0001000UL)
 #define OS_ARCH_REG_DWT_CYCCNT               (*(__IO uint32_t *)0xE0001004UL)
 #define OS_ARCH_REG_DWT_LAR                  (*(__IO uint32_t *)0xE0001FB0UL)
-#define OS_ARCH_REG_SYST_CSR                 (*(__IO uint32_t *)0xE000E010UL)
-#define OS_ARCH_REG_SYST_RVR                 (*(__IO uint32_t *)0xE000E014UL)
-#define OS_ARCH_REG_SYST_CVR                 (*(__IO uint32_t *)0xE000E018UL)
 
 #define OS_ARCH_DEMCR_TRCENA_MSK             (1UL << 24)
 #define OS_ARCH_DWT_CTRL_CYCCNTENA_MSK       (1UL << 0)
+#define OS_ARCH_DWT_CTRL_NOCYCCNT_MSK        (1UL << 25)
 #define OS_ARCH_DWT_LAR_UNLOCK_KEY           0xC5ACCE55UL
 
-#define OS_ARCH_SYST_CSR_ENABLE_MSK          (1UL << 0)
-#define OS_ARCH_SYST_CSR_TICKINT_MSK         (1UL << 1)
-#define OS_ARCH_SYST_CSR_CLKSOURCE_MSK       (1UL << 2)
-#define OS_ARCH_SYST_CSR_COUNTFLAG_MSK       (1UL << 16)
-#define OS_ARCH_SYST_RVR_RELOAD_MSK          0x00FFFFFFUL
-
-#define OS_ARCH_SHPR2_SVC_PRI_POS            24U
+/* SVCall's priority field (SHPR2) is deliberately absent: the kernel does not
+ * use SVC, so it has no business changing that exception's priority. */
 #define OS_ARCH_SHPR3_PENDSV_PRI_POS         16U
 #define OS_ARCH_SHPR3_SYSTICK_PRI_POS        24U
 
-#define OS_ARCH_PRIORITY_HIGHEST             0U
 #define OS_ARCH_PRIORITY_LOWEST              255U
 #define OS_ARCH_XPSR_THUMB                   (1UL << 24)
 
@@ -98,9 +93,14 @@ static uint32_t os_arch_sleep_mask_state        = 0U;
 /* Whether os_arch_sleep_mask_state actually holds a mask os_arch_sleep_finish must release. */
 static bool     os_arch_sleep_mask_held         = false;
 
+/* Whether DWT CYCCNT is present and actually counting on this device; decided
+ * once in os_arch_init(). False routes os_arch_cycle_count_get() to the
+ * SysTick-derived counter instead. */
+static bool     os_arch_dwt_available           = false;
+
 /*
  * ***********************************************************************************************************
- * Context switch handlers (SVC starts the first task, PendSV switches tasks)
+ * Context switch handler (PendSV does everything)
  * ***********************************************************************************************************
  *
  * Software-saved frame layout on a task stack (low address first):
@@ -113,6 +113,15 @@ static bool     os_arch_sleep_mask_held         = false;
  * which is mandatory with -mfloat-abi=hard where any task or the startup code
  * may touch the FPU. os_task_stack_select_next() never returns NULL (the idle
  * task always exists), so the restore path needs no fallback.
+ *
+ * PendSV is the ONLY exception this kernel takes over, and the PSP == 0
+ * sentinel is what lets one handler serve both jobs: zero means no task has
+ * run yet, so there is no outgoing context to save and the handler simply
+ * installs the first task (the "first start" path below). Every later entry
+ * finds a real PSP and performs an ordinary switch. See os_arch_port_v7m.c's
+ * equivalent block for why SVC is deliberately left to the application - a
+ * point that matters most on exactly this core, where secure firmware
+ * (TF-M and the like) routinely uses SVC for its own gateway calls.
 */
 
 __asm(
@@ -121,29 +130,12 @@ __asm(
 ".text\n"
 ".align 2\n"
 
-".global SVC_Handler\n"
-".type   SVC_Handler, %function\n"
+".global " OS_ARCH_STRINGIFY(OS_CONFIG_ARCH_PENDSV_HANDLER) "\n"
+".type   " OS_ARCH_STRINGIFY(OS_CONFIG_ARCH_PENDSV_HANDLER) ", %function\n"
 ".thumb_func\n"
-"SVC_Handler:\n"
-"    bl      os_task_stack_select_next\n"  /* r0 = first task stack pointer */
-#if (OS_CONFIG_TRUSTZONE == OS_CONFIG_TRUSTZONE_NON_SECURE)
-"    mov     r4, r0\n"                     /* r4 survives the call (callee-saved) */
-"    bl      os_arch_tz_context_restore\n" /* load the first task's secure context */
-"    mov     r0, r4\n"
-#endif
-"    movw    r1, #0xED08\n"                /* reset MSP to the vector-table initial value; */
-"    movt    r1, #0xE000\n"                /* the boot (main) context is abandoned here    */
-"    ldr     r1, [r1]\n"
-"    ldr     r1, [r1]\n"
-"    msr     msp, r1\n"
-"    b       os_arch_context_restore_asm\n"
-
-".global PendSV_Handler\n"
-".type   PendSV_Handler, %function\n"
-".thumb_func\n"
-"PendSV_Handler:\n"
+OS_ARCH_STRINGIFY(OS_CONFIG_ARCH_PENDSV_HANDLER) ":\n"
 "    mrs     r0, psp\n"
-"    cbz     r0, 1f\n"                     /* no task context yet: nothing to switch */
+"    cbz     r0, 1f\n"                     /* PSP == 0: no task has run yet, go start the first */
 #if defined(__ARM_FP)
 "    tst     lr, #0x10\n"
 "    it      eq\n"
@@ -162,8 +154,20 @@ __asm(
 "    mov     r0, r4\n"
 #endif
 "    b       os_arch_context_restore_asm\n"
-"1:\n"
-"    bx      lr\n"
+
+"1:\n"                                     /* first start: nothing to save */
+"    bl      os_task_stack_select_next\n"  /* r0 = first task stack pointer */
+#if (OS_CONFIG_TRUSTZONE == OS_CONFIG_TRUSTZONE_NON_SECURE)
+"    mov     r4, r0\n"                     /* r4 survives the call (callee-saved) */
+"    bl      os_arch_tz_context_restore\n" /* load the first task's secure context */
+"    mov     r0, r4\n"
+#endif
+"    movw    r1, #0xED08\n"                /* reset MSP to the vector-table initial value; */
+"    movt    r1, #0xE000\n"                /* the boot (main) context is abandoned here,   */
+"    ldr     r1, [r1]\n"                   /* including the frame this exception pushed -  */
+"    ldr     r1, [r1]\n"                   /* the return below unstacks from PSP instead   */
+"    msr     msp, r1\n"
+"    b       os_arch_context_restore_asm\n"
 
 ".global os_arch_context_restore_asm\n"
 ".type   os_arch_context_restore_asm, %function\n"
@@ -183,6 +187,10 @@ __asm(
 "    bx      lr\n"
 );
 
+/* Declared through the configured name so the boot-time vector check compares
+ * against exactly the symbol the vector table is expected to reference. */
+extern void OS_CONFIG_ARCH_PENDSV_HANDLER(void);
+
 /*
  * ***********************************************************************************************************
  * Private function prototypes
@@ -200,6 +208,7 @@ extern uint32_t os_task_current_id_get(void);
 extern uint32_t __StackLimit OS_WEAK;
 extern uint32_t _sstack      OS_WEAK;
 
+static bool     os_arch_dwt_enable(void);
 static void     os_arch_task_exit_trap(void);
 
 /*
@@ -216,34 +225,34 @@ static void     os_arch_task_exit_trap(void);
  */
 void os_arch_init(void)
 {
-    uint32_t shpr2 = OS_ARCH_REG_SHPR2;
     uint32_t shpr3 = OS_ARCH_REG_SHPR3;
 
-    /* PSP == 0 is the sentinel PendSV_Handler uses to recognize "no task
-     * context yet" (see PendSV_Handler / os_arch_start_first_task below).
-     * Primed here - the very first arch call from os_init(), before
-     * os_tick_init() ever enables SysTick - rather than only right before
-     * the bootstrap SVC in os_arch_start_first_task: os_kernel_running is
-     * set true in os_start() a few instructions before that function
-     * re-primes PSP, and interrupts stay enabled the whole time (the kernel
-     * never masks them at boot), so a tick landing in that gap would pend a
-     * PendSV that reads PSP's architecturally-unpredictable power-on-reset
-     * value instead of the sentinel - PSP is not the active stack pointer
-     * yet (Thread mode still runs on MSP), so priming it this early has no
-     * other effect and closes the window unconditionally. */
+    /* Before anything else: confirm the vector table really routes PendSV
+     * here. Everything below assumes the kernel owns that exception, and a
+     * table that does not is a silent hang rather than a fault. */
+    os_arch_vector_check(OS_CONFIG_ARCH_PENDSV_HANDLER);
+
+    /* PSP == 0 is the sentinel the PendSV handler uses to recognize "no task
+     * context yet" (see the context-switch block above). Primed here - the
+     * very first arch call from os_init(), before os_tick_init() ever starts
+     * the tick - rather than only in os_arch_start_first_task:
+     * os_kernel_running is set true in os_start() a few instructions before
+     * that function re-primes PSP, and interrupts stay enabled the whole time
+     * (the kernel never masks them at boot), so a tick landing in that gap
+     * would pend a PendSV that reads PSP's architecturally-unpredictable
+     * power-on-reset value instead of the sentinel - PSP is not the active
+     * stack pointer yet (Thread mode still runs on MSP), so priming it this
+     * early has no other effect and closes the window unconditionally. */
     __asm volatile("msr psp, %0" :: "r"(0U));
     OS_ARCH_ISB();
 
-    /* SVC highest so os_start always reaches it; PendSV/SysTick lowest so
-     * context switches never preempt application interrupts. */
-    shpr2 &= ~(0xFFUL << OS_ARCH_SHPR2_SVC_PRI_POS);
-    shpr2 |= ((uint32_t)OS_ARCH_PRIORITY_HIGHEST << OS_ARCH_SHPR2_SVC_PRI_POS);
-
+    /* PendSV and SysTick lowest, so a context switch or a tick never preempts
+     * an application interrupt. SVCall's priority is left exactly as the
+     * application set it: the kernel does not use SVC. */
     shpr3 &= ~((0xFFUL << OS_ARCH_SHPR3_PENDSV_PRI_POS) | (0xFFUL << OS_ARCH_SHPR3_SYSTICK_PRI_POS));
     shpr3 |= ((uint32_t)OS_ARCH_PRIORITY_LOWEST << OS_ARCH_SHPR3_PENDSV_PRI_POS);
     shpr3 |= ((uint32_t)OS_ARCH_PRIORITY_LOWEST << OS_ARCH_SHPR3_SYSTICK_PRI_POS);
 
-    OS_ARCH_REG_SHPR2 = shpr2;
     OS_ARCH_REG_SHPR3 = shpr3;
 
 #if (OS_CONFIG_MAX_SYSCALL_INTERRUPT_PRIORITY != 0U)
@@ -280,11 +289,12 @@ void os_arch_init(void)
     /* Start the cycle counter used for precise busy-wait delays and tickless
      * accounting. The LAR write unlocks DWT on cores implementing the
      * CoreSight software lock; it is ignored elsewhere. */
-    OS_ARCH_REG_DEMCR      |= OS_ARCH_DEMCR_TRCENA_MSK;
-    OS_ARCH_REG_DWT_LAR    = OS_ARCH_DWT_LAR_UNLOCK_KEY;
-    OS_ARCH_REG_DWT_CYCCNT = 0U;
-    OS_ARCH_REG_DWT_CTRL   |= OS_ARCH_DWT_CTRL_CYCCNTENA_MSK;
+    OS_ARCH_REG_DEMCR   |= OS_ARCH_DEMCR_TRCENA_MSK;
+    OS_ARCH_REG_DWT_LAR  = OS_ARCH_DWT_LAR_UNLOCK_KEY;
 
+    os_arch_dwt_available = os_arch_dwt_enable();
+
+    os_arch_cycle_systick_reset();
     os_arch_planned_idle_ticks = 0U;
 
     /* Guard the handler stack: an MSP push below the stack bottom raises a
@@ -320,7 +330,7 @@ void os_arch_start_first_task(void)
     uint32_t control;
 
     /* Startup/HAL code (hard-float ABI) may have used the FPU: clear FPCA so
-     * the bootstrap SVC stacks a basic frame and leaves no lazy FP state
+     * the bootstrap exception stacks a basic frame and leaves no lazy FP state
      * pointing at the abandoned main stack. */
     __asm volatile("mrs %0, control" : "=r"(control));
     control &= ~OS_ARCH_CONTROL_FPCA_MSK;
@@ -328,14 +338,17 @@ void os_arch_start_first_task(void)
     OS_ARCH_ISB();
 #endif
 
-    /* PSP == 0 tells PendSV there is no task context to save yet. */
+    /* PSP == 0 tells the PendSV handler there is no task context to save yet,
+     * so it takes its "first start" path and installs the first task. */
     __asm volatile("msr psp, %0" :: "r"(0U));
     OS_ARCH_ISB();
 
+    OS_ARCH_CONTEXT_SWITCH_REQUEST();
     OS_ARCH_IRQ_ENABLE();
-    __asm volatile("svc 0");
 
-    /* Never reached: the SVC handler switches to the first task. */
+    /* Never reached: PendSV is the lowest priority, so it is taken as soon as
+     * nothing else is pending, and it returns into the first task rather than
+     * back to here. */
     while (1)
     {
         OS_ARCH_IDLE();
@@ -344,12 +357,18 @@ void os_arch_start_first_task(void)
 
 /******************************************************************************************************/
 /**
- * @brief Initialize SysTick as the kernel tick source.
+ * @brief Start the kernel tick. See os_arch_port_common.h.
  *
  * @return None.
  */
 void os_arch_tick_init(void)
 {
+#if (OS_CONFIG_TICK_SOURCE == OS_CONFIG_TICK_SOURCE_EXTERNAL)
+    /* The application owns the tick hardware; the port programs nothing.
+     * os_arch_tick_reload_cycles stays 0, which is exactly what disables this
+     * port's SysTick tick suppression - see os_arch_sleep_prepare. */
+    os_arch_tick_init_cb();
+#else
     uint32_t clock_hz = os_arch_clock_hz_get();
     uint32_t reload_value;
 
@@ -374,6 +393,7 @@ void os_arch_tick_init(void)
     OS_ARCH_REG_SYST_CSR = OS_ARCH_SYST_CSR_CLKSOURCE_MSK |
                            OS_ARCH_SYST_CSR_TICKINT_MSK |
                            OS_ARCH_SYST_CSR_ENABLE_MSK;
+#endif
 }
 
 /******************************************************************************************************/
@@ -428,13 +448,23 @@ uint32_t* os_arch_task_stack_initialize(uint8_t *stack_base, size_t stack_bytes,
 
 /******************************************************************************************************/
 /**
- * @brief Read the free-running core cycle counter (DWT CYCCNT).
+ * @brief Read the free-running core cycle counter: DWT CYCCNT where the device implements it,
+ *        the SysTick-derived counter otherwise.
+ *
+ * DWT and CYCCNT within it are both OPTIONAL on ARMv8-M, so assuming CYCCNT exists is not portable
+ * across vendors - on a part without it, CYCCNT reads a constant and every busy-wait built on it
+ * (os_delay_us, os_delay_ms below one tick) would spin forever. See os_arch_dwt_enable().
  *
  * @return uint32_t  Current cycle count.
  */
 uint32_t os_arch_cycle_count_get(void)
 {
-    return OS_ARCH_REG_DWT_CYCCNT;
+    if (os_arch_dwt_available)
+    {
+        return OS_ARCH_REG_DWT_CYCCNT;
+    }
+
+    return os_arch_cycle_systick_get();
 }
 
 /******************************************************************************************************/
@@ -912,7 +942,7 @@ uint32_t os_arch_max_suppressed_ticks_get(void)
 #if (OS_CONFIG_TRUSTZONE == OS_CONFIG_TRUSTZONE_NON_SECURE)
 /******************************************************************************************************/
 /**
- * @brief Bank the outgoing task's secure context; called from the SVC/PendSV handlers while
+ * @brief Bank the outgoing task's secure context; called from the PendSV handler while
  *        os_task_current still names that task.
  *
  * @return None.
@@ -939,6 +969,60 @@ void os_arch_tz_context_restore(void)
  * Private function implementations
  * ***********************************************************************************************************
 */
+
+/******************************************************************************************************/
+/**
+ * @brief Enable DWT CYCCNT and report whether it is genuinely usable on this device.
+ *
+ * Three ways it can be absent, all of them normal parts rather than exotic ones, and none of them
+ * detectable from the core type alone:
+ *
+ *   1. DWT_CTRL.NOCYCCNT reads 1        The cycle counter is not implemented. Architecturally
+ *                                       optional on every core this port covers.
+ *   2. The enable does not stick        DWT is behind the debug power domain on some devices and
+ *                                       reads back unchanged until a debugger powers it up.
+ *   3. It is enabled but does not run   Same cause, seen later: the register accepts the write
+ *                                       yet the counter never advances.
+ *
+ * All three are checked, in that order, because each is cheaper than the next. The last needs an
+ * actual observation, so it spends a bounded handful of loop iterations looking for the counter to
+ * move - once, at boot.
+ *
+ * @return bool  true when CYCCNT is implemented, enabled and counting.
+ */
+static bool os_arch_dwt_enable(void)
+{
+    uint32_t control = OS_ARCH_REG_DWT_CTRL;
+    uint32_t first_sample;
+    uint32_t attempt;
+
+    if ((control & OS_ARCH_DWT_CTRL_NOCYCCNT_MSK) != 0U)
+    {
+        return false; /* not implemented */
+    }
+
+    OS_ARCH_REG_DWT_CYCCNT = 0U;
+    OS_ARCH_REG_DWT_CTRL   = control | OS_ARCH_DWT_CTRL_CYCCNTENA_MSK;
+
+    if ((OS_ARCH_REG_DWT_CTRL & OS_ARCH_DWT_CTRL_CYCCNTENA_MSK) == 0U)
+    {
+        return false; /* enable refused (debug power domain down) */
+    }
+
+    /* Confirm it counts. The bound is generous next to the handful of cycles a working counter
+     * needs to move, and it runs exactly once, so the cost is invisible against boot. */
+    first_sample = OS_ARCH_REG_DWT_CYCCNT;
+
+    for (attempt = 0U; attempt < 64U; attempt++)
+    {
+        if (OS_ARCH_REG_DWT_CYCCNT != first_sample)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
 
 /******************************************************************************************************/
 /**

@@ -20,6 +20,11 @@
 #define OS_CONFIG_TRUSTZONE_NON_SECURE  1U
 #define OS_CONFIG_TRUSTZONE_SECURE      2U
 
+/* Tick source values for OS_CONFIG_TICK_SOURCE, kernel-owned on the same terms
+ * as the TrustZone modes above. See the "Tick source" block further down. */
+#define OS_CONFIG_TICK_SOURCE_SYSTICK   0U
+#define OS_CONFIG_TICK_SOURCE_EXTERNAL  1U
+
 /*
  * The application provides the kernel configuration: copy
  * ahura_kernel/os_config_template.h into the project as os_config.h
@@ -74,6 +79,93 @@
 
 #if (OS_CONFIG_CORE_COUNT > 31U)
 #error "OS_CONFIG_CORE_COUNT must be at most 31 (core affinity masks are 32 bits wide)."
+#endif
+
+/*
+ * ***********************************************************************************************************
+ * OPTIONAL configuration (the only options os_config.h may leave out)
+ * ***********************************************************************************************************
+ *
+ * Everything checked above is mandatory, because a missing sizing or feature
+ * switch would read as 0 in an #if and silently disable or misconfigure
+ * something. The three below are different in kind: each is a NAME or a
+ * yes/no diagnostic that the kernel can default correctly on its own, and a
+ * missing one is caught by #ifndef rather than misread as 0. They are
+ * documented in os_config_template.h, so a config copied from the template
+ * carries them, but an older config that predates them still builds and
+ * behaves exactly as it did before.
+*/
+
+/*
+ * The symbol the port gives the PendSV exception handler - the ONE vector the
+ * kernel must own, because a context switch has to be the exception entry
+ * point itself (it manipulates the frame the hardware pushed and returns
+ * through EXC_RETURN, neither of which survives an ordinary C call).
+ *
+ * PendSV_Handler is the CMSIS-Pack convention, which is what essentially every
+ * vendor startup file uses - ST, Nordic, NXP, TI, Silicon Labs, Renesas,
+ * Microchip, Infineon - so the default needs no configuration on any of them.
+ * Override it when the vector table uses a different name (a hand-written
+ * startup file, a non-CMSIS RTOS environment, a bootloader's own table).
+ *
+ * The kernel claims nothing else. SysTick is routed by the application
+ * (see "Tick source" below) and SVC is left entirely alone - see the
+ * context-switch comment in the port .c files for why the first task no
+ * longer boots through it.
+ */
+#ifndef OS_CONFIG_ARCH_PENDSV_HANDLER
+#define OS_CONFIG_ARCH_PENDSV_HANDLER  PendSV_Handler
+#endif
+
+/*
+ * Boot-time check that the live vector table really routes PendSV to the
+ * kernel (1 = on, the default; 0 = skip).
+ *
+ * Worth leaving on. The failure it catches is otherwise silent and very
+ * expensive to debug: if some other definition of the handler name wins at
+ * link time, or the table was relocated and re-populated without the kernel
+ * entry, os_start() simply never switches and the board hangs with no clue
+ * why. This turns that into an immediate park in os_arch_config_fault_trap(),
+ * where the debugger lands on the cause.
+ *
+ * Set it to 0 only for a boot flow whose vector table genuinely cannot be read
+ * at os_init() time - e.g. a table that is patched in later, or one behind a
+ * memory window VTOR does not describe.
+ */
+#ifndef OS_CONFIG_ARCH_VECTOR_CHECK
+#define OS_CONFIG_ARCH_VECTOR_CHECK    1U
+#endif
+
+/*
+ * Where the kernel tick comes from.
+ *
+ *   OS_CONFIG_TICK_SOURCE_SYSTICK   The port programs SysTick from
+ *                                   SystemCoreClock and OS_CONFIG_TICK_HZ. The
+ *                                   default, and the right answer whenever
+ *                                   SysTick is free and keeps running in
+ *                                   whatever sleep modes the product uses.
+ *
+ *   OS_CONFIG_TICK_SOURCE_EXTERNAL  The application owns the tick hardware:
+ *                                   the port programs nothing, calls
+ *                                   os_arch_tick_init_cb() so the application
+ *                                   can start its own timer, and expects
+ *                                   os_tick_handler() to be called from that
+ *                                   timer's ISR at OS_CONFIG_TICK_HZ.
+ *
+ * EXTERNAL exists because SysTick is not universally usable. It does not run
+ * in the low-power modes several families actually ship with (Nordic nRF5x
+ * drives time from the RTC peripheral for exactly this reason), some SoCs do
+ * not implement it at all, and on others it is already spoken for by a vendor
+ * HAL or a bootloader. None of that is something the kernel can detect, so it
+ * is a configuration choice rather than a guess.
+ */
+#ifndef OS_CONFIG_TICK_SOURCE
+#define OS_CONFIG_TICK_SOURCE          OS_CONFIG_TICK_SOURCE_SYSTICK
+#endif
+
+#if (OS_CONFIG_TICK_SOURCE != OS_CONFIG_TICK_SOURCE_SYSTICK) &&                                        \
+    (OS_CONFIG_TICK_SOURCE != OS_CONFIG_TICK_SOURCE_EXTERNAL)
+#error "OS_CONFIG_TICK_SOURCE must be OS_CONFIG_TICK_SOURCE_SYSTICK or OS_CONFIG_TICK_SOURCE_EXTERNAL."
 #endif
 
 #ifdef __cplusplus
@@ -173,8 +265,38 @@ extern "C"
 #error "OS_CONFIG_TRUSTZONE_NON_SECURE: do not compile the kernel with -mcmse."
 #endif
 
+/* Stringify, used to paste OS_CONFIG_ARCH_PENDSV_HANDLER into the inline
+ * assembly that defines the handler. Two levels: the inner one would stringify
+ * the macro's NAME instead of its expansion. */
+#define OS_ARCH_STRINGIFY_(text)          #text
+#define OS_ARCH_STRINGIFY(text)           OS_ARCH_STRINGIFY_(text)
+
 #define OS_ARCH_REG_ICSR                  (*(__IO uint32_t *)0xE000ED04UL)
 #define OS_ARCH_ICSR_PENDSVSET_MSK        (1UL << 28)
+
+/* Vector Table Offset Register. Writable on ARMv7-M/ARMv8-M and on most ARMv6-M
+ * implementations; where it is not implemented it reads as zero, which is also
+ * the fixed table address, so reading it locates the table on every core. */
+#define OS_ARCH_REG_VTOR                  (*(__I uint32_t *)0xE000ED08UL)
+
+/* Exception numbers, which - unlike the handler NAMES - are architectural. */
+#define OS_ARCH_VECTOR_PENDSV             14U
+
+/*
+ * SysTick. Defined here rather than per port because the block is identical on
+ * ARMv6-M, ARMv7-M and ARMv8-M, and all three ports need it: as the tick source
+ * and, where DWT is unavailable, as the cycle counter behind
+ * os_arch_cycle_systick_get() (os_arch_cycle_systick.c).
+ */
+#define OS_ARCH_REG_SYST_CSR              (*(__IO uint32_t *)0xE000E010UL)
+#define OS_ARCH_REG_SYST_RVR              (*(__IO uint32_t *)0xE000E014UL)
+#define OS_ARCH_REG_SYST_CVR              (*(__IO uint32_t *)0xE000E018UL)
+
+#define OS_ARCH_SYST_CSR_ENABLE_MSK       (1UL << 0)
+#define OS_ARCH_SYST_CSR_TICKINT_MSK      (1UL << 1)
+#define OS_ARCH_SYST_CSR_CLKSOURCE_MSK    (1UL << 2)
+#define OS_ARCH_SYST_CSR_COUNTFLAG_MSK    (1UL << 16)
+#define OS_ARCH_SYST_RVR_RELOAD_MSK       0x00FFFFFFUL
 
 /* Byte-addressable priority register banks, indexed rather than read as whole
  * words (os_arch_isr_priority_check reads one exception's priority byte):
@@ -190,7 +312,6 @@ extern "C"
  * exceptions, 16+ = external interrupts (IRQ n is IPSR 16 + n). */
 #define OS_ARCH_IPSR_THREAD_MODE          0U
 #define OS_ARCH_IPSR_SYSHANDLER_BASE      4U   /* MemManage: first byte of the SHPR bank */
-#define OS_ARCH_IPSR_SVCALL               11U
 #define OS_ARCH_IPSR_IRQ_BASE             16U
 
 #define OS_ARCH_STACK_ALIGNMENT_BYTES     4U
@@ -346,6 +467,45 @@ static inline void os_arch_config_fault_trap(void)
 
 /******************************************************************************************************/
 /**
+ * @brief Verify that the live vector table routes PendSV to the kernel's handler, and park in
+ *        os_arch_config_fault_trap() if it does not. Called from os_arch_init() on every core.
+ *
+ * PendSV is the only vector the kernel must own, and owning it is not something the linker can
+ * confirm: if another definition of the configured handler name wins (a vendor IDE's generated
+ * interrupt file is the usual one), or a bootloader relocated the table and repopulated it from
+ * its own image, the build still succeeds and the symptom is a board that reaches os_start() and
+ * then simply stops - no fault, no output, nothing to attach a debugger to. Comparing the table
+ * against the address the port actually assembled turns that into a halt at the cause, at boot.
+ *
+ * Compiles to nothing when OS_CONFIG_ARCH_VECTOR_CHECK is 0.
+ *
+ * @param[in] pendsv_handler  Address the port's PendSV handler assembled to.
+ * @return None.
+ */
+static inline void os_arch_vector_check(void (*pendsv_handler)(void))
+{
+#if (OS_CONFIG_ARCH_VECTOR_CHECK != 0U)
+    const uint32_t *vector_table = (const uint32_t *)(uintptr_t)OS_ARCH_REG_VTOR;
+    uint32_t        installed;
+    uint32_t        expected;
+
+    /* Bit 0 of a vector entry is the Thumb bit and bit 0 of a function pointer
+     * is the same flag, so both sides normally carry it - masking it off makes
+     * the comparison independent of how either was produced. */
+    installed = vector_table[OS_ARCH_VECTOR_PENDSV] & ~(uint32_t)1U;
+    expected  = (uint32_t)(uintptr_t)pendsv_handler & ~(uint32_t)1U;
+
+    if (installed != expected)
+    {
+        os_arch_config_fault_trap();
+    }
+#else
+    (void)pendsv_handler;
+#endif
+}
+
+/******************************************************************************************************/
+/**
  * @brief In BASEPRI mode, trap a kernel API call from an interrupt the kernel mask cannot
  *        reach (NVIC priority numerically below OS_CONFIG_MAX_SYSCALL_INTERRUPT_PRIORITY):
  *        such a call could corrupt kernel state, so it parks in os_arch_config_fault_trap.
@@ -372,17 +532,13 @@ static inline void os_arch_isr_priority_check(void)
     else if (ipsr >= OS_ARCH_IPSR_SYSHANDLER_BASE)
     {
         /* Configurable-priority system handler (MemManage, BusFault,
-         * UsageFault, SecureFault, DebugMonitor): priority byte in
+         * UsageFault, SVCall, SecureFault, DebugMonitor): priority byte in
          * SHPR1-SHPR3. These reset to 0 = above any threshold, so an
          * application-enabled fault handler calling kernel APIs is caught
-         * here. SVCall (11) is kernel-owned at the highest priority and
-         * calls no kernel API; PendSV/SysTick (14/15) are kernel-owned at
+         * here. SVCall (11) gets no exemption: the kernel no longer uses SVC
+         * for anything, so an SVC handler is application code like any other
+         * and is held to the same rule. PendSV (14) and SysTick (15) sit at
          * the lowest priority and pass the comparison anyway. */
-        if (ipsr == OS_ARCH_IPSR_SVCALL)
-        {
-            return;
-        }
-
         priority = (uint32_t)OS_ARCH_REG_SHPR_BASE[ipsr - OS_ARCH_IPSR_SYSHANDLER_BASE];
     }
     else
@@ -479,7 +635,11 @@ void os_arch_start_first_task(void);
 
 /******************************************************************************************************/
 /**
- * @brief Initialize the architecture tick source.
+ * @brief Start the kernel tick at OS_CONFIG_TICK_HZ.
+ *
+ * With OS_CONFIG_TICK_SOURCE_SYSTICK this programs SysTick from the live CPU clock. With
+ * OS_CONFIG_TICK_SOURCE_EXTERNAL it touches no hardware and calls os_arch_tick_init_cb()
+ * instead, leaving the tick entirely to the application.
  */
 void os_arch_tick_init(void);
 
@@ -602,6 +762,32 @@ void os_arch_sleep_finish(void);
  *        tick count, since it varies with both the platform clock and OS_CONFIG_TICK_HZ.
  */
 uint32_t os_arch_max_suppressed_ticks_get(void);
+
+/*
+ * ***********************************************************************************************************
+ * CONFIGURABLE - External tick source (OS_CONFIG_TICK_SOURCE_EXTERNAL only)
+ * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_TICK_SOURCE == OS_CONFIG_TICK_SOURCE_EXTERNAL)
+/******************************************************************************************************/
+/**
+ * @brief Application callback: start the timer that will drive the kernel tick, and arrange for its
+ *        ISR to call os_tick_handler() OS_CONFIG_TICK_HZ times per second.
+ *
+ * Called once from os_tick_init(), at the end of os_init(), so the clock tree is already configured.
+ *
+ * REQUIRED in this mode: the kernel ships no default, so a missing implementation is a link error
+ * rather than a kernel whose clock never advances - which would look like every delay, timeout and
+ * timer hanging forever, with nothing pointing at the tick as the cause.
+ *
+ * Give the tick interrupt the LOWEST priority the device offers, matching what the port does for
+ * SysTick. Anything else lets a tick preempt application interrupts. The handler must also be
+ * reachable by the kernel's interrupt mask: with a nonzero OS_CONFIG_MAX_SYSCALL_INTERRUPT_PRIORITY,
+ * a tick ISR above the threshold is trapped by os_arch_isr_priority_check the moment it calls in.
+ */
+void os_arch_tick_init_cb(void);
+#endif /* OS_CONFIG_TICK_SOURCE_EXTERNAL */
 
 /*
  * ***********************************************************************************************************

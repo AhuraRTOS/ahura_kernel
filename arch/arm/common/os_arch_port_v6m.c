@@ -26,29 +26,23 @@
 #error "os_arch_port_v6m.c targets ARMv6-M / ARMv8-M baseline cores (check -mcpu / -march)."
 #endif
 
+/* This port's only cycle counter: ARMv6-M has no DWT. Textual include, like
+ * this file itself. */
+#include "os_arch_cycle_systick.c"
+
 /*
  * ***********************************************************************************************************
  * Macros
  * ***********************************************************************************************************
 */
 
-#define OS_ARCH_REG_SHPR2                    (*(__IO uint32_t *)0xE000ED1CUL)
 #define OS_ARCH_REG_SHPR3                    (*(__IO uint32_t *)0xE000ED20UL)
-#define OS_ARCH_REG_SYST_CSR                 (*(__IO uint32_t *)0xE000E010UL)
-#define OS_ARCH_REG_SYST_RVR                 (*(__IO uint32_t *)0xE000E014UL)
-#define OS_ARCH_REG_SYST_CVR                 (*(__IO uint32_t *)0xE000E018UL)
 
-#define OS_ARCH_SYST_CSR_ENABLE_MSK          (1UL << 0)
-#define OS_ARCH_SYST_CSR_TICKINT_MSK         (1UL << 1)
-#define OS_ARCH_SYST_CSR_CLKSOURCE_MSK       (1UL << 2)
-#define OS_ARCH_SYST_CSR_COUNTFLAG_MSK       (1UL << 16)
-#define OS_ARCH_SYST_RVR_RELOAD_MSK          0x00FFFFFFUL
-
-#define OS_ARCH_SHPR2_SVC_PRI_POS            24U
+/* SVCall's priority field (SHPR2) is deliberately absent: the kernel does not
+ * use SVC, so it has no business changing that exception's priority. */
 #define OS_ARCH_SHPR3_PENDSV_PRI_POS         16U
 #define OS_ARCH_SHPR3_SYSTICK_PRI_POS        24U
 
-#define OS_ARCH_PRIORITY_HIGHEST             0U
 #define OS_ARCH_PRIORITY_LOWEST              255U
 #define OS_ARCH_XPSR_THUMB                   (1UL << 24)
 
@@ -66,11 +60,6 @@
 #define OS_ARCH_EXC_RETURN_THREAD_PSP        0xFFFFFFFDUL
 #endif
 
-/* Cycles credited per os_arch_cycle_count_get call when SysTick is not yet
- * running. Deliberately below the real call cost so busy-waits only ever get
- * longer, never shorter. */
-#define OS_ARCH_CYCLE_FALLBACK_STEP          8U
-
 /*
  * ***********************************************************************************************************
  * Global variables
@@ -79,12 +68,10 @@
 
 static uint32_t os_arch_sleep_entry_cycles = 0U;
 static uint32_t os_arch_planned_idle_ticks = 0U;
-static uint32_t os_arch_cycle_accum        = 0U;
-static uint32_t os_arch_cycle_fallback     = 0U;
 
 /*
  * ***********************************************************************************************************
- * Context switch handlers (SVC starts the first task, PendSV switches tasks)
+ * Context switch handler (PendSV does everything)
  * ***********************************************************************************************************
  *
  * Software-saved frame layout on a task stack (low address first):
@@ -94,6 +81,13 @@ static uint32_t os_arch_cycle_fallback     = 0U;
  * Same layout as the mainline port, built with the Thumb-1 subset: high
  * registers are staged through r4-r7 because ARMv6-M LDM/STM only address
  * low registers, and there is no CBZ/IT/MOVW/MOVT.
+ *
+ * PendSV is the ONLY exception this kernel takes over, and the PSP == 0
+ * sentinel is what lets one handler serve both jobs: zero means no task has
+ * run yet, so there is no outgoing context to save and the handler simply
+ * installs the first task (the "first start" path below). Every later entry
+ * finds a real PSP and performs an ordinary switch. See os_arch_port_v7m.c's
+ * equivalent block for why SVC is deliberately left to the application.
 */
 
 __asm(
@@ -102,32 +96,13 @@ __asm(
 ".text\n"
 ".align 2\n"
 
-".global SVC_Handler\n"
-".type   SVC_Handler, %function\n"
+".global " OS_ARCH_STRINGIFY(OS_CONFIG_ARCH_PENDSV_HANDLER) "\n"
+".type   " OS_ARCH_STRINGIFY(OS_CONFIG_ARCH_PENDSV_HANDLER) ", %function\n"
 ".thumb_func\n"
-"SVC_Handler:\n"
-"    bl      os_task_stack_select_next\n"  /* r0 = first task stack pointer */
-#if (OS_CONFIG_TRUSTZONE == OS_CONFIG_TRUSTZONE_NON_SECURE)
-"    mov     r4, r0\n"                     /* r4 survives the call (callee-saved) */
-"    bl      os_arch_tz_context_restore\n" /* load the first task's secure context */
-"    mov     r0, r4\n"
-#endif
-"    ldr     r1, os_arch_vtor_addr\n"      /* reset MSP to the vector-table initial value; */
-"    ldr     r1, [r1]\n"                   /* VTOR reads as zero on cores without it,      */
-"    ldr     r1, [r1]\n"                   /* which is the fixed table address anyway      */
-"    msr     msp, r1\n"
-"    b       os_arch_context_restore_asm\n"
-".align 2\n"
-"os_arch_vtor_addr:\n"
-"    .word   0xE000ED08\n"
-
-".global PendSV_Handler\n"
-".type   PendSV_Handler, %function\n"
-".thumb_func\n"
-"PendSV_Handler:\n"
+OS_ARCH_STRINGIFY(OS_CONFIG_ARCH_PENDSV_HANDLER) ":\n"
 "    mrs     r0, psp\n"
-"    cmp     r0, #0\n"                     /* no task context yet: nothing to switch */
-"    beq     os_arch_pendsv_exit\n"
+"    cmp     r0, #0\n"                     /* PSP == 0: no task has run yet, go start the first */
+"    beq     os_arch_first_start\n"
 "    subs    r0, r0, #36\n"                /* reserve r4-r11 + EXC_RETURN (9 words) */
 "    stmia   r0!, {r4-r7}\n"               /* save r4-r7 */
 "    mov     r4, r8\n"                     /* stage and save r8-r11 */
@@ -149,8 +124,22 @@ __asm(
 "    mov     r0, r4\n"
 #endif
 "    b       os_arch_context_restore_asm\n"
-"os_arch_pendsv_exit:\n"
-"    bx      lr\n"
+
+"os_arch_first_start:\n"                   /* first start: nothing to save */
+"    bl      os_task_stack_select_next\n"  /* r0 = first task stack pointer */
+#if (OS_CONFIG_TRUSTZONE == OS_CONFIG_TRUSTZONE_NON_SECURE)
+"    mov     r4, r0\n"                     /* r4 survives the call (callee-saved) */
+"    bl      os_arch_tz_context_restore\n" /* load the first task's secure context */
+"    mov     r0, r4\n"
+#endif
+"    ldr     r1, os_arch_vtor_addr\n"      /* reset MSP to the vector-table initial value; the */
+"    ldr     r1, [r1]\n"                   /* boot (main) context is abandoned here, including */
+"    ldr     r1, [r1]\n"                   /* the frame this exception pushed - the return     */
+"    msr     msp, r1\n"                    /* below unstacks from PSP instead                  */
+"    b       os_arch_context_restore_asm\n"
+".align 2\n"
+"os_arch_vtor_addr:\n"                     /* VTOR reads as zero on cores without it, which is */
+"    .word   0xE000ED08\n"                 /* the fixed table address anyway                   */
 
 ".global os_arch_context_restore_asm\n"
 ".type   os_arch_context_restore_asm, %function\n"
@@ -173,6 +162,10 @@ __asm(
 "    isb\n"
 "    bx      lr\n"
 );
+
+/* Declared through the configured name so the boot-time vector check compares
+ * against exactly the symbol the vector table is expected to reference. */
+extern void OS_CONFIG_ARCH_PENDSV_HANDLER(void);
 
 /*
  * ***********************************************************************************************************
@@ -199,41 +192,40 @@ static void     os_arch_task_exit_trap(void);
  */
 void os_arch_init(void)
 {
-    uint32_t shpr2 = OS_ARCH_REG_SHPR2;
     uint32_t shpr3 = OS_ARCH_REG_SHPR3;
 
-    /* PSP == 0 is the sentinel PendSV_Handler uses to recognize "no task
-     * context yet" (see PendSV_Handler / os_arch_start_first_task below).
-     * Primed here - the very first arch call from os_init(), before
-     * os_tick_init() ever enables SysTick - rather than only right before
-     * the bootstrap SVC in os_arch_start_first_task: os_kernel_running is
-     * set true in os_start() a few instructions before that function
-     * re-primes PSP, and interrupts stay enabled the whole time (the kernel
-     * never masks them at boot), so a tick landing in that gap would pend a
-     * PendSV that reads PSP's architecturally-unpredictable power-on-reset
-     * value instead of the sentinel - PSP is not the active stack pointer
-     * yet (Thread mode still runs on MSP), so priming it this early has no
-     * other effect and closes the window unconditionally. */
+    /* Before anything else: confirm the vector table really routes PendSV
+     * here. Everything below assumes the kernel owns that exception, and a
+     * table that does not is a silent hang rather than a fault. */
+    os_arch_vector_check(OS_CONFIG_ARCH_PENDSV_HANDLER);
+
+    /* PSP == 0 is the sentinel the PendSV handler uses to recognize "no task
+     * context yet" (see the context-switch block above). Primed here - the
+     * very first arch call from os_init(), before os_tick_init() ever starts
+     * the tick - rather than only in os_arch_start_first_task:
+     * os_kernel_running is set true in os_start() a few instructions before
+     * that function re-primes PSP, and interrupts stay enabled the whole time
+     * (the kernel never masks them at boot), so a tick landing in that gap
+     * would pend a PendSV that reads PSP's architecturally-unpredictable
+     * power-on-reset value instead of the sentinel - PSP is not the active
+     * stack pointer yet (Thread mode still runs on MSP), so priming it this
+     * early has no other effect and closes the window unconditionally. */
     __asm volatile("msr psp, %0" :: "r"(0U));
     OS_ARCH_ISB();
 
-    /* SVC highest so os_start always reaches it; PendSV/SysTick lowest so
-     * context switches never preempt application interrupts. ARMv6-M
-     * requires word access to SHPR registers, which this is. */
-    shpr2 &= ~(0xFFUL << OS_ARCH_SHPR2_SVC_PRI_POS);
-    shpr2 |= ((uint32_t)OS_ARCH_PRIORITY_HIGHEST << OS_ARCH_SHPR2_SVC_PRI_POS);
-
+    /* PendSV and SysTick lowest, so a context switch or a tick never preempts
+     * an application interrupt. SVCall's priority is left exactly as the
+     * application set it: the kernel does not use SVC. ARMv6-M requires word
+     * access to SHPR registers, which this is. */
     shpr3 &= ~((0xFFUL << OS_ARCH_SHPR3_PENDSV_PRI_POS) | (0xFFUL << OS_ARCH_SHPR3_SYSTICK_PRI_POS));
     shpr3 |= ((uint32_t)OS_ARCH_PRIORITY_LOWEST << OS_ARCH_SHPR3_PENDSV_PRI_POS);
     shpr3 |= ((uint32_t)OS_ARCH_PRIORITY_LOWEST << OS_ARCH_SHPR3_SYSTICK_PRI_POS);
 
-    OS_ARCH_REG_SHPR2 = shpr2;
     OS_ARCH_REG_SHPR3 = shpr3;
 
+    os_arch_cycle_systick_reset();
     os_arch_sleep_entry_cycles = 0U;
     os_arch_planned_idle_ticks = 0U;
-    os_arch_cycle_accum        = 0U;
-    os_arch_cycle_fallback     = 0U;
 }
 
 /******************************************************************************************************/
@@ -244,14 +236,17 @@ void os_arch_init(void)
  */
 void os_arch_start_first_task(void)
 {
-    /* PSP == 0 tells PendSV there is no task context to save yet. */
+    /* PSP == 0 tells the PendSV handler there is no task context to save yet,
+     * so it takes its "first start" path and installs the first task. */
     __asm volatile("msr psp, %0" :: "r"(0U));
     OS_ARCH_ISB();
 
+    OS_ARCH_CONTEXT_SWITCH_REQUEST();
     OS_ARCH_IRQ_ENABLE();
-    __asm volatile("svc 0");
 
-    /* Never reached: the SVC handler switches to the first task. */
+    /* Never reached: PendSV is the lowest priority, so it is taken as soon as
+     * nothing else is pending, and it returns into the first task rather than
+     * back to here. */
     while (1)
     {
         OS_ARCH_IDLE();
@@ -260,12 +255,16 @@ void os_arch_start_first_task(void)
 
 /******************************************************************************************************/
 /**
- * @brief Initialize SysTick as the kernel tick source.
+ * @brief Start the kernel tick. See os_arch_port_common.h.
  *
  * @return None.
  */
 void os_arch_tick_init(void)
 {
+#if (OS_CONFIG_TICK_SOURCE == OS_CONFIG_TICK_SOURCE_EXTERNAL)
+    /* The application owns the tick hardware; the port programs nothing. */
+    os_arch_tick_init_cb();
+#else
     uint32_t clock_hz = os_arch_clock_hz_get();
     uint32_t reload_value;
 
@@ -286,6 +285,7 @@ void os_arch_tick_init(void)
     OS_ARCH_REG_SYST_CSR = OS_ARCH_SYST_CSR_CLKSOURCE_MSK |
                            OS_ARCH_SYST_CSR_TICKINT_MSK |
                            OS_ARCH_SYST_CSR_ENABLE_MSK;
+#endif
 }
 
 /******************************************************************************************************/
@@ -338,50 +338,15 @@ uint32_t* os_arch_task_stack_initialize(uint8_t *stack_base, size_t stack_bytes,
 /**
  * @brief Read the free-running core cycle counter, synthesized from SysTick.
  *
- * ARMv6-M has no DWT cycle counter, so this derives one from the SysTick
- * down-counter plus a wrap accumulator. Wraps are only observed while this
- * function is being polled (busy-waits do so continuously), so it is meant
- * for measuring short intervals, not absolute time. Before SysTick runs, a
- * conservative software fallback advances the count so busy-waits still
- * terminate (slower than requested, never faster).
+ * ARMv6-M has no DWT cycle counter, so the SysTick-derived one is all there is here - see
+ * os_arch_cycle_systick.c for what it guarantees. The mainline ports use the same code as their
+ * fallback when DWT CYCCNT turns out to be unavailable.
  *
  * @return uint32_t  Current cycle count.
  */
 uint32_t os_arch_cycle_count_get(void)
 {
-    uint32_t primask = os_arch_primask_get();
-    uint32_t reload;
-    uint32_t csr;
-    uint32_t value;
-
-    OS_ARCH_IRQ_DISABLE();
-
-    reload = OS_ARCH_REG_SYST_RVR & OS_ARCH_SYST_RVR_RELOAD_MSK;
-
-    /* Single CSR read: it clears COUNTFLAG, so it must be sampled once. */
-    csr = OS_ARCH_REG_SYST_CSR;
-
-    if (((csr & OS_ARCH_SYST_CSR_ENABLE_MSK) == 0U) || (reload == 0U))
-    {
-        os_arch_cycle_fallback += OS_ARCH_CYCLE_FALLBACK_STEP;
-        value = os_arch_cycle_accum + os_arch_cycle_fallback;
-    }
-    else
-    {
-        if ((csr & OS_ARCH_SYST_CSR_COUNTFLAG_MSK) != 0U)
-        {
-            os_arch_cycle_accum += (reload + 1U);
-        }
-
-        value = os_arch_cycle_accum + (reload - (OS_ARCH_REG_SYST_CVR & OS_ARCH_SYST_RVR_RELOAD_MSK));
-    }
-
-    if (primask == 0U)
-    {
-        OS_ARCH_IRQ_ENABLE();
-    }
-
-    return value;
+    return os_arch_cycle_systick_get();
 }
 
 /******************************************************************************************************/
@@ -672,7 +637,7 @@ uint32_t os_arch_max_suppressed_ticks_get(void)
 #if (OS_CONFIG_TRUSTZONE == OS_CONFIG_TRUSTZONE_NON_SECURE)
 /******************************************************************************************************/
 /**
- * @brief Bank the outgoing task's secure context; called from the SVC/PendSV handlers while
+ * @brief Bank the outgoing task's secure context; called from the PendSV handler while
  *        os_task_current still names that task.
  *
  * @return None.

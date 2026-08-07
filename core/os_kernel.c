@@ -131,7 +131,7 @@ void os_start(void)
  * @brief Enter the scheduler on a secondary core. Does not return.
  *
  * Call from the secondary core after os_start() is running on core 0, once
- * the SoC layer has booted the core with a vector table routing SVC, PendSV
+ * the SoC layer has booted the core with a vector table routing PendSV
  * and SysTick to the kernel handlers. SHPR, SysTick, DWT and MSPLIM are all
  * banked per core, so the same architecture init runs here; the per-core
  * SysTick drives this core's preemption while core 0 owns the time base.

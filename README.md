@@ -3,10 +3,18 @@
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Standard: C11](https://img.shields.io/badge/standard-C11-blue.svg)
 ![Platform: Cortex-M](https://img.shields.io/badge/platform-Cortex--M-informational.svg)
+![Toolchains: GCC | Clang | armclang](https://img.shields.io/badge/toolchains-GCC%20%7C%20Clang%20%7C%20armclang-informational.svg)
 
 A small, preemptive, priority-based RTOS kernel for ARM Cortex-M, covering
 everything from the M0 to the M85. It is TrustZone-aware and has no mandatory
 HAL or CMSIS dependency.
+
+**It runs on any Cortex-M device, from any vendor.** The kernel takes over
+exactly **one** exception - PendSV - and asks the application for exactly one
+thing: a periodic call to `os_tick_handler()`. It claims no `SVC_Handler`, no
+`SysTick_Handler`, no vendor headers, and no HAL. See
+[Integration](#integration) for what that means in practice on STM32, Nordic,
+NXP and anything else.
 
 - **Preemptive priority scheduler.** 31 priority levels, O(1) list-based ready
   queues, and round-robin among tasks of equal priority.
@@ -36,8 +44,11 @@ HAL or CMSIS dependency.
 
 **[Getting started](#getting-started)**
 [Quick start](#quick-start) ·
+[Adding the kernel to a build](#adding-the-kernel-to-a-build) ·
 [Configuration](#configuration) ·
-[Integration checklist](#integration-checklist)
+[Integration](#integration) ·
+[Vendor notes](#vendor-notes) ·
+[Verifying the port](#verifying-the-port)
 
 **[Using the kernel](#using-the-kernel)**
 [API at a glance](#api-at-a-glance) ·
@@ -76,30 +87,115 @@ HAL or CMSIS dependency.
 
 ### Quick start
 
-1. **Configure.** Copy [`os_config_template.h`](os_config_template.h) into the
-   project as `os_config.h`. Any directory works, the layout does not matter.
-   Every option starts at its default value.
-2. **Point the kernel build at it**, before `add_subdirectory`, so the kernel
-   library and the application compile against the exact same config:
+Five steps. Steps 1-3 copy three files and point the build at them; steps 4-5
+are the only two places the kernel touches the device.
+
+1. **Copy three files** out of the kernel into the project. Any directories
+   work - the layout does not matter, only that the build can see them.
+
+   | Copy this template | into the project as | and add it to |
+   |---|---|---|
+   | [`os_config_template.h`](os_config_template.h) | `os_config.h` | nothing (it is a header) |
+   | [`os_cb_template.c`](os_cb_template.c) | `os_cb.c` | the **application** build |
+   | [`os_main_template.c`](os_main_template.c) | `os_main.c` | the **application** build |
+
+   The kernel deliberately compiles none of the three. `os_config.h` is the
+   application's configuration, and `os_cb.c` / `os_main.c` hold application
+   code - see [Configuration](#configuration) and
+   [Application callbacks](#application-callbacks).
+
+2. **Build the kernel** and point it at `os_config.h`. With CMake that is two
+   lines, and `OS_CONFIG_DIR` must be set *before* `add_subdirectory` so the
+   kernel library and the application compile against the same configuration:
 
    ```cmake
    set(OS_CONFIG_DIR ${CMAKE_CURRENT_SOURCE_DIR}/Core/Inc)  # wherever the copy lives
    add_subdirectory(ahura_kernel)
+   target_link_libraries(my_firmware ahura_kernel)
    ```
 
-3. **Boot the kernel** from `main()`, after clocks are configured:
+   Not using CMake? See [Adding the kernel to a
+   build](#adding-the-kernel-to-a-build) for the plain file list - it is short.
+
+3. **Give the kernel its tick.** Route the tick interrupt to
+   `os_tick_handler()`. On a stock CMSIS device that is one line:
+
+   ```c
+   void SysTick_Handler(void) { os_tick_handler(); }
+   ```
+
+   If SysTick is unavailable or already taken - which is the case on Nordic
+   nRF5x, among others - use a different timer instead, see
+   [Integration](#integration).
+
+4. **Make sure the kernel owns PendSV.** It is the one exception the kernel
+   must have, and on most projects there is nothing to do: the port defines
+   `PendSV_Handler`, which is the name every CMSIS startup file already puts in
+   the vector table. The exception is a vendor IDE that generates its own empty
+   `PendSV_Handler` - STM32CubeMX does - which must be turned off, see
+   [Vendor notes](#vendor-notes).
+
+5. **Boot it** from `main()`, after the clock tree is configured:
 
    ```c
    os_init();
    os_start();   /* never returns */
    ```
 
-   `os_init()` has already created and started a default application task, so
-   there is nothing else to create just to get moving.
-4. **Write the application** in `os_main()`. Copy
-   [`os_main_template.c`](os_main_template.c) into the project as `os_main.c`
-   and replace the body, or spawn further tasks from it with `OS_TASK_DEFINE`
-   and `os_task_create`.
+   `os_init()` already creates and starts a default application task, so there
+   is nothing else to create just to get moving. Write the application in
+   `os_main()`, in the `os_main.c` copied in step 1, and spawn further tasks
+   from there with `OS_TASK_DEFINE` and `os_task_create`.
+
+Not sure it worked? [Verifying the port](#verifying-the-port) runs the built-in
+self-test suite, which validates the whole port with no application code.
+
+### Adding the kernel to a build
+
+The kernel ships a `CMakeLists.txt`, but nothing about it requires CMake. It is
+plain C11 plus GCC-style inline assembly, with no generated sources and no
+build-time code generation, so any toolchain that can compile a C file can build
+it - Keil µVision, IAR EWARM, MPLAB X, SEGGER Embedded Studio, MCUXpresso,
+STM32CubeIDE without CMake, or a hand-written Makefile.
+
+**Source files to compile** (all of `core/`, plus exactly one arch file):
+
+```text
+core/os_atomic.c      core/os_list.c        core/os_semaphore.c
+core/os_critical.c    core/os_log.c         core/os_task.c
+core/os_delay.c       core/os_mem.c         core/os_tick.c
+core/os_event.c       core/os_mutex.c       core/os_timer.c
+core/os_kernel.c      core/os_notify.c      core/os_work.c
+core/os_queue.c
+
+arch/arm/<core>/os_arch_port.c    <- exactly ONE, matching the target
+```
+
+Pick `<core>` to match the device: `cortex_m0`, `cortex_m0plus`, `cortex_m3`,
+`cortex_m4`, `cortex_m7`, `cortex_m23`, `cortex_m33`, `cortex_m35p`,
+`cortex_m52`, `cortex_m55`, or `cortex_m85`. Each is a two-line wrapper that
+pulls in the shared implementation for its architecture, and each carries an
+`#error` guard, so a mismatch with `-mcpu` fails loudly at compile time rather
+than producing a subtly wrong context switch.
+
+Do **not** add the files under `common/` to the build. They are textual
+includes, pulled in by the wrapper above; compiling them separately produces
+duplicate symbols.
+
+**Include directories** (three):
+
+```text
+<kernel root>/                      <- ahura.h
+<kernel root>/arch/arm/<core>/      <- os_arch_port.h
+<path to your os_config.h>/
+```
+
+**Application files**, compiled into the application, never the kernel library:
+`os_cb.c` and `os_main.c` from the quick start.
+
+That is the whole story. No linker-script edits, no preprocessor defines from
+the build system (`os_config.h` is the single source of configuration - see
+[Configuration](#configuration)), and no vendor headers.
 
 New to a specific feature? [`ahura_examples/kernel/`](../ahura_examples/kernel/)
 has a minimal, standalone example per feature. See [Examples](#examples).
@@ -133,26 +229,272 @@ same model as `FreeRTOSConfig.h`:
 `os_config.h` is the single source of configuration. All options are plain
 defines, so do not additionally define `OS_CONFIG_` macros from the build system
 with `target_compile_definitions`, since that would redefine them. The
-`OS_CONFIG_TRUSTZONE_*` mode values are kernel-owned (`os_arch_port_common.h`)
-and the config file only selects among them. `OS_TASK_PRIO_MAX` is kernel-owned
-too, fixed at `31` in `ahura.h` because that is the most a 32-bit ready bitmap
-can support, so it is not one of the options `os_config.h` defines.
+`OS_CONFIG_TRUSTZONE_*` and `OS_CONFIG_TICK_SOURCE_*` value macros are
+kernel-owned (`os_arch_port_common.h`) and the config file only selects among
+them. `OS_TASK_PRIO_MAX` is kernel-owned too, fixed at `31` in `ahura.h` because
+that is the most a 32-bit ready bitmap can support, so it is not one of the
+options `os_config.h` defines.
 
-### Integration checklist
+Three options are **optional** and may be left out, in which case the kernel
+supplies the default shown:
 
-1. Route `SysTick_Handler` to `os_tick_handler()`. `SVC_Handler` and
-   `PendSV_Handler` are provided by the port, so do not define them in
-   `stm32*_it.c`.
-2. Call `os_init()` after clocks are configured, so the live CMSIS
-   `SystemCoreClock` is already correct when the kernel reads it. See [Platform
-   clock](#platform-clock).
-3. Create and start any tasks the application needs before the scheduler runs.
-   `os_init()` already created the default task (see [Default application
-   task](#default-application-task)) unless this is a self-test build. Then call
-   `os_start()`, which never returns.
-4. For task stacks, use `OS_TASK_DEFINE(name, stack_bytes)`. The size is in
-   bytes, rounded up to an 8-byte multiple by the macro, and must be at least
-   `OS_CONFIG_MIN_STACK_SIZE`.
+| Option | Default | Purpose |
+|---|---|---|
+| `OS_CONFIG_TICK_SOURCE` | `..._SYSTICK` | Who owns the tick timer. See [Integration](#integration) |
+| `OS_CONFIG_ARCH_PENDSV_HANDLER` | `PendSV_Handler` | Name of the context-switch vector |
+| `OS_CONFIG_ARCH_VECTOR_CHECK` | `1U` | Boot-time check that the vector table routes PendSV to the kernel |
+
+They are exempt because each is a name or a yes/no diagnostic that the kernel
+can default correctly on its own, and a missing one is caught by `#ifndef`
+rather than misread. Every other option is mandatory for the opposite reason: a
+missing sizing or feature switch would read as `0` in an `#if` and silently
+disable or misconfigure something, so the kernel rejects the build instead.
+
+### Integration
+
+The whole contract between the kernel and the device is two items. Everything
+in this section is one of them, or a consequence of one of them.
+
+| # | What the kernel needs | Who provides it |
+|---|---|---|
+| 1 | The **PendSV** exception vector | The kernel (it defines `PendSV_Handler`) - the application must only avoid defining it too |
+| 2 | `os_tick_handler()` called `OS_CONFIG_TICK_HZ` times a second | The application, from a timer ISR |
+
+That is all. The kernel does not use `SVC`, does not require `SysTick`, does not
+need CMSIS headers, a HAL, or a linker-script change, and never asks the build
+system for a preprocessor define.
+
+#### 1. PendSV, the one vector the kernel owns
+
+A context switch has to **be** the exception entry point: it manipulates the
+stack frame the hardware pushed and returns through `EXC_RETURN`, neither of
+which survives an ordinary C function call. So this vector cannot be "routed"
+the way the tick is - the kernel has to define the handler itself.
+
+It defines it under the name `PendSV_Handler`, the CMSIS-Pack convention that
+essentially every vendor's startup file already places in the vector table. On
+a normal project this means **there is nothing to do**.
+
+Two things can go wrong, and both are worth knowing:
+
+- **Something else defines `PendSV_Handler` too.** The link fails with a
+  duplicate-symbol error. The fix is to remove the other definition - it is
+  almost always an empty stub generated by a vendor IDE, see
+  [Vendor notes](#vendor-notes). Note that the `.weak` in a startup file does
+  *not* help here: it only covers the default handler, not a second real one.
+- **The vector table calls the entry something else.** A hand-written startup
+  file, a non-CMSIS environment, or a bootloader's own table. Point the kernel
+  at the right name in `os_config.h`:
+
+  ```c
+  #define OS_CONFIG_ARCH_PENDSV_HANDLER  my_pendsv_vector_name
+  ```
+
+The kernel checks this for itself at boot. `os_arch_init()` reads the live
+vector table through VTOR and compares entry 14 against the address its own
+handler assembled to; a mismatch parks the core immediately in
+`os_arch_config_fault_trap()`, where a debugger lands on the cause. Without that
+check the failure mode is a board that reaches `os_start()` and silently stops -
+no fault, no output, nothing to attach to. Turn it off with
+`OS_CONFIG_ARCH_VECTOR_CHECK` `0` only if the vector table genuinely cannot be
+read when `os_init()` runs.
+
+> **`SVC` is not used and never has been claimed.** Starting the first task
+> through `svc 0` is the traditional Cortex-M approach - FreeRTOS does it - but
+> it spends a second permanent vector on one action performed once at boot, and
+> `SVC` is the most contended exception on the architecture: Nordic's SoftDevice
+> reserves part of the SVC number space, TF-M and other secure firmware use it
+> for gateway calls, and vendor bootloaders and ROM APIs use it. Ahura folds the
+> first-task start into PendSV's "no task has run yet" path instead, so `SVC` is
+> entirely the application's. Define `SVC_Handler` however you like.
+
+#### 2. The tick
+
+The kernel needs `os_tick_handler()` called at `OS_CONFIG_TICK_HZ`. It drives
+delays, timeouts, timer expiry and round-robin preemption; nothing else in the
+kernel reads a clock. `OS_CONFIG_TICK_SOURCE` picks who owns the timer.
+
+**`OS_CONFIG_TICK_SOURCE_SYSTICK`** (the default). The port programs SysTick
+from the live CPU clock. The application routes the vector, and that handler
+does one thing:
+
+```c
+void SysTick_Handler(void) { os_tick_handler(); }
+```
+
+**`OS_CONFIG_TICK_SOURCE_EXTERNAL`.** The port touches no timer hardware. It
+calls `os_arch_tick_init_cb()` once from `os_init()`, where the application
+starts whatever timer it wants, and that timer's ISR calls `os_tick_handler()`.
+Both live in `os_cb.c`; the template shows a full example.
+
+Choose EXTERNAL when SysTick is unusable or unavailable:
+
+- **It stops in low-power modes on several families.** Nordic nRF5x drives time
+  from the RTC peripheral for exactly this reason - a SysTick-based kernel there
+  loses time whenever the CPU sleeps.
+- **A vendor HAL or bootloader already owns it** and will not give it up.
+- **The device does not implement it.**
+
+Either way, give the tick interrupt the **lowest** priority the device offers.
+It drives preemption, so it must never itself preempt an application interrupt.
+The port does this for SysTick automatically; with EXTERNAL it is the
+application's job.
+
+> **If the vendor HAL also wants SysTick**, do not try to share the handler by
+> calling both `os_tick_handler()` and the HAL's tick. Two schedulers on one
+> interrupt is a recipe for drift and for HAL timeouts that behave differently
+> depending on what else is running. Move one of them: give the HAL a spare
+> hardware timer (the usual choice, see [Vendor notes](#vendor-notes)), or leave
+> the HAL on SysTick and give the kernel a timer through
+> `OS_CONFIG_TICK_SOURCE_EXTERNAL`.
+
+#### 3. Boot order
+
+```c
+int main(void)
+{
+    /* device init: clock tree, peripherals, whatever the board needs */
+    SystemClock_Config();
+
+    os_init();     /* creates the idle task, service tasks and tsk_main; starts the tick */
+    os_start();    /* switches to task context - never returns */
+}
+```
+
+`os_init()` must run **after** the clock tree is configured, so the live
+`SystemCoreClock` is already correct when the kernel reads it to program the
+tick. See [Platform clock](#platform-clock).
+
+Tasks the application needs before the scheduler runs are created between the
+two calls; everything else is better created from `os_main()`. For stacks use
+`OS_TASK_DEFINE(name, stack_bytes)` - the size is in bytes, rounded up to an
+8-byte multiple, and must be at least `OS_CONFIG_MIN_STACK_SIZE`.
+
+### Vendor notes
+
+Nothing in the kernel is vendor-specific, but vendor *tooling* differs in
+exactly one way that matters: whether it generates an interrupt file that also
+defines `PendSV_Handler`.
+
+#### STM32 (STM32CubeMX / CubeIDE)
+
+CubeMX generates a non-weak `PendSV_Handler` into `Core/Src/stm32<family>_it.c`,
+which collides with the kernel's. Deleting it by hand works until the next code
+generation overwrites the file, so turn it off at the source instead:
+
+> **CubeMX → System Core → NVIC → Code generation tab → clear "Generate IRQ
+> handler" for *Pendable request for system service*.**
+
+That setting is stored in the `.ioc`, so regeneration keeps honouring it. Leave
+*System tick timer* generating, since that is where `os_tick_handler()` goes,
+and leave *System service call via SWI instruction* (`SVC_Handler`) alone - the
+kernel does not use it.
+
+Then move the HAL off SysTick, or the HAL and the kernel will fight over it:
+
+> **CubeMX → System Core → SYS → Timebase Source → any spare timer** (TIM6,
+> TIM7 and TIM17 are common picks).
+
+CubeMX adds `stm32<family>_hal_timebase_tim.c` to the project, and from then on
+`HAL_Delay()` and `HAL_GetTick()` run off that timer while SysTick belongs to
+the kernel. Do **not** call `HAL_IncTick()` from `SysTick_Handler` afterwards.
+
+Note that `HAL_Delay()` still busy-waits - it does not yield. Use
+`os_delay_ms()` in task code and keep `HAL_Delay()` for driver init paths that
+run before `os_start()`.
+
+#### Nordic (nRF5x, nRF53, nRF91)
+
+Nordic's MDK startup files use the standard CMSIS names, so `PendSV_Handler`
+binds with no configuration and nothing needs disabling.
+
+The thing to get right on these parts is the tick. SysTick does not run when the
+CPU sleeps, so anything using the low-power modes these devices are chosen for
+will lose time. Set `OS_CONFIG_TICK_SOURCE_EXTERNAL` and drive
+`os_tick_handler()` from an RTC peripheral instead, as Nordic's own software
+does - `os_cb_template.c` has the skeleton.
+
+If a SoftDevice is present, note that it owns the top of the vector table and
+forwards the lower SVC range to the application. That is not a problem here,
+because the kernel does not use SVC at all.
+
+#### NXP, TI, Silicon Labs, Renesas, Microchip, Infineon, GD32
+
+All use CMSIS-Pack startup files with the standard names, and none of their
+generators emits a competing `PendSV_Handler`. Copy the three files, route the
+tick, build. If a vendor RTOS abstraction is enabled in the project (MCUXpresso
+with FreeRTOS selected, for instance), disable it - two RTOSes cannot both own
+PendSV.
+
+#### Anything else
+
+Open the startup file, find the vector table, and read the name at entry 14
+(offset `0x38`). If it is `PendSV_Handler`, there is nothing to do. If it is
+something else, set `OS_CONFIG_ARCH_PENDSV_HANDLER` to that name. The boot-time
+vector check will confirm it either way.
+
+### Verifying the port
+
+The kernel ships a self-test suite that exercises every enabled feature and
+reports `PASS`/`FAIL` over `printf`, ending with a cycle-accurate benchmark
+table. It needs no application code and no board support beyond a working
+`printf`, which makes it the fastest way to prove a new target is correctly
+integrated before writing anything on top of it.
+
+There are **three** things to line up, and the build tells you clearly if any is
+missing:
+
+1. **Turn it on** in `os_config.h`:
+
+   ```c
+   #define OS_CONFIG_TEST_ENABLE  1U
+   ```
+
+2. **Link the suite.** `os_test()` is declared in `ahura.h` and defined *only*
+   in this library - the kernel ships no stub, not even a weak one, so that
+   forgetting this step fails at link time instead of booting a test build that
+   silently tests nothing:
+
+   ```cmake
+   add_subdirectory(ahura_kernel/test)
+   target_link_libraries(my_firmware os_test)
+   ```
+
+   Miss it and you get `undefined reference to 'os_test'`.
+
+3. **Let the suite own `os_log_output_cb`** (only when `OS_CONFIG_LOG_ENABLE`
+   is also 1). The suite defines that callback itself, because testing the log
+   means inspecting what the kernel actually emitted. The application's copy in
+   `os_cb.c` must therefore step aside, which the current `os_cb_template.c`
+   does for you:
+
+   ```c
+   #if (OS_CONFIG_LOG_ENABLE == 1U) && (OS_CONFIG_TEST_ENABLE == 0U)
+   ```
+
+   An `os_cb.c` copied before that guard existed needs the same condition added.
+   Miss it and you get `multiple definition of 'os_log_output_cb'`. The suite's
+   own PASS/FAIL report goes to `printf`, not through that callback, so nothing
+   is lost.
+
+With the switch on, `os_init()` creates the test task instead of `tsk_main`, so
+the suite runs alone and `os_main()` is never called (`os_main.c` can stay in
+the build; it is simply unused). See [Self-test suite](#self-test-suite) for
+what it covers and how to read the output.
+
+> **Tip.** Rather than keep steps 1 and 2 in sync by hand, have CMake read the
+> switch out of `os_config.h` so there is only one place to change:
+>
+> ```cmake
+> file(READ ${OS_CONFIG_DIR}/os_config.h _os_cfg)
+> if(_os_cfg MATCHES "#define[ \t]+OS_CONFIG_TEST_ENABLE[ \t]+1")
+>     add_subdirectory(ahura_kernel/test)
+>     target_link_libraries(my_firmware os_test)
+> endif()
+> ```
+>
+> Re-run CMake after changing the define - a header is not a configure-time
+> dependency, so the build will not notice on its own.
 
 ---
 
@@ -785,6 +1127,31 @@ Cortex-M1 (ARMv6-M, FPGA) is deliberately not supported. "Optional per device"
 means the Security Extension is a silicon-vendor choice and may also be disabled
 in option bytes, in which case use `OS_CONFIG_TRUSTZONE_DISABLED`.
 
+Every core above is supported on **every silicon vendor**. Nothing in the kernel
+or the ports refers to a vendor, a family, or a HAL - the only device-specific
+symbol anywhere is CMSIS `SystemCoreClock`, and even that has a documented
+one-line fallback (see [Platform clock](#platform-clock)).
+
+### Supported toolchains
+
+| Toolchain | Status |
+|---|---|
+| **GCC** (`arm-none-eabi-gcc`, 10 and later) | Supported. The primary build and test toolchain |
+| **LLVM/Clang** for bare-metal Arm | Supported |
+| **Arm Compiler 6** (`armclang`) | Supported |
+| Arm Compiler 5 (`armcc`) | **Not** supported - end of life, and no GCC-style inline assembly |
+| IAR EWARM (`iccarm`) | **Not** supported yet |
+
+The dividing line is GCC-style inline assembly, which armclang and Clang both
+implement and `armcc`/`iccarm` do not. The port layer needs it for the context
+switch and the atomics; the entire `core/` tree is ordinary portable C11 and
+would build anywhere. Everything else the kernel relies on -
+`__attribute__((weak))`, `__builtin_clz`/`__builtin_ctz`, the `__ARM_ARCH_*` and
+`__ARM_FP` predefined macros - is common to those three compilers.
+
+An IAR port is a contained piece of work: `os_arch_port_common.h` plus the three
+files under `arch/arm/common/`. Nothing in `core/` would change.
+
 ### Application callbacks
 
 Application hooks carry the `_cb` suffix. Most are weak, so overriding them is
@@ -795,6 +1162,9 @@ point, copy `ahura_kernel/os_cb_template.c` into the application source tree as
 `os_cb.c`, add it to the **application** build (never to the kernel, where the
 template is deliberately absent from the CMakeLists), and adapt:
 
+- `os_arch_tick_init_cb` starts the application's own tick timer. **Required**
+  when `OS_CONFIG_TICK_SOURCE` is `OS_CONFIG_TICK_SOURCE_EXTERNAL`, and not
+  declared at all otherwise. See [Integration](#integration).
 - `os_assert_failed_cb` reports a failed assertion. **Required** when
   `OS_CONFIG_ASSERT_ENABLE` is 1, see [Debugging](#debugging).
 - `os_log_output_cb` transmits finished log bytes. **Required** when
@@ -920,6 +1290,15 @@ Config options: `OS_CONFIG_TICKLESS_ENABLE` (default 0),
 `OS_CONFIG_TICKLESS_MIN_IDLE` (the shortest idle worth sleeping for), and
 `OS_CONFIG_MAX_SUPPRESSED_TICKS`.
 
+**Interaction with `OS_CONFIG_TICK_SOURCE`.** Real tick suppression works by
+reprogramming the tick timer's reload, which the port can only do for a timer it
+owns. With `OS_CONFIG_TICK_SOURCE_EXTERNAL` the timer belongs to the
+application, so `os_arch_max_suppressed_ticks_get()` reports 0 and idle degrades
+to a plain WFI - correct, and no worse than the v6m/v7m ports do today, but not
+power-optimal. Suppressing an application-owned tick means suppressing it in
+`os_tickless_pre_sleep_cb()` and reporting the real elapsed time afterwards,
+which the current callback pair does not yet express.
+
 The whole group compiles away with the option, like every other feature in PART
 2 of `ahura.h`: with `OS_CONFIG_TICKLESS_ENABLE` at 0 the three control
 functions are neither declared nor defined, so calling one is a compile error
@@ -1025,6 +1404,22 @@ kernel deliberately ships no stub for `os_test()`, so `os_kernel.c.o` leaves the
 symbol undefined and the linker has a reason to extract `os_test.c.o` from the
 archive. Forgetting the library is a link error rather than a test suite that
 silently vanishes from the build.
+
+One thing the application must give up for a test build: when
+`OS_CONFIG_LOG_ENABLE` is also 1, **the suite defines `os_log_output_cb`
+itself** - testing the log means inspecting what the kernel actually emitted, so
+it captures into a buffer it can search. A second definition in the
+application's `os_cb.c` is a duplicate-symbol link error, which is why
+`os_cb_template.c` guards its copy with:
+
+```c
+#if (OS_CONFIG_LOG_ENABLE == 1U) && (OS_CONFIG_TEST_ENABLE == 0U)
+```
+
+An `os_cb.c` copied before that guard existed needs the same condition added.
+Nothing is lost: the suite's own PASS/FAIL report goes to `printf`, not through
+that callback. See [Verifying the port](#verifying-the-port) for the full
+checklist and the two error messages that point at it.
 
 Once linked, `os_init()` creates and starts the self-test task by itself, gated
 by `OS_CONFIG_TEST_ENABLE`, which is off by default in the template so each
@@ -1224,11 +1619,17 @@ All filenames are `os_`-prefixed:
 
 #### `arch/arm/` port layer
 
-This layer covers the SysTick tick source, SVC first-task start, PendSV context
-switch, initial stack frames, and the cycle counter. Shared code is organized by
-architecture, the same split Zephyr and CMSIS-RTX use: one v6m implementation,
-one v7m implementation, one v8m implementation, with thin per-core wrapper
-folders on top.
+This layer covers the tick source, the PendSV context switch (including the
+first-task start), initial stack frames, and the cycle counter. Shared code is
+organized by architecture, the same split Zephyr and CMSIS-RTX use: one v6m
+implementation, one v7m implementation, one v8m implementation, with thin
+per-core wrapper folders on top.
+
+The layer defines exactly **one** externally visible vector handler,
+`PendSV_Handler` (renameable, see [Integration](#integration)). It does not
+define `SVC_Handler` - the first task is started through PendSV's `PSP == 0`
+path, so SVC stays free for the application - and it does not define
+`SysTick_Handler`, which the application routes to `os_tick_handler()`.
 
 - `common/os_arch_port_v7m.c` is the ARMv7-M (M3) and ARMv7E-M (M4, M7)
   implementation. It is Thumb-2 and FPU-aware, saving `s16-s31` and a per-task
@@ -1245,7 +1646,16 @@ folders on top.
   Baseline does not belong in the v8m file because it cannot execute the
   mainline Thumb-2 ISA, so its TrustZone support is handled here. Non-secure
   v8-M baseline has no `PSPLIM`, so there is no stack-limit handling.
-- Each shared file carries a `#error` guard against being compiled for the wrong
+- `common/os_arch_cycle_systick.c` is the SysTick-derived cycle counter, shared
+  by all three ports. It is the only counter ARMv6-M has, and it is what the
+  mainline ports fall back to when DWT CYCCNT turns out to be unavailable - the
+  unit is architecturally optional, may report `DWT_CTRL.NOCYCCNT`, and on
+  several devices sits behind a debug power domain that refuses the enable until
+  a debugger attaches. `os_arch_init()` checks all three cases and picks once.
+  Without that fallback, `os_delay_us()` on such a part would spin forever.
+- The four files under `common/` are **textual includes**, pulled in by the
+  per-core wrappers below. Never add them to a build as separate compilation
+  units. Each carries a `#error` guard against being compiled for the wrong
   architecture profile.
 - `cortex_m0/`, `cortex_m0plus/`, and `cortex_m23/` are thin wrappers over the
   v6m port.
@@ -1275,6 +1685,9 @@ folders on top.
 
 ## Notes and constraints
 
+- The kernel owns exactly one exception vector, PendSV, and needs exactly one
+  call from the application, `os_tick_handler()`. `SVC` and `SysTick` are not
+  claimed. See [Integration](#integration).
 - Do not block, whether by delaying or locking with a timeout, inside a critical
   section, a scheduler-locked region, or an ISR. Under a scheduler lock the
   kernel enforces it: blocking calls degrade to non-blocking rather than parking

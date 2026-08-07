@@ -448,6 +448,30 @@ os_task_state_t os_task_state_get(const os_task_t *task);
  */
 uint32_t os_tick_get(void);
 
+/******************************************************************************************************/
+/**
+ * @brief Advance the kernel clock by one tick. Call this - and nothing else - from the tick
+ *        interrupt, OS_CONFIG_TICK_HZ times per second.
+ *
+ * This is the one kernel function an application is REQUIRED to call from an ISR, which is why it
+ * is public rather than internal. Which ISR depends on OS_CONFIG_TICK_SOURCE:
+ *
+ *   SYSTICK (default)  The port programs SysTick, and the application routes the vector:
+ *
+ *                          void SysTick_Handler(void) { os_tick_handler(); }
+ *
+ *                      Nothing else belongs in that handler. In particular, on STM32 do not also
+ *                      call HAL_IncTick() - move the HAL's timebase to a spare TIM instead, or the
+ *                      two fight over the same interrupt (see the kernel README).
+ *
+ *   EXTERNAL           The application's own timer ISR calls it, having started that timer in
+ *                      os_arch_tick_init_cb(). See os_cb_template.c.
+ *
+ * Give the tick interrupt the lowest priority the device offers. It drives preemption, so it
+ * should never itself preempt an application interrupt.
+ */
+void os_tick_handler(void);
+
 /*
  * The three delays return nothing. A delay either waits or the request was one the platform
  * cannot express - an unreadable CPU clock, or a duration too long for a 32-bit tick count - and
@@ -1498,7 +1522,7 @@ void os_arch_tz_context_restore_cb(uint32_t task_id);
 /**
  * @brief Enter the scheduler on a secondary core. Call after os_start() is running on core 0,
  *        from the secondary core, once the SoC layer has booted it with a vector table routing
- *        SVC/PendSV/SysTick to the kernel handlers. Does not return.
+ *        PendSV to the kernel handler. Does not return.
  */
 void os_core_start(void);
 

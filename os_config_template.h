@@ -13,7 +13,14 @@
  *   PART 1  CORE - always compiled in. Set these first.
  *   PART 2  OPTIONAL FEATURES - one section per feature, each holding its _ENABLE switch with the
  *           sizing that switch controls. Same order as PART 2 of ahura.h.
- *   PART 3  PLATFORM - target properties (TrustZone, core count, tickless).
+ *   PART 3  PLATFORM - target properties (vector name, TrustZone, core count, tickless).
+ *
+ * Three options are marked OPTIONAL where they appear - OS_CONFIG_TICK_SOURCE,
+ * OS_CONFIG_ARCH_PENDSV_HANDLER and OS_CONFIG_ARCH_VECTOR_CHECK. Each is a name or a yes/no
+ * diagnostic the kernel can default correctly on its own, so a config predating them still builds
+ * and behaves identically. Everything else is mandatory: a missing sizing or feature switch would
+ * read as 0 in an #if and silently disable or misconfigure something, which is why the kernel
+ * rejects it outright instead.
  *
  * @copyright (c) 2026 Ahura Project Contributors
  *            SPDX-License-Identifier: MIT
@@ -40,6 +47,39 @@
 */
 
 #define OS_CONFIG_TICK_HZ                   1000U
+
+/**
+ * Where that tick comes from. The two values are kernel-owned
+ * (os_arch_port_common.h); this only selects between them.
+ *
+ *   OS_CONFIG_TICK_SOURCE_SYSTICK   The port programs SysTick itself, from the
+ *                                   live CPU clock and OS_CONFIG_TICK_HZ above.
+ *                                   Nothing to write, nothing to route.
+ *
+ *   OS_CONFIG_TICK_SOURCE_EXTERNAL  The application owns the tick hardware. The
+ *                                   port programs nothing and instead calls
+ *                                   os_arch_tick_init_cb() (os_cb.c) once at
+ *                                   the end of os_init(); that callback starts
+ *                                   whatever timer the board uses, and its ISR
+ *                                   must call os_tick_handler() OS_CONFIG_TICK_HZ
+ *                                   times per second.
+ *
+ * Reach for EXTERNAL when SysTick is unusable or already taken:
+ *
+ *   - It stops in the low-power modes several families ship with. Nordic nRF5x
+ *     drives time from the RTC peripheral for exactly this reason, and a
+ *     SysTick-based kernel there simply loses time whenever the CPU sleeps.
+ *   - A vendor HAL or bootloader already owns it and cannot give it up.
+ *   - The device does not implement it.
+ *
+ * Note for tickless idle: the ARMv8-M port suppresses ticks by reprogramming
+ * SysTick, which it obviously cannot do for a timer it does not own. With
+ * EXTERNAL it therefore reports no suppression capability and idle degrades to
+ * a plain WFI - correct, just not power-optimal.
+ *
+ * This option is OPTIONAL: leaving it out selects SYSTICK.
+ */
+#define OS_CONFIG_TICK_SOURCE               OS_CONFIG_TICK_SOURCE_SYSTICK
 
 /* Round-robin time slice, in ticks: how long a task may hold the CPU before an
  * equal-priority peer takes over. Tasks of DIFFERENT priorities are unaffected
@@ -367,6 +407,56 @@
  * PART 3 - PLATFORM (target properties, not application design choices)
  * ***********************************************************************************************************
 */
+
+/*
+ * ***********************************************************************************************************
+ * Exception vector the kernel owns
+ * ***********************************************************************************************************
+*/
+
+/**
+ * The symbol name the kernel gives its PendSV handler.
+ *
+ * PendSV is the ONE vector the kernel must own, because a context switch has to
+ * BE the exception entry point - it manipulates the frame the hardware pushed
+ * and returns through EXC_RETURN, neither of which survives an ordinary C call.
+ * SysTick is routed by the application (or replaced entirely, see
+ * OS_CONFIG_TICK_SOURCE in PART 1), and SVC is left completely alone.
+ *
+ * PendSV_Handler is the CMSIS-Pack convention, which is what essentially every
+ * vendor startup file uses - ST, Nordic, NXP, TI, Silicon Labs, Renesas,
+ * Microchip, Infineon - so the default is correct on all of them and the vast
+ * majority of projects never touch this. Change it only when the vector table
+ * calls the entry something else: a hand-written startup file, a non-CMSIS
+ * environment, or a bootloader's own table.
+ *
+ * Whatever name is set here, exactly one definition of it may exist in the
+ * link. If a vendor IDE also generates one (STM32CubeMX does), stop it doing
+ * so or delete it - see the kernel README, "Integration".
+ *
+ * This option is OPTIONAL: leaving it out selects PendSV_Handler.
+ */
+#define OS_CONFIG_ARCH_PENDSV_HANDLER       PendSV_Handler
+
+/**
+ * Check at boot that the live vector table really routes PendSV to the kernel
+ * (1 = on, 0 = skip).
+ *
+ * Worth leaving on. Without it, the failure is silent and expensive: if some
+ * other definition of the handler name wins at link time, or a bootloader
+ * relocated the vector table and repopulated it from its own image, the build
+ * still succeeds and the board simply stops at os_start() - no fault, no
+ * output, nothing to attach to. The check turns that into an immediate park in
+ * os_arch_config_fault_trap(), where the debugger lands on the cause. It costs
+ * one load and one compare, once.
+ *
+ * Set it to 0 only for a boot flow whose vector table genuinely cannot be read
+ * when os_init() runs - one patched in later, or behind a memory window VTOR
+ * does not describe.
+ *
+ * This option is OPTIONAL: leaving it out enables the check.
+ */
+#define OS_CONFIG_ARCH_VECTOR_CHECK         1U
 
 /*
  * ***********************************************************************************************************

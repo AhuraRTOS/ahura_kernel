@@ -46,6 +46,55 @@
 
 /*
  * ***********************************************************************************************************
+ * Kernel tick source (OS_CONFIG_TICK_SOURCE_EXTERNAL only)
+ * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_TICK_SOURCE == OS_CONFIG_TICK_SOURCE_EXTERNAL)
+/******************************************************************************************************/
+/**
+ * @brief Start the timer that drives the kernel tick, and arrange for its ISR to call
+ *        os_tick_handler() OS_CONFIG_TICK_HZ times per second.
+ *
+ * REQUIRED while OS_CONFIG_TICK_SOURCE is OS_CONFIG_TICK_SOURCE_EXTERNAL: the kernel ships no
+ * default, so leaving this out is a link error rather than a kernel whose clock never advances -
+ * which presents as every delay, timeout and timer hanging forever, with nothing pointing at the
+ * tick as the cause. Delete this block (and set the option back to SYSTICK) to let the port
+ * program SysTick itself.
+ *
+ * Called once from os_init(), after the application has configured its clock tree.
+ *
+ * Two rules for the interrupt this starts:
+ *
+ *   1. Give it the LOWEST priority the device offers, which is what the port does for SysTick.
+ *      Anything higher lets a tick preempt application interrupts.
+ *   2. It must be reachable by the kernel's interrupt mask. With a nonzero
+ *      OS_CONFIG_MAX_SYSCALL_INTERRUPT_PRIORITY, a tick ISR above that threshold is trapped by
+ *      os_arch_isr_priority_check the moment it calls into the kernel.
+ *
+ * Example - an RTC/LPTIM-style peripheral, which is the usual reason to be here at all (Nordic
+ * nRF5x, and any design whose SysTick stops in the sleep mode it ships with):
+ *
+ *     void os_arch_tick_init_cb(void)
+ *     {
+ *         my_lptim_start_periodic(OS_CONFIG_TICK_HZ);
+ *         my_lptim_irq_priority_set(MY_LOWEST_IRQ_PRIORITY);
+ *         my_lptim_irq_enable();
+ *     }
+ *
+ *     void LPTIM_IRQHandler(void)   // the device's own vector name
+ *     {
+ *         my_lptim_flag_clear();
+ *         os_tick_handler();
+ *     }
+ */
+void os_arch_tick_init_cb(void)
+{
+}
+#endif /* OS_CONFIG_TICK_SOURCE_EXTERNAL */
+
+/*
+ * ***********************************************************************************************************
  * Debug hooks
  * ***********************************************************************************************************
 */
@@ -102,7 +151,14 @@ void os_stack_overflow_cb(const char *task_name)
 }
 #endif /* OS_CONFIG_STACK_CHECK_ENABLE */
 
-#if (OS_CONFIG_LOG_ENABLE == 1U)
+/* The self-test build owns this one. The suite has to see what the kernel actually emitted in
+ * order to test the log at all, so ahura_kernel/test/os_test.c defines os_log_output_cb itself
+ * and captures into a buffer it can search. Two definitions would be a duplicate-symbol link
+ * error, so the application's steps aside for that build - which is also why this guard tests
+ * OS_CONFIG_TEST_ENABLE while every other block here tests only its own feature switch.
+ *
+ * The suite's PASS/FAIL report does not come through here; it goes to printf. */
+#if (OS_CONFIG_LOG_ENABLE == 1U) && (OS_CONFIG_TEST_ENABLE == 0U)
 /******************************************************************************************************/
 /**
  * @brief Transmit finished log bytes.
@@ -122,7 +178,7 @@ void os_log_output_cb(const uint8_t *data, size_t length)
 
     /* Example: HAL_UART_Transmit(&huart, (uint8_t *)data, length, HAL_MAX_DELAY); */
 }
-#endif /* OS_CONFIG_LOG_ENABLE */
+#endif /* OS_CONFIG_LOG_ENABLE && !OS_CONFIG_TEST_ENABLE */
 
 /*
  * ***********************************************************************************************************

@@ -1645,7 +1645,7 @@ void os_task_stack_save_current(uint32_t *stack_ptr)
 
 /******************************************************************************************************/
 /**
- * @brief Select the next task to run and return its stack pointer (called from PendSV/SVC).
+ * @brief Select the next task to run and return its stack pointer (called from PendSV).
  *
  * @return uint32_t*  Stack pointer for the selected task; never NULL (idle fallback).
  */
