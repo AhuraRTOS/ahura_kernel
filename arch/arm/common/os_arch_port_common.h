@@ -65,8 +65,8 @@
     !defined(OS_CONFIG_TIMER_CORE_AFFINITY) ||                                                         \
     !defined(OS_CONFIG_MAIN_TASK_STACK_SIZE) || !defined(OS_CONFIG_MAIN_TASK_PRIORITY) ||               \
     !defined(OS_CONFIG_TEST_STACK_SIZE) || !defined(OS_CONFIG_TEST_PRIORITY) ||                        \
-    !defined(OS_CONFIG_TRUSTZONE) || !defined(OS_CONFIG_MAX_SYSCALL_INTERRUPT_PRIORITY) ||             \
-    !defined(OS_CONFIG_CORE_COUNT) || !defined(OS_CONFIG_MULTICORE_SPINLOCK_SOC_BACKEND) ||            \
+    !defined(OS_CONFIG_TRUSTZONE) || !defined(OS_CONFIG_MAX_SYSCALL_IRQ_PRIORITY) ||             \
+    !defined(OS_CONFIG_CORE_COUNT) || !defined(OS_CONFIG_SPINLOCK_SOC_BACKEND) ||            \
     !defined(OS_CONFIG_TICKLESS_ENABLE) ||                                                             \
     !defined(OS_CONFIG_TICKLESS_MIN_IDLE) || !defined(OS_CONFIG_LPTIM_CLOCK_HZ) ||                     \
     !defined(OS_CONFIG_MAX_SUPPRESSED_TICKS)
@@ -259,19 +259,19 @@ extern "C"
 #endif
 
 /*
- * Kernel interrupt-mask backend selected by OS_CONFIG_MAX_SYSCALL_INTERRUPT_PRIORITY:
+ * Kernel interrupt-mask backend selected by OS_CONFIG_MAX_SYSCALL_IRQ_PRIORITY:
  *   0        PRIMASK: critical sections mask every interrupt (all cores).
  *   nonzero  BASEPRI: critical sections mask only interrupts whose NVIC
  *            priority byte is numerically >= the value; interrupts above it
  *            (numerically lower) keep zero kernel latency but MUST NOT call
  *            any kernel API. Requires BASEPRI (see OS_ARCH_HAS_BASEPRI).
  */
-#if (OS_CONFIG_MAX_SYSCALL_INTERRUPT_PRIORITY != 0U) && (OS_ARCH_HAS_BASEPRI == 0)
-#error "OS_CONFIG_MAX_SYSCALL_INTERRUPT_PRIORITY requires BASEPRI (ARMv7-M/ARMv7E-M/ARMv8-M mainline); set it to 0 on Cortex-M0/M0+/M23."
+#if (OS_CONFIG_MAX_SYSCALL_IRQ_PRIORITY != 0U) && (OS_ARCH_HAS_BASEPRI == 0)
+#error "OS_CONFIG_MAX_SYSCALL_IRQ_PRIORITY requires BASEPRI (ARMv7-M/ARMv7E-M/ARMv8-M mainline); set it to 0 on Cortex-M0/M0+/M23."
 #endif
 
-#if (OS_CONFIG_MAX_SYSCALL_INTERRUPT_PRIORITY > 255U)
-#error "OS_CONFIG_MAX_SYSCALL_INTERRUPT_PRIORITY is an 8-bit NVIC priority byte (0..255, pre-shifted into the implemented bits)."
+#if (OS_CONFIG_MAX_SYSCALL_IRQ_PRIORITY > 255U)
+#error "OS_CONFIG_MAX_SYSCALL_IRQ_PRIORITY is an 8-bit NVIC priority byte (0..255, pre-shifted into the implemented bits)."
 #endif
 
 /* Validate the configured TrustZone mode against the target early, with
@@ -407,7 +407,7 @@ static inline bool os_arch_in_isr(void)
  * ***********************************************************************************************************
  *
  * Every kernel critical section and ISR-safe walk masks interrupts through
- * this pair. With OS_CONFIG_MAX_SYSCALL_INTERRUPT_PRIORITY == 0 it is the
+ * this pair. With OS_CONFIG_MAX_SYSCALL_IRQ_PRIORITY == 0 it is the
  * classic PRIMASK mask (everything). With a nonzero value it raises BASEPRI
  * instead, so interrupts of numerically lower (more urgent) priority stay
  * enabled with zero kernel-induced latency - in exchange they must never
@@ -420,14 +420,14 @@ static inline bool os_arch_in_isr(void)
  */
 static inline uint32_t os_arch_kernel_mask_save(void)
 {
-#if (OS_CONFIG_MAX_SYSCALL_INTERRUPT_PRIORITY != 0U)
+#if (OS_CONFIG_MAX_SYSCALL_IRQ_PRIORITY != 0U)
     uint32_t previous;
 
     __asm volatile("mrs %0, basepri" : "=r"(previous));
 
     /* basepri_max only ever tightens the mask: a nested save can never
      * accidentally lower a threshold already raised by an outer level. */
-    __asm volatile("msr basepri_max, %0" :: "r"((uint32_t)OS_CONFIG_MAX_SYSCALL_INTERRUPT_PRIORITY) : "memory");
+    __asm volatile("msr basepri_max, %0" :: "r"((uint32_t)OS_CONFIG_MAX_SYSCALL_IRQ_PRIORITY) : "memory");
     OS_ARCH_DSB();
     OS_ARCH_ISB();
 
@@ -447,7 +447,7 @@ static inline uint32_t os_arch_kernel_mask_save(void)
  */
 static inline void os_arch_kernel_mask_restore(uint32_t saved_state)
 {
-#if (OS_CONFIG_MAX_SYSCALL_INTERRUPT_PRIORITY != 0U)
+#if (OS_CONFIG_MAX_SYSCALL_IRQ_PRIORITY != 0U)
     __asm volatile("msr basepri, %0" :: "r"(saved_state) : "memory");
     OS_ARCH_ISB();
 #else
@@ -464,7 +464,7 @@ static inline void os_arch_kernel_mask_restore(uint32_t saved_state)
  */
 static inline uint32_t os_arch_kernel_mask_active(void)
 {
-#if (OS_CONFIG_MAX_SYSCALL_INTERRUPT_PRIORITY != 0U)
+#if (OS_CONFIG_MAX_SYSCALL_IRQ_PRIORITY != 0U)
     uint32_t basepri;
 
     __asm volatile("mrs %0, basepri" : "=r"(basepri));
@@ -531,13 +531,13 @@ static inline void os_arch_vector_check(void (*pendsv_handler)(void))
 /******************************************************************************************************/
 /**
  * @brief In BASEPRI mode, trap a kernel API call from an interrupt the kernel mask cannot
- *        reach (NVIC priority numerically below OS_CONFIG_MAX_SYSCALL_INTERRUPT_PRIORITY):
+ *        reach (NVIC priority numerically below OS_CONFIG_MAX_SYSCALL_IRQ_PRIORITY):
  *        such a call could corrupt kernel state, so it parks in os_arch_config_fault_trap.
  *        Compiles to nothing in PRIMASK mode, where every interrupt is maskable.
  */
 static inline void os_arch_isr_priority_check(void)
 {
-#if (OS_CONFIG_MAX_SYSCALL_INTERRUPT_PRIORITY != 0U)
+#if (OS_CONFIG_MAX_SYSCALL_IRQ_PRIORITY != 0U)
     uint32_t ipsr;
     uint32_t priority;
 
@@ -577,7 +577,7 @@ static inline void os_arch_isr_priority_check(void)
     /* Raw-byte comparison is exact because os_arch_init rejects thresholds
      * with unimplemented bits and priority groupings with subpriority bits
      * (both would make this differ from the hardware's masking decision). */
-    if (priority < (uint32_t)OS_CONFIG_MAX_SYSCALL_INTERRUPT_PRIORITY)
+    if (priority < (uint32_t)OS_CONFIG_MAX_SYSCALL_IRQ_PRIORITY)
     {
         os_arch_config_fault_trap();
     }
@@ -1189,7 +1189,7 @@ uint32_t os_arch_max_suppressed_ticks_get(void);
  *
  * Give the tick interrupt the LOWEST priority the device offers, matching what the port does for
  * SysTick. Anything else lets a tick preempt application interrupts. The handler must also be
- * reachable by the kernel's interrupt mask: with a nonzero OS_CONFIG_MAX_SYSCALL_INTERRUPT_PRIORITY,
+ * reachable by the kernel's interrupt mask: with a nonzero OS_CONFIG_MAX_SYSCALL_IRQ_PRIORITY,
  * a tick ISR above the threshold is trapped by os_arch_isr_priority_check the moment it calls in.
  */
 void os_arch_tick_init_cb(void);
@@ -1249,7 +1249,7 @@ static inline uint32_t os_arch_core_id_get(void)
 
 /*
  * The SoC-callback spinlock backend is used when the core lacks LDREX/STREX
- * (mandatory - ARMv6-M) or when OS_CONFIG_MULTICORE_SPINLOCK_SOC_BACKEND opts
+ * (mandatory - ARMv6-M) or when OS_CONFIG_SPINLOCK_SOC_BACKEND opts
  * out of the built-in LDREX/STREX backend: a core WITH exclusives can still
  * need this when its interconnect implements no GLOBAL exclusive monitor, or
  * the spinlock's memory is not Shareable-mapped - STREX then only excludes
@@ -1257,14 +1257,14 @@ static inline uint32_t os_arch_core_id_get(void)
  * across cores. See the OS_CONFIG_CORE_COUNT precondition notes in
  * os_config_template.h.
  */
-#define OS_ARCH_SPINLOCK_USE_CB  ((OS_ARCH_HAS_EXCLUSIVES == 0) || (OS_CONFIG_MULTICORE_SPINLOCK_SOC_BACKEND != 0))
+#define OS_ARCH_SPINLOCK_USE_CB  ((OS_ARCH_HAS_EXCLUSIVES == 0) || (OS_CONFIG_SPINLOCK_SOC_BACKEND != 0))
 
 #if (OS_CONFIG_CORE_COUNT > 1U) && (OS_ARCH_SPINLOCK_USE_CB)
 /******************************************************************************************************/
 /**
  * @brief SoC callbacks backing the kernel spinlock: mandatory on cores without LDREX/STREX
  *        (ARMv6-M multi-core SoCs, e.g. hardware SIO spinlocks on the RP2040), optional
- *        elsewhere via OS_CONFIG_MULTICORE_SPINLOCK_SOC_BACKEND. No default is provided
+ *        elsewhere via OS_CONFIG_SPINLOCK_SOC_BACKEND. No default is provided
  *        on purpose: a missing implementation must fail at link time rather than silently
  *        not lock.
  */

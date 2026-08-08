@@ -185,7 +185,7 @@
  * preemption, with no subpriority bits.
  */
 
-#define OS_CONFIG_MAX_SYSCALL_INTERRUPT_PRIORITY  0U
+#define OS_CONFIG_MAX_SYSCALL_IRQ_PRIORITY  0U
 
 /*
  * ***********************************************************************************************************
@@ -291,7 +291,7 @@
 /* Task notifications: a single overwrite uint32_t "mailbox" built into every task's own
  * control block (os_notify_give / os_notify_wait) - lets one task or an ISR signal
  * a specific task directly without allocating a separate semaphore/queue object. */
-#define OS_CONFIG_NOTIFY_ENABLE        1U
+#define OS_CONFIG_NOTIFY_ENABLE             1U
 
 /*
  * ***********************************************************************************************************
@@ -503,7 +503,7 @@
  *   1. Global exclusive monitor. The inter-core spinlock uses LDREX/STREX, which only excludes
  *      another core when the interconnect implements a GLOBAL monitor for that address AND the
  *      address is Shareable-mapped. Without both, two cores can succeed at once and the lock
- *      silently stops excluding anything. OS_CONFIG_MULTICORE_SPINLOCK_SOC_BACKEND routes it
+ *      silently stops excluding anything. OS_CONFIG_SPINLOCK_SOC_BACKEND routes it
  *      through your own hardware semaphore instead.
  *   2. Cache coherency. Cortex-M has none between cores, and DSB is not cache maintenance. Every
  *      shared kernel object (ready/delay lists, the registries, os_task_current[], the spinlock
@@ -528,7 +528,7 @@
  * OS_CONFIG_CORE_COUNT > 1; keep 0 on single-core builds.
  */
 
-#define OS_CONFIG_MULTICORE_SPINLOCK_SOC_BACKEND  0U
+#define OS_CONFIG_SPINLOCK_SOC_BACKEND      0U
 
 /*
  * ***********************************************************************************************************

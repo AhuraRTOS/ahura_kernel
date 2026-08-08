@@ -71,7 +71,7 @@ static uint32_t os_arch_cycle_systick_get(void)
     /* The accumulator is read-modify-written against a down-counter that keeps running, so the
      * whole sample has to be indivisible - a tick landing in the middle would double-count or
      * skip a wrap. PRIMASK rather than the kernel mask: this must also be correct when called
-     * from an interrupt above OS_CONFIG_MAX_SYSCALL_INTERRUPT_PRIORITY. */
+     * from an interrupt above OS_CONFIG_MAX_SYSCALL_IRQ_PRIORITY. */
     OS_ARCH_IRQ_DISABLE();
 
     reload = OS_ARCH_REG_SYST_RVR & OS_ARCH_SYST_RVR_RELOAD_MSK;

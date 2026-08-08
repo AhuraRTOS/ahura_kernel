@@ -220,7 +220,7 @@ void os_arch_init(void)
 
     OS_ARCH_REG_SHPR3 = shpr3;
 
-#if (OS_CONFIG_MAX_SYSCALL_INTERRUPT_PRIORITY != 0U)
+#if (OS_CONFIG_MAX_SYSCALL_IRQ_PRIORITY != 0U)
     /* The raw-byte comparisons in os_arch_isr_priority_check are only exact
      * when (1) the configured threshold lives entirely in this device's
      * implemented priority bits (write-back must return it unchanged; a
@@ -235,7 +235,7 @@ void os_arch_init(void)
         uint32_t implemented;
         uint32_t prigroup;
 
-        __asm volatile("msr basepri, %0" :: "r"((uint32_t)OS_CONFIG_MAX_SYSCALL_INTERRUPT_PRIORITY) : "memory");
+        __asm volatile("msr basepri, %0" :: "r"((uint32_t)OS_CONFIG_MAX_SYSCALL_IRQ_PRIORITY) : "memory");
         __asm volatile("mrs %0, basepri" : "=r"(readback));
         __asm volatile("msr basepri, %0" :: "r"(0xFFU) : "memory");
         __asm volatile("mrs %0, basepri" : "=r"(implemented));
@@ -243,7 +243,7 @@ void os_arch_init(void)
 
         prigroup = (OS_ARCH_REG_AIRCR >> 8) & 0x7U;
 
-        if ((readback != (uint32_t)OS_CONFIG_MAX_SYSCALL_INTERRUPT_PRIORITY) ||
+        if ((readback != (uint32_t)OS_CONFIG_MAX_SYSCALL_IRQ_PRIORITY) ||
             ((implemented & ((1UL << (prigroup + 1U)) - 1U)) != 0U))
         {
             os_arch_config_fault_trap();

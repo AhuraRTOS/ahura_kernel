@@ -770,7 +770,7 @@ static void test_critical_section(void)
     test_print_section("Critical Sections");
 
     /* os_arch_kernel_mask_active reads PRIMASK or BASEPRI depending on
-     * OS_CONFIG_MAX_SYSCALL_INTERRUPT_PRIORITY, so the checks hold in both
+     * OS_CONFIG_MAX_SYSCALL_IRQ_PRIORITY, so the checks hold in both
      * kernel mask modes. */
     AHURA_TEST_CHECK(os_arch_kernel_mask_active() == 0U, "the kernel mask is lowered before entering a critical section");
 

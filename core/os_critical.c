@@ -3,7 +3,7 @@
  * @brief Critical section module implementation (kernel interrupt mask based, nesting aware).
  *
  * The interrupt mask is the port's kernel mask: PRIMASK by default, or BASEPRI up to
- * OS_CONFIG_MAX_SYSCALL_INTERRUPT_PRIORITY when that is nonzero (interrupts above the threshold
+ * OS_CONFIG_MAX_SYSCALL_IRQ_PRIORITY when that is nonzero (interrupts above the threshold
  * keep zero kernel latency but must never call a kernel API). On multi-core builds the outermost
  * enter also takes the global kernel spinlock, so a critical section excludes the other cores
  * too; nesting is per core, and both compile to nothing on single-core builds.

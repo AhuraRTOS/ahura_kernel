@@ -69,7 +69,7 @@
  *   1. Give it the LOWEST priority the device offers, which is what the port does for SysTick.
  *      Anything higher lets a tick preempt application interrupts.
  *   2. It must be reachable by the kernel's interrupt mask. With a nonzero
- *      OS_CONFIG_MAX_SYSCALL_INTERRUPT_PRIORITY, a tick ISR above that threshold is trapped by
+ *      OS_CONFIG_MAX_SYSCALL_IRQ_PRIORITY, a tick ISR above that threshold is trapped by
  *      os_arch_isr_priority_check the moment it calls into the kernel.
  *
  * Example - an RTC/LPTIM-style peripheral, which is the usual reason to be here at all (Nordic
@@ -242,7 +242,7 @@ void os_arch_core_ipi_request_cb(uint32_t core_id)
 /* Exactly the condition under which the kernel routes its spinlock through
  * these callbacks (os_arch_port_common.h), so the two can never disagree:
  * cores without LDREX/STREX, plus any core where
- * OS_CONFIG_MULTICORE_SPINLOCK_SOC_BACKEND opts out of the built-in backend.
+ * OS_CONFIG_SPINLOCK_SOC_BACKEND opts out of the built-in backend.
  * Testing OS_ARCH_HAS_EXCLUSIVES alone would miss that second case and leave
  * the opt-out failing at link time. */
 #if (OS_ARCH_SPINLOCK_USE_CB)
