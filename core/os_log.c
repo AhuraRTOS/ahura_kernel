@@ -98,17 +98,11 @@ void os_log_write(uint32_t level, const char *fmt, ...)
 {
     /* Scratch lives on the CALLER's stack: every task that logs needs
      * OS_CONFIG_LOG_LINE_MAX bytes of headroom for it. */
-    char    line[OS_CONFIG_LOG_LINE_MAX];
-    va_list args;
-    int     prefix_len;
-    int     body_len;
-    size_t  total;
-    char    severity;
-
-    if (fmt == NULL)
-    {
-        return;
-    }
+    /* Scratch lives on the CALLER's stack: every task that logs needs
+     * OS_CONFIG_LOG_LINE_MAX bytes of headroom for it. */
+    char line[OS_CONFIG_LOG_LINE_MAX];
+    char severity;
+    int  prefix_len = -1;
 
     switch (level)
     {
@@ -118,45 +112,49 @@ void os_log_write(uint32_t level, const char *fmt, ...)
     default:                 severity = 'I'; break;
     }
 
-    /* Timestamp first so lines are orderable even when the transport reorders
-     * nothing - the tick is read here, at the call site, not at drain time. */
-    prefix_len = snprintf(line, sizeof(line), "[%8lu] %c ", (unsigned long)os_tick_get(), severity);
-
-    if ((prefix_len < 0) || ((size_t)prefix_len >= sizeof(line)))
+    if (fmt != NULL)
     {
-        return; /* cannot happen with a sane LINE_MAX, but never index past the buffer */
+        /* Timestamp first so lines are orderable even when the transport reorders
+         * nothing - the tick is read here, at the call site, not at drain time. */
+        prefix_len = snprintf(line, sizeof(line), "[%8lu] %c ", (unsigned long)os_tick_get(), severity);
     }
 
-    va_start(args, fmt);
-    body_len = vsnprintf(&line[prefix_len], sizeof(line) - (size_t)prefix_len, fmt, args);
-    va_end(args);
-
-    if (body_len < 0)
+    /* Cannot happen with a sane LINE_MAX, but never index past the buffer. */
+    if ((prefix_len >= 0) && ((size_t)prefix_len < sizeof(line)))
     {
-        return; /* encoding error in the format string */
+        va_list args;
+        int     body_len;
+
+        va_start(args, fmt);
+        body_len = vsnprintf(&line[prefix_len], sizeof(line) - (size_t)prefix_len, fmt, args);
+        va_end(args);
+
+        /* A negative length is an encoding error in the format string: nothing to queue. */
+        if (body_len >= 0)
+        {
+            size_t total = (size_t)prefix_len + (size_t)body_len;
+
+            /* vsnprintf reports what it WOULD have written: clamp to what it actually
+             * did, so an over-long line is truncated rather than read out of bounds. */
+            if (total > (sizeof(line) - 1U))
+            {
+                total = sizeof(line) - 1U;
+            }
+
+            /* Room for the line ending is reserved from the same budget, so a full
+             * line still terminates properly instead of running into the next one. */
+            if (total > (sizeof(line) - 3U))
+            {
+                total = sizeof(line) - 3U;
+            }
+
+            line[total]      = '\r';
+            line[total + 1U] = '\n';
+            total            += 2U;
+
+            os_log_queue(line, total);
+        }
     }
-
-    total = (size_t)prefix_len + (size_t)body_len;
-
-    /* vsnprintf reports what it WOULD have written: clamp to what it actually
-     * did, so an over-long line is truncated rather than read out of bounds. */
-    if (total > (sizeof(line) - 1U))
-    {
-        total = sizeof(line) - 1U;
-    }
-
-    /* Room for the line ending is reserved from the same budget, so a full
-     * line still terminates properly instead of running into the next one. */
-    if (total > (sizeof(line) - 3U))
-    {
-        total = sizeof(line) - 3U;
-    }
-
-    line[total]      = '\r';
-    line[total + 1U] = '\n';
-    total            += 2U;
-
-    os_log_queue(line, total);
 }
 
 /******************************************************************************************************/
@@ -199,20 +197,20 @@ os_status os_log_system_init(void)
     os_log_dropped = 0U;
 
     status = os_task_create_system(&tsk_log, &config);
-    if (status != OS_STATUS_OK)
+
+    /* Each step only runs once the previous one succeeded, and the first failure
+     * is what gets reported. */
+    if (status == OS_STATUS_OK)
     {
-        return status;
+        status = os_task_start(&tsk_log);
     }
 
-    status = os_task_start(&tsk_log);
-    if (status != OS_STATUS_OK)
+    if (status == OS_STATUS_OK)
     {
-        return status;
+        os_log_task_tcb = os_task_tcb_resolve(tsk_log.id);
     }
 
-    os_log_task_tcb = os_task_tcb_resolve(tsk_log.id);
-
-    return OS_STATUS_OK;
+    return status;
 }
 
 /*

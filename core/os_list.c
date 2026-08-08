@@ -33,13 +33,11 @@
  */
 void os_list_init(os_list_t *list)
 {
-    if (list == NULL)
+    if (list != NULL)
     {
-        return;
+        list->head = NULL;
+        list->tail = NULL;
     }
-
-    list->head = NULL;
-    list->tail = NULL;
 }
 
 /******************************************************************************************************/
@@ -51,12 +49,14 @@ void os_list_init(os_list_t *list)
  */
 bool os_list_is_empty(const os_list_t *list)
 {
-    if (list == NULL)
+    bool is_empty = true;
+
+    if (list != NULL)
     {
-        return true;
+        is_empty = (list->head == NULL);
     }
 
-    return (list->head == NULL);
+    return is_empty;
 }
 
 /******************************************************************************************************/
@@ -69,24 +69,22 @@ bool os_list_is_empty(const os_list_t *list)
  */
 void os_list_push_back(os_list_t *list, os_list_node_t *node)
 {
-    if ((list == NULL) || (node == NULL))
+    if ((list != NULL) && (node != NULL))
     {
-        return;
-    }
+        node->next = NULL;
+        node->prev = list->tail;
 
-    node->next = NULL;
-    node->prev = list->tail;
+        if (list->tail != NULL)
+        {
+            list->tail->next = node;
+        }
+        else
+        {
+            list->head = node;
+        }
 
-    if (list->tail != NULL)
-    {
-        list->tail->next = node;
+        list->tail = node;
     }
-    else
-    {
-        list->head = node;
-    }
-
-    list->tail = node;
 }
 
 /******************************************************************************************************/
@@ -100,25 +98,23 @@ os_list_node_t* os_list_pop_front(os_list_t *list)
 {
     os_list_node_t *node = NULL;
 
-    if ((list == NULL) || (list->head == NULL))
+    if ((list != NULL) && (list->head != NULL))
     {
-        return NULL;
-    }
+        node       = list->head;
+        list->head = node->next;
 
-    node       = list->head;
-    list->head = node->next;
+        if (list->head != NULL)
+        {
+            list->head->prev = NULL;
+        }
+        else
+        {
+            list->tail = NULL;
+        }
 
-    if (list->head != NULL)
-    {
-        list->head->prev = NULL;
+        node->next = NULL;
+        node->prev = NULL;
     }
-    else
-    {
-        list->tail = NULL;
-    }
-
-    node->next = NULL;
-    node->prev = NULL;
 
     return node;
 }
@@ -136,36 +132,32 @@ os_list_node_t* os_list_pop_front(os_list_t *list)
  */
 void os_list_remove(os_list_t *list, os_list_node_t *node)
 {
-    if ((list == NULL) || (node == NULL))
+    /* A detached node (NULL neighbours and not the head) is left alone, so removing
+     * twice is harmless - expressed as one guarded block for a single exit. */
+    if ((list != NULL) && (node != NULL) &&
+        ((node->prev != NULL) || (node->next != NULL) || (list->head == node)))
     {
-        return;
-    }
+        if (node->prev != NULL)
+        {
+            node->prev->next = node->next;
+        }
+        else
+        {
+            list->head = node->next;
+        }
 
-    if ((node->prev == NULL) && (node->next == NULL) && (list->head != node))
-    {
-        return;
-    }
+        if (node->next != NULL)
+        {
+            node->next->prev = node->prev;
+        }
+        else
+        {
+            list->tail = node->prev;
+        }
 
-    if (node->prev != NULL)
-    {
-        node->prev->next = node->next;
+        node->next = NULL;
+        node->prev = NULL;
     }
-    else
-    {
-        list->head = node->next;
-    }
-
-    if (node->next != NULL)
-    {
-        node->next->prev = node->prev;
-    }
-    else
-    {
-        list->tail = node->prev;
-    }
-
-    node->next = NULL;
-    node->prev = NULL;
 }
 
 /******************************************************************************************************/
@@ -182,28 +174,27 @@ void os_list_remove(os_list_t *list, os_list_node_t *node)
  */
 void os_list_insert_before(os_list_t *list, os_list_node_t *position, os_list_node_t *node)
 {
-    if ((list == NULL) || (node == NULL))
+    if ((list != NULL) && (node != NULL))
     {
-        return;
-    }
+        if (position == NULL)
+        {
+            os_list_push_back(list, node);
+        }
+        else
+        {
+            node->next = position;
+            node->prev = position->prev;
 
-    if (position == NULL)
-    {
-        os_list_push_back(list, node);
-        return;
-    }
+            if (position->prev != NULL)
+            {
+                position->prev->next = node;
+            }
+            else
+            {
+                list->head = node;
+            }
 
-    node->next = position;
-    node->prev = position->prev;
-
-    if (position->prev != NULL)
-    {
-        position->prev->next = node;
+            position->prev = node;
+        }
     }
-    else
-    {
-        list->head = node;
-    }
-
-    position->prev = node;
 }

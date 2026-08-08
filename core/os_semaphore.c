@@ -34,28 +34,32 @@
  */
 os_status os_semaphore_init(os_semaphore_t *semaphore, uint32_t initial_count, uint32_t max_count)
 {
-    if ((semaphore == NULL) || (max_count == 0U) || (initial_count > max_count))
-    {
-        return OS_STATUS_INVALID_ARG;
-    }
+    os_status status = OS_STATUS_INVALID_ARG;
 
-    os_critical_enter();
-
-    /* Re-initializing with queued waiters would strand them on dangling
-     * intrusive nodes and corrupt the list (first-time init must run on
-     * zero-initialized storage - static objects are). */
-    if (semaphore->waiters.head != NULL)
+    if ((semaphore != NULL) && (max_count != 0U) && (initial_count <= max_count))
     {
+        os_critical_enter();
+
+        /* Re-initializing with queued waiters would strand them on dangling
+         * intrusive nodes and corrupt the list (first-time init must run on
+         * zero-initialized storage - static objects are). */
+        if (semaphore->waiters.head != NULL)
+        {
+            status = OS_STATUS_BUSY;
+        }
+        else
+        {
+            semaphore->count     = initial_count;
+            semaphore->max_count = max_count;
+            os_list_init(&semaphore->waiters);
+
+            status = OS_STATUS_OK;
+        }
+
         os_critical_exit();
-        return OS_STATUS_BUSY;
     }
 
-    semaphore->count     = initial_count;
-    semaphore->max_count = max_count;
-    os_list_init(&semaphore->waiters);
-
-    os_critical_exit();
-    return OS_STATUS_OK;
+    return status;
 }
 
 /******************************************************************************************************/
@@ -67,29 +71,30 @@ os_status os_semaphore_init(os_semaphore_t *semaphore, uint32_t initial_count, u
  */
 os_status os_semaphore_give(os_semaphore_t *semaphore)
 {
-    os_status status = OS_STATUS_OK;
+    os_status status = OS_STATUS_INVALID_ARG;
 
-    if (semaphore == NULL)
+    if (semaphore != NULL)
     {
-        return OS_STATUS_INVALID_ARG;
+        os_critical_enter();
+
+        if (semaphore->count >= semaphore->max_count)
+        {
+            status = OS_STATUS_FULL;
+        }
+        else
+        {
+            semaphore->count++;
+
+            /* Hand the token to the highest-priority waiter (it re-takes in its
+             * own context). */
+            (void)os_task_waiters_wake_one(&semaphore->waiters);
+
+            status = OS_STATUS_OK;
+        }
+
+        os_critical_exit();
     }
 
-    os_critical_enter();
-
-    if (semaphore->count >= semaphore->max_count)
-    {
-        status = OS_STATUS_FULL;
-    }
-    else
-    {
-        semaphore->count++;
-
-        /* Hand the token to the highest-priority waiter (it re-takes in its
-         * own context). */
-        (void)os_task_waiters_wake_one(&semaphore->waiters);
-    }
-
-    os_critical_exit();
     return status;
 }
 
@@ -107,61 +112,73 @@ os_status os_semaphore_give(os_semaphore_t *semaphore)
  */
 os_status os_semaphore_take(os_semaphore_t *semaphore, uint32_t timeout_ms)
 {
-    uint32_t budget_ticks;
-    uint32_t start_tick;
-    uint32_t remaining_ticks;
+    os_status status = OS_STATUS_INVALID_ARG;
 
-    if (semaphore == NULL)
+    if (semaphore != NULL)
     {
-        return OS_STATUS_INVALID_ARG;
+        uint32_t budget_ticks    = os_internal_timeout_to_ticks(timeout_ms);
+        uint32_t start_tick      = os_tick_get();
+        uint32_t remaining_ticks = budget_ticks;
+        bool     waiting         = true;
+
+        /* Retry loop rather than the repeated returns this used to have: one exit
+         * (MISRA Rule 15.5) means the outcome is recorded in status and the loop
+         * is told to stop, instead of each arm returning for itself. */
+        while (waiting)
+        {
+            os_critical_enter();
+
+            if (semaphore->count > 0U)
+            {
+                semaphore->count--;
+                os_task_wait_end();
+                os_critical_exit();
+
+                status  = OS_STATUS_OK;
+                waiting = false;
+            }
+            else if ((timeout_ms == OS_WAIT_NOTHING) || (!os_internal_can_block()))
+            {
+                os_task_wait_end();
+                os_critical_exit();
+
+                status  = OS_STATUS_EMPTY;
+                waiting = false;
+            }
+            else if (remaining_ticks == 0U)
+            {
+                os_task_wait_end();
+                os_critical_exit();
+
+                status  = OS_STATUS_TIMEOUT;
+                waiting = false;
+            }
+            else
+            {
+                /* Join the waiter list inside the same critical section that saw the
+                 * semaphore empty (no lost-wakeup window); the switch happens on exit. */
+                os_task_wait_begin(&semaphore->waiters, remaining_ticks);
+                os_critical_exit();
+
+                /* Resumed: a give signaled us (retry the take) or the wait timed
+                 * out. The budget is recomputed against the wall clock so READY
+                 * time counts toward the timeout. */
+                if (os_task_wait_signaled())
+                {
+                    remaining_ticks = os_internal_wait_remaining(budget_ticks, start_tick);
+                }
+                else
+                {
+                    os_task_wait_end();
+
+                    status  = OS_STATUS_TIMEOUT;
+                    waiting = false;
+                }
+            }
+        }
     }
 
-    budget_ticks    = os_internal_timeout_to_ticks(timeout_ms);
-    start_tick      = os_tick_get();
-    remaining_ticks = budget_ticks;
-
-    for (;;)
-    {
-        os_critical_enter();
-
-        if (semaphore->count > 0U)
-        {
-            semaphore->count--;
-            os_task_wait_end();
-            os_critical_exit();
-            return OS_STATUS_OK;
-        }
-
-        if ((timeout_ms == OS_WAIT_NOTHING) || !os_internal_can_block())
-        {
-            os_task_wait_end();
-            os_critical_exit();
-            return OS_STATUS_EMPTY;
-        }
-
-        if (remaining_ticks == 0U)
-        {
-            os_task_wait_end();
-            os_critical_exit();
-            return OS_STATUS_TIMEOUT;
-        }
-
-        /* Join the waiter list inside the same critical section that saw the
-         * semaphore empty (no lost-wakeup window); the switch happens on exit. */
-        os_task_wait_begin(&semaphore->waiters, remaining_ticks);
-        os_critical_exit();
-
-        /* Resumed: a give signaled us (retry the take) or the wait timed
-         * out. The budget is recomputed against the wall clock so READY
-         * time counts toward the timeout. */
-        if (!os_task_wait_signaled())
-        {
-            os_task_wait_end();
-            return OS_STATUS_TIMEOUT;
-        }
-
-        remaining_ticks = os_internal_wait_remaining(budget_ticks, start_tick);
-    }
+    return status;
 }
 
 #endif /* OS_CONFIG_SEMAPHORE_ENABLE */

@@ -585,7 +585,7 @@ spawn further tasks. Two config options size the task:
 
 ```c
 #define OS_CONFIG_MAIN_TASK_STACK_SIZE  1024U  /* bytes                            */
-#define OS_CONFIG_MAIN_TASK_PRIORITY    1U     /* OS_TASK_PRIO_USER_MIN..USER_MAX  */
+#define OS_CONFIG_MAIN_TASK_PRIORITY    1U     /* PRIO_1_LOWEST..PRIO_30_HIGHEST   */
 ```
 
 There is no switch to compile the default task out. It always exists unless the
@@ -600,18 +600,43 @@ called in that build.
 
 ### Task priorities
 
-- `0` is the idle task, owned by the kernel.
-- `OS_TASK_PRIO_MAX` is kept out of reach of `os_task_create`, so the kernel's
-  service tasks `tsk_work` and `tsk_timer` - which `os_init()` creates
-  automatically - have a level nothing else can claim. That is where
-  `OS_CONFIG_WORK_PRIORITY` and `OS_CONFIG_TIMER_PRIORITY` put them by default;
-  either may be lowered into the user range when a user task should outrank
-  deferred work or timer callbacks. They stay system tasks at any priority, so
-  `os_task_pause` and `os_task_delete` keep refusing them. They cost no
-  `OS_CONFIG_MAX_USER_TASKS` slots: the kernel reserves its service tasks' slots
-  on top of that number.
-- `OS_TASK_PRIO_USER_MIN` through `OS_TASK_PRIO_USER_MAX` (1 to MAX-1) are user
-  tasks. `os_task_create` rejects anything outside this range.
+There are 32 levels, and `os_task_priority_t` in `ahura.h` names every one of
+them - including the two the application may not use, so the enum describes the
+whole scheduler rather than only the part applications touch.
+
+| Level | Name | Owner |
+|---|---|---|
+| `0` | `OS_TASK_PRIO_IDLE` | Kernel: the idle task, one per scheduling core |
+| `1` .. `30` | `OS_TASK_PRIO_1_LOWEST` .. `OS_TASK_PRIO_30_HIGHEST` (and `OS_TASK_PRIO_1` .. `OS_TASK_PRIO_30`) | The application |
+| `31` | `OS_TASK_PRIO_MAX` | Kernel: `tsk_work` and `tsk_timer` by default |
+
+- **`OS_TASK_PRIO_1_LOWEST` through `OS_TASK_PRIO_30_HIGHEST` is the user
+  range**, and those two names *are* the limits - there is no separate pair of
+  range constants to keep in sync with them. `os_task_create` and
+  `os_task_priority_set` reject anything outside it with
+  `OS_STATUS_INVALID_ARG`.
+- **`OS_TASK_PRIO_IDLE` is the empty-ready-bitmap fallback.** The idle task must
+  be the only thing at that level, or the scheduler could pick a real task when
+  it means to idle - so it is out of reach of `os_task_create`.
+- **`OS_TASK_PRIO_MAX` is kept out of reach too**, so the kernel's service tasks
+  `tsk_work` and `tsk_timer` - which `os_init()` creates automatically - have a
+  level nothing else can claim. That is where `OS_CONFIG_WORK_PRIORITY` and
+  `OS_CONFIG_TIMER_PRIORITY` put them by default; either may be lowered into the
+  user range when a user task should outrank deferred work or timer callbacks.
+  They stay system tasks at any priority, so `os_task_pause` and
+  `os_task_delete` keep refusing them. They cost no `OS_CONFIG_MAX_USER_TASKS`
+  slots: the kernel reserves its service tasks' slots on top of that number.
+
+A static assertion in `ahura.h` keeps the user range contiguous with both
+kernel-owned levels, so renumbering one end without the other fails to build
+rather than leaving a level no task can ever occupy.
+
+Using a name is a style choice - a plain number works identically, since
+`os_task_config_t.priority` is a `uint32_t`. What a name cannot do is survive
+the preprocessor: an enum constant is not a macro, so `#if` reads it as `0`.
+That is why a configured priority written as a name is checked with
+`_Static_assert` rather than `#if` (see `os_timer.c`), and why application code
+should not test one in `#if` either.
 
 The default application task (`tsk_main`) and the self-test task (`tsk_test`)
 live in the user range too, at `OS_CONFIG_MAIN_TASK_PRIORITY` and
@@ -873,32 +898,44 @@ Two rules worth stating outright:
   if you need to know which happened.
 
 **Cost depends on the core**, because the whole operation set is part of the
-port rather than something portable code builds out of one primitive. Each port
-implements all nine operations in whichever way its instruction set allows:
+port rather than something portable code builds out of one primitive. There are
+two backends, selected by `OS_ARCH_ATOMIC_LOCK_FREE` in
+`os_arch_port_common.h`:
 
-| Port | Cores | How | Cost |
+| Backend | Cores | How | Cost |
 |---|---|---|---|
-| `os_arch_port_v7m.c`, `os_arch_port_v8m.c` | Cortex-M3, M4, M7, M33, M35P, M52, M55, M85 | One `LDREX`/`STREX` retry loop per operation, each a single asm block | Lock-free; interrupts stay enabled |
-| `os_arch_port_v6m.c` | Cortex-M0, M0+, M1, M23 | Each operation inside `os_critical_enter`/`os_critical_exit` | Adds the update's length to interrupt latency, and can wait on unrelated kernel work on multi-core builds |
+| Lock-free | Cortex-M3, M4, M7, M33, M35P, M52, M55, M85 | One `LDREX`/`STREX` retry loop per operation, each a single asm block | Interrupts stay enabled; interference costs a retry, not correctness |
+| Critical section | Cortex-M0, M0+, M23 | Each operation inside `os_critical_enter`/`os_critical_exit` | Adds the update's length to interrupt latency, and can wait on unrelated kernel work on multi-core builds |
 
 The second row exists because ARMv6-M has no instruction that can *detect*
 interference mid-update, so it has to be prevented instead. Worth knowing before
 putting an atomic in an ARMv6-M interrupt-latency budget. All of them are safe
 to call from tasks and from ISRs.
 
-Writing each operation out per port, instead of sharing one implementation
+**Both backends are inlined into the caller**, with `always_inline` rather than
+a plain `inline` so it holds at `-O0` as well. Every one of them has exactly one
+caller - the matching one-line wrapper in `os_atomic.c`, which validates its
+argument and forwards - so leaving them in the port translation unit meant every
+atomic paid a real call and stack frame to reach five instructions. Inlining
+costs nothing in size either, because a body this small is smaller than the call
+sequence that used to reach it. On a Cortex-M7 at `-Os`, `os_atomic_add()` is
+now a NULL check followed by the bare `LDREX`/`ADD`/`STREX`/`CMP`/`BNE` loop,
+with no call anywhere in it.
+
+Writing each operation out separately, instead of sharing one implementation
 behind a selector, is what keeps the emitted code to the five instructions the
-sequence actually is - at `-O0` as well as `-O2`, with nothing needing to fold
-away first - and keeps compiler-generated stack traffic from ever landing
-between an `LDREX` and its `STREX`.
+sequence actually is, and keeps compiler-generated stack traffic from ever
+landing between an `LDREX` and its `STREX`.
 
 Portable code above the port only composes these: incrementing is an add of 1,
 clearing a bit is an AND with its complement. So a new port implements nine
 operations and gets the full API, with no behaviour able to drift between cores.
 
-> Cortex-M23 is ARMv8-M *baseline*: it has `LDREX`/`STREX`, but it reaches
-> `os_arch_port_v6m.c` for its Thumb-1-compatible context switch and so runs the
-> critical-section atomics today. Correct, just not as fast as that core allows.
+> Cortex-M23 is ARMv8-M *baseline*: it has `LDREX`/`STREX`, but runs the Thumb-1
+> subset, where the three-operand data-processing forms these loops use have no
+> encoding - so it takes the critical-section backend. Correct, just not as fast
+> as that core allows. Lifting it means rewriting the loops in the flag-setting
+> Thumb-1 forms, which would constrain register allocation on every other core.
 
 ### Work queue
 
@@ -1620,10 +1657,17 @@ All filenames are `os_`-prefixed:
 #### `arch/arm/` port layer
 
 This layer covers the tick source, the PendSV context switch (including the
-first-task start), initial stack frames, and the cycle counter. Shared code is
-organized by architecture, the same split Zephyr and CMSIS-RTX use: one v6m
-implementation, one v7m implementation, one v8m implementation, with thin
-per-core wrapper folders on top.
+first-task start), initial stack frames, the cycle counter, the interrupt mask,
+and the atomics. Shared code is organized by architecture, the same split Zephyr
+and CMSIS-RTX use: one v6m implementation, one v7m implementation, one v8m
+implementation, with thin per-core wrapper folders on top.
+
+`os_arch_port_common.h` is more than a header of declarations: everything small
+and hot enough that a cross-unit call would dominate it lives there as an inline
+definition rather than in a port `.c`. That covers the interrupt mask, the
+in-ISR and core-id checks, the spinlock, the boot-time vector check, and the
+whole atomic set (see [Atomics](#atomics)). The port `.c` files are left with
+what genuinely differs per architecture and is too large to inline.
 
 The layer defines exactly **one** externally visible vector handler,
 `PendSV_Handler` (renameable, see [Integration](#integration)). It does not

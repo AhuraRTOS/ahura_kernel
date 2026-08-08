@@ -180,16 +180,13 @@ bool os_kernel_is_running(void)
  */
 void os_kernel_lock(void)
 {
-    uint32_t mask_state;
-
-    if (os_arch_in_isr())
+    if (!os_arch_in_isr())
     {
-        return;
-    }
+        uint32_t mask_state = os_arch_kernel_mask_save();
 
-    mask_state = os_arch_kernel_mask_save();
-    os_kernel_lock_count[os_arch_core_id_get()]++;
-    os_arch_kernel_mask_restore(mask_state);
+        os_kernel_lock_count[os_arch_core_id_get()]++;
+        os_arch_kernel_mask_restore(mask_state);
+    }
 }
 
 /******************************************************************************************************/
@@ -205,36 +202,31 @@ void os_kernel_lock(void)
  */
 void os_kernel_unlock(void)
 {
-    uint32_t mask_state;
-    uint32_t core;
-    bool     switch_due = false;
+    bool switch_due = false;
 
-    if (os_arch_in_isr())
+    if (!os_arch_in_isr())
     {
-        return;
-    }
+        uint32_t mask_state = os_arch_kernel_mask_save();
+        uint32_t core       = os_arch_core_id_get();
 
-    mask_state = os_arch_kernel_mask_save();
+        /* An unlock with no matching lock means the pairing is broken somewhere, exactly as in
+         * os_critical_exit: decrementing anyway would wrap the counter and lock the scheduler for
+         * ~4 billion nested unlocks. */
+        OS_ASSERT(os_kernel_lock_count[core] != 0U);
 
-    core = os_arch_core_id_get();
-
-    /* An unlock with no matching lock means the pairing is broken somewhere, exactly as in
-     * os_critical_exit: decrementing anyway would wrap the counter and lock the scheduler for
-     * ~4 billion nested unlocks. */
-    OS_ASSERT(os_kernel_lock_count[core] != 0U);
-
-    if (os_kernel_lock_count[core] != 0U)
-    {
-        os_kernel_lock_count[core]--;
-
-        if (os_kernel_lock_count[core] == 0U)
+        if (os_kernel_lock_count[core] != 0U)
         {
-            switch_due                   = os_kernel_switch_pending[core];
-            os_kernel_switch_pending[core] = false;
-        }
-    }
+            os_kernel_lock_count[core]--;
 
-    os_arch_kernel_mask_restore(mask_state);
+            if (os_kernel_lock_count[core] == 0U)
+            {
+                switch_due                     = os_kernel_switch_pending[core];
+                os_kernel_switch_pending[core] = false;
+            }
+        }
+
+        os_arch_kernel_mask_restore(mask_state);
+    }
 
     /* Outside the mask: the switch is due now, and pending it under the mask
      * would only delay it to the restore above. */
@@ -313,12 +305,14 @@ static os_status os_main_system_init(void)
     };
 
     status = os_task_create(&tsk_main, &config);
-    if (status != OS_STATUS_OK)
+
+    /* Only start what was actually created; a failed create is reported as-is. */
+    if (status == OS_STATUS_OK)
     {
-        return status;
+        status = os_task_start(&tsk_main);
     }
 
-    return os_task_start(&tsk_main);
+    return status;
 }
 
 /******************************************************************************************************/
@@ -356,12 +350,14 @@ static os_status os_test_system_init(void)
     };
 
     status = os_task_create(&tsk_test, &config);
-    if (status != OS_STATUS_OK)
+
+    /* Only start what was actually created; a failed create is reported as-is. */
+    if (status == OS_STATUS_OK)
     {
-        return status;
+        status = os_task_start(&tsk_test);
     }
 
-    return os_task_start(&tsk_test);
+    return status;
 }
 
 /******************************************************************************************************/

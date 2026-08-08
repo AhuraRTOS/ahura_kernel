@@ -45,43 +45,43 @@
  */
 os_status os_notify_give(os_task_t *task, uint32_t value)
 {
-    void             *tcb;
-    os_notify_slot_t *slot;
+    os_status status = OS_STATUS_INVALID_ARG;
 
-    if ((task == NULL) || (task->id == 0U))
+    if ((task != NULL) && (task->id != 0U))
     {
-        return OS_STATUS_INVALID_ARG;
-    }
+        void *tcb;
 
-    os_critical_enter();
+        os_critical_enter();
 
-    tcb = os_task_tcb_resolve(task->id);
-    if (tcb == NULL)
-    {
+        tcb = os_task_tcb_resolve(task->id);
+        if (tcb != NULL)
+        {
+            os_notify_slot_t *slot = os_task_notify_slot(tcb);
+
+            slot->value   = value;
+            slot->pending = true;
+
+            /* Only a task parked in os_notify_wait is woken. waiting is true only inside that
+             * block, so a task blocked on anything else keeps its own wakeup reason and finds the
+             * value waiting the next time it asks for one.
+             *
+             * os_task_wake_tcb rather than os_task_wake: the critical section above already holds
+             * both the kernel mask and (on multi-core) the cross-core spinlock that the
+             * direct-handle form requires of its caller, so it skips the id lookup and the nested
+             * critical section. */
+            if (os_task_tcb_is_blocked(tcb) && slot->waiting)
+            {
+                slot->waiting = false;
+                os_task_wake_tcb(tcb);
+            }
+
+            status = OS_STATUS_OK;
+        }
+
         os_critical_exit();
-        return OS_STATUS_INVALID_ARG;
     }
 
-    slot = os_task_notify_slot(tcb);
-
-    slot->value   = value;
-    slot->pending = true;
-
-    /* Only a task parked in os_notify_wait is woken. waiting is true only inside that block, so
-     * a task blocked on anything else keeps its own wakeup reason and finds the value waiting the
-     * next time it asks for one.
-     *
-     * os_task_wake_tcb rather than os_task_wake: the critical section above already holds both the
-     * kernel mask and (on multi-core) the cross-core spinlock that the direct-handle form requires
-     * of its caller, so it skips the id lookup and the nested critical section. */
-    if (os_task_tcb_is_blocked(tcb) && slot->waiting)
-    {
-        slot->waiting = false;
-        os_task_wake_tcb(tcb);
-    }
-
-    os_critical_exit();
-    return OS_STATUS_OK;
+    return status;
 }
 
 /******************************************************************************************************/
@@ -99,82 +99,93 @@ os_status os_notify_give(os_task_t *task, uint32_t value)
  */
 os_status os_notify_wait(uint32_t timeout_ms, uint32_t *value_out)
 {
-    uint32_t budget_ticks;
-    uint32_t start_tick;
-    uint32_t remaining_ticks;
+    os_status status = OS_STATUS_INVALID_ARG;
 
     /* Task-only, like os_mutex_lock: an ISR has no task identity to wait as. */
     OS_ASSERT(!os_arch_in_isr());
 
-    if (os_arch_in_isr())
+    if (!os_arch_in_isr())
     {
-        return OS_STATUS_INVALID_ARG;
-    }
+        uint32_t budget_ticks    = os_internal_timeout_to_ticks(timeout_ms);
+        uint32_t start_tick      = os_tick_get();
+        uint32_t remaining_ticks = budget_ticks;
+        bool     waiting         = true;
 
-    budget_ticks    = os_internal_timeout_to_ticks(timeout_ms);
-    start_tick      = os_tick_get();
-    remaining_ticks = budget_ticks;
-
-    for (;;)
-    {
-        void             *current;
-        os_notify_slot_t *slot;
-
-        os_critical_enter();
-
-        current = os_task_tcb_current();
-        if (current == NULL)
+        /* Retry loop with one exit (MISRA Rule 15.5): each arm records the outcome in
+         * status and clears the loop flag rather than returning for itself. */
+        while (waiting)
         {
-            os_critical_exit();
-            return OS_STATUS_INVALID_ARG;
-        }
+            void *current;
 
-        slot = os_task_notify_slot(current);
+            os_critical_enter();
 
-        /* Cleared every iteration: only true while genuinely blocked below,
-         * so a give() arriving any other time correctly just latches. */
-        slot->waiting = false;
-
-        if (slot->pending)
-        {
-            /* Consumed unconditionally: only the copy out is optional. */
-            slot->pending = false;
-
-            if (value_out != NULL)
+            current = os_task_tcb_current();
+            if (current == NULL)
             {
-                *value_out = slot->value;
+                os_critical_exit();
+
+                status  = OS_STATUS_INVALID_ARG;
+                waiting = false;
             }
+            else
+            {
+                os_notify_slot_t *slot = os_task_notify_slot(current);
 
-            slot->value = 0U;
-            os_critical_exit();
-            return OS_STATUS_OK;
+                /* Cleared every iteration: only true while genuinely blocked below,
+                 * so a give() arriving any other time correctly just latches. */
+                slot->waiting = false;
+
+                if (slot->pending)
+                {
+                    /* Consumed unconditionally: only the copy out is optional. */
+                    slot->pending = false;
+
+                    if (value_out != NULL)
+                    {
+                        *value_out = slot->value;
+                    }
+
+                    slot->value = 0U;
+                    os_critical_exit();
+
+                    status  = OS_STATUS_OK;
+                    waiting = false;
+                }
+                else if ((timeout_ms == OS_WAIT_NOTHING) || (!os_internal_can_block()))
+                {
+                    os_critical_exit();
+
+                    status  = OS_STATUS_EMPTY;
+                    waiting = false;
+                }
+                else if (remaining_ticks == 0U)
+                {
+                    os_critical_exit();
+
+                    status  = OS_STATUS_TIMEOUT;
+                    waiting = false;
+                }
+                else
+                {
+                    /* Blocks without joining any object's waiter list - os_notify_give addresses
+                     * this task directly by id, so there is no list for it to walk. The sleep runs
+                     * inside the critical section that just found the mailbox empty (no
+                     * lost-wakeup window); the switch happens when the outermost critical section
+                     * is left. */
+                    slot->waiting = true;
+                    os_task_sleep_ticks(remaining_ticks);
+                    os_critical_exit();
+
+                    /* Resumed: either give() latched a value (checked at the top of the next
+                     * iteration) or the wait timed out - the budget recomputed against the wall
+                     * clock decides which, exactly as every other blocking primitive here does. */
+                    remaining_ticks = os_internal_wait_remaining(budget_ticks, start_tick);
+                }
+            }
         }
-
-        if ((timeout_ms == OS_WAIT_NOTHING) || !os_internal_can_block())
-        {
-            os_critical_exit();
-            return OS_STATUS_EMPTY;
-        }
-
-        if (remaining_ticks == 0U)
-        {
-            os_critical_exit();
-            return OS_STATUS_TIMEOUT;
-        }
-
-        /* Blocks without joining any object's waiter list - os_notify_give addresses this task
-         * directly by id, so there is no list for it to walk. The sleep runs inside the critical
-         * section that just found the mailbox empty (no lost-wakeup window); the switch happens
-         * when the outermost critical section is left. */
-        slot->waiting = true;
-        os_task_sleep_ticks(remaining_ticks);
-        os_critical_exit();
-
-        /* Resumed: either give() latched a value (checked at the top of the next
-         * iteration) or the wait timed out - the budget recomputed against the wall
-         * clock decides which, exactly as every other blocking primitive here does. */
-        remaining_ticks = os_internal_wait_remaining(budget_ticks, start_tick);
     }
+
+    return status;
 }
 
 #endif /* OS_CONFIG_NOTIFY_ENABLE */

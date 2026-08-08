@@ -57,29 +57,29 @@ static void os_delay_cycle_wait(uint64_t cycle_count);
  */
 void os_delay_ms(uint32_t milliseconds)
 {
-    uint64_t ticks_u64;
-
     if (milliseconds == OS_WAIT_FOREVER)
     {
         os_delay_forever();
-        return;
     }
-
-    ticks_u64 = ((uint64_t)milliseconds * (uint64_t)OS_CONFIG_TICK_HZ + (OS_DELAY_MS_PER_SECOND - 1ULL)) /
-                OS_DELAY_MS_PER_SECOND;
-
-    /* Only reachable when OS_CONFIG_TICK_HZ pushes the tick count past 32 bits, which needs a
-     * duration of weeks. Clamping delays as long as the kernel can represent, rather than the old
-     * "report INVALID_ARG and return immediately" - of the two wrong answers, waiting far too long
-     * is the one a caller notices. */
-    OS_ASSERT(ticks_u64 <= (uint64_t)UINT32_MAX);
-
-    if (ticks_u64 > (uint64_t)UINT32_MAX)
+    else
     {
-        ticks_u64 = (uint64_t)UINT32_MAX;
-    }
+        uint64_t ticks_u64 =
+            ((uint64_t)milliseconds * (uint64_t)OS_CONFIG_TICK_HZ + (OS_DELAY_MS_PER_SECOND - 1ULL)) /
+            OS_DELAY_MS_PER_SECOND;
 
-    os_delay_ticks((uint32_t)ticks_u64);
+        /* Only reachable when OS_CONFIG_TICK_HZ pushes the tick count past 32 bits, which needs a
+         * duration of weeks. Clamping delays as long as the kernel can represent, rather than the
+         * old "report INVALID_ARG and return immediately" - of the two wrong answers, waiting far
+         * too long is the one a caller notices. */
+        OS_ASSERT(ticks_u64 <= (uint64_t)UINT32_MAX);
+
+        if (ticks_u64 > (uint64_t)UINT32_MAX)
+        {
+            ticks_u64 = (uint64_t)UINT32_MAX;
+        }
+
+        os_delay_ticks((uint32_t)ticks_u64);
+    }
 }
 
 /******************************************************************************************************/
@@ -95,26 +95,19 @@ void os_delay_ms(uint32_t milliseconds)
 void os_delay_us(uint32_t microseconds)
 {
     uint32_t clock_hz = os_arch_clock_hz_get();
-    uint64_t cycle_count;
-
-    if (microseconds == 0U)
-    {
-        return;
-    }
 
     /* No clock reading means no way to measure a microsecond, so this cannot wait at all. The
      * platform's clock callback is not answering - see the README "Platform clock". */
-    OS_ASSERT(clock_hz != 0U);
+    OS_ASSERT((microseconds == 0U) || (clock_hz != 0U));
 
-    if (clock_hz == 0U)
+    if ((microseconds != 0U) && (clock_hz != 0U))
     {
-        return;
+        uint64_t cycle_count =
+            ((uint64_t)microseconds * (uint64_t)clock_hz + (OS_DELAY_US_PER_SECOND - 1ULL)) /
+            OS_DELAY_US_PER_SECOND;
+
+        os_delay_cycle_wait(cycle_count);
     }
-
-    cycle_count = ((uint64_t)microseconds * (uint64_t)clock_hz + (OS_DELAY_US_PER_SECOND - 1ULL)) /
-                  OS_DELAY_US_PER_SECOND;
-
-    os_delay_cycle_wait(cycle_count);
 }
 
 /******************************************************************************************************/
@@ -128,26 +121,25 @@ void os_delay_us(uint32_t microseconds)
  */
 void os_delay_s(uint32_t seconds)
 {
-    uint64_t ticks_u64;
-
     if (seconds == OS_WAIT_FOREVER)
     {
         os_delay_forever();
-        return;
     }
-
-    ticks_u64 = (uint64_t)seconds * (uint64_t)OS_CONFIG_TICK_HZ;
-
-    /* Clamped rather than refused, same reasoning as os_delay_ms. At 1 kHz this needs a request
-     * of about 50 days. */
-    OS_ASSERT(ticks_u64 <= (uint64_t)UINT32_MAX);
-
-    if (ticks_u64 > (uint64_t)UINT32_MAX)
+    else
     {
-        ticks_u64 = (uint64_t)UINT32_MAX;
-    }
+        uint64_t ticks_u64 = (uint64_t)seconds * (uint64_t)OS_CONFIG_TICK_HZ;
 
-    os_delay_ticks((uint32_t)ticks_u64);
+        /* Clamped rather than refused, same reasoning as os_delay_ms. At 1 kHz this needs a
+         * request of about 50 days. */
+        OS_ASSERT(ticks_u64 <= (uint64_t)UINT32_MAX);
+
+        if (ticks_u64 > (uint64_t)UINT32_MAX)
+        {
+            ticks_u64 = (uint64_t)UINT32_MAX;
+        }
+
+        os_delay_ticks((uint32_t)ticks_u64);
+    }
 }
 
 /*
@@ -169,14 +161,11 @@ static void os_delay_forever(void)
      * where a "forever" delay does not. */
     OS_ASSERT(os_internal_can_block());
 
-    if (!os_internal_can_block())
-    {
-        return;
-    }
-
     /* Re-arm on any spurious wake (forced os_task_wake aimed at a kernel
-     * service task): forever really is forever. */
-    while (1)
+     * service task): forever really is forever. The loop condition doubles as
+     * the can-block guard, so the ISR/pre-scheduler case falls straight out
+     * without a second exit. */
+    while (os_internal_can_block())
     {
         os_task_sleep_ticks(OS_WAIT_FOREVER);
     }
@@ -192,56 +181,55 @@ static void os_delay_forever(void)
  */
 static void os_delay_ticks(uint32_t ticks)
 {
-    uint32_t clock_hz;
-    uint64_t cycle_count;
+    /* MISRA Rule 17.8 (do not modify a parameter): the sentinel adjustment below works
+     * on a local copy rather than on ticks itself. */
+    uint32_t wait_ticks = ticks;
 
-    if (ticks == 0U)
+    if (wait_ticks != 0U)
     {
-        return;
-    }
-
-    /* The callers route an intentional OS_WAIT_FOREVER to os_delay_forever
-     * before converting, so the sentinel value can only be reached here as
-     * a FINITE duration whose tick conversion collides with it numerically.
-     * One tick short keeps it out of the sleep primitive's "until woken"
-     * meaning at a cost of 1 tick in ~49 days (at 1 kHz). */
-    if (ticks == OS_WAIT_FOREVER)
-    {
-        ticks--;
-    }
-
-    /* Preferred path: yield the CPU to other tasks until the delay expires.
-     * The sleep is re-armed until the duration has really elapsed: a forced
-     * os_task_wake aimed at a kernel service task (new work/timer expiry
-     * while its handler delays) must not cut the delay short. */
-    if (os_internal_can_block())
-    {
-        uint32_t start_tick = os_tick_get();
-        uint32_t elapsed    = 0U;
-
-        while (elapsed < ticks)
+        /* The callers route an intentional OS_WAIT_FOREVER to os_delay_forever
+         * before converting, so the sentinel value can only be reached here as
+         * a FINITE duration whose tick conversion collides with it numerically.
+         * One tick short keeps it out of the sleep primitive's "until woken"
+         * meaning at a cost of 1 tick in ~49 days (at 1 kHz). */
+        if (wait_ticks == OS_WAIT_FOREVER)
         {
-            os_task_sleep_ticks(ticks - elapsed);
-            elapsed = os_tick_get() - start_tick; /* wrap-safe unsigned diff */
+            wait_ticks--;
         }
 
-        return;
+        /* Preferred path: yield the CPU to other tasks until the delay expires.
+         * The sleep is re-armed until the duration has really elapsed: a forced
+         * os_task_wake aimed at a kernel service task (new work/timer expiry
+         * while its handler delays) must not cut the delay short. */
+        if (os_internal_can_block())
+        {
+            uint32_t start_tick = os_tick_get();
+            uint32_t elapsed    = 0U;
+
+            while (elapsed < wait_ticks)
+            {
+                os_task_sleep_ticks(wait_ticks - elapsed);
+                elapsed = os_tick_get() - start_tick; /* wrap-safe unsigned diff */
+            }
+        }
+        else
+        {
+            /* Pre-scheduler or interrupt context: precise busy-wait. */
+            uint32_t clock_hz = os_arch_clock_hz_get();
+
+            /* Same as os_delay_us: without a clock reading there is no way to time the wait, so
+             * this delays not at all. The platform's clock callback is not answering. */
+            OS_ASSERT(clock_hz != 0U);
+
+            if (clock_hz != 0U)
+            {
+                uint64_t cycle_count =
+                    ((uint64_t)wait_ticks * (uint64_t)clock_hz) / (uint64_t)OS_CONFIG_TICK_HZ;
+
+                os_delay_cycle_wait(cycle_count);
+            }
+        }
     }
-
-    /* Pre-scheduler or interrupt context: precise busy-wait. */
-    clock_hz = os_arch_clock_hz_get();
-
-    /* Same as os_delay_us: without a clock reading there is no way to time the wait, so this
-     * returns without delaying at all. The platform's clock callback is not answering. */
-    OS_ASSERT(clock_hz != 0U);
-
-    if (clock_hz == 0U)
-    {
-        return;
-    }
-
-    cycle_count = ((uint64_t)ticks * (uint64_t)clock_hz) / (uint64_t)OS_CONFIG_TICK_HZ;
-    os_delay_cycle_wait(cycle_count);
 }
 
 /******************************************************************************************************/

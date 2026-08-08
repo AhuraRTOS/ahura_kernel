@@ -89,79 +89,75 @@ static void os_mem_block_insert(os_mem_block_t *block);
  */
 void* os_mem_alloc(size_t size)
 {
-    os_mem_block_t  *prev;
-    os_mem_block_t  *block;
-    void            *memory = NULL;
-    size_t          need;
-
-    if (size == 0U)
-    {
-        return NULL;
-    }
+    void   *memory = NULL;
+    size_t  need;
 
     /* Whole-block size: header + payload rounded up to the alignment. The
      * top bit is the allocated flag, so a size that reaches it (or wraps)
-     * can never be satisfied. */
+     * can never be satisfied. Computed for a zero size too, then discarded by
+     * the guard below, so that this stays a single expression with one exit. */
     need = OS_MEM_HEADER_SIZE + ((size + OS_MEM_ALIGN_MSK) & ~OS_MEM_ALIGN_MSK);
-    if ((need < size) || ((need & OS_MEM_ALLOCATED_MSK) != 0U))
+
+    if ((size != 0U) && (need >= size) && ((need & OS_MEM_ALLOCATED_MSK) == 0U))
     {
-        return NULL;
-    }
+        os_mem_block_t *prev;
+        os_mem_block_t *block;
 
-    os_critical_enter();
+        os_critical_enter();
 
-    if (os_mem_end == NULL)
-    {
-        os_mem_init();
-    }
-
-    /* First fit: the free list is address ordered and ends at the marker. */
-    prev  = &os_mem_start;
-    block = os_mem_start.next;
-    while ((block != os_mem_end) && (block->size < need))
-    {
-        prev  = block;
-        block = block->next;
-    }
-
-    if (block != os_mem_end)
-    {
-        os_mem_block_t *next_free = block->next; /* capture before either relink below */
-
-        /* Split when the leftover still makes a usable free block. The
-         * remainder's position in the address-ordered list is already known
-         * (between prev and next_free) so it is relinked directly instead of
-         * re-walking the whole free list via os_mem_block_insert: neither
-         * merge could ever fire here (the predecessor is the block just
-         * removed, and a touching successor would already have been merged
-         * when this free block was inserted). */
-        if ((block->size - need) >= OS_MEM_MIN_BLOCK_SIZE)
+        if (os_mem_end == NULL)
         {
-            os_mem_block_t *remainder = (os_mem_block_t *)(void *)((uint8_t *)block + need);
-
-            remainder->size = block->size - need;
-            remainder->next = next_free;
-            prev->next      = remainder;
-            block->size     = need;
-        }
-        else
-        {
-            prev->next = next_free;
+            os_mem_init();
         }
 
-        os_mem_free_bytes -= block->size;
-        if (os_mem_free_bytes < os_mem_min_free_bytes)
+        /* First fit: the free list is address ordered and ends at the marker. */
+        prev  = &os_mem_start;
+        block = os_mem_start.next;
+        while ((block != os_mem_end) && (block->size < need))
         {
-            os_mem_min_free_bytes = os_mem_free_bytes;
+            prev  = block;
+            block = block->next;
         }
 
-        block->size |= OS_MEM_ALLOCATED_MSK;
-        block->next = NULL;
+        if (block != os_mem_end)
+        {
+            os_mem_block_t *next_free = block->next; /* capture before either relink below */
 
-        memory = (void *)((uint8_t *)block + OS_MEM_HEADER_SIZE);
+            /* Split when the leftover still makes a usable free block. The
+             * remainder's position in the address-ordered list is already known
+             * (between prev and next_free) so it is relinked directly instead of
+             * re-walking the whole free list via os_mem_block_insert: neither
+             * merge could ever fire here (the predecessor is the block just
+             * removed, and a touching successor would already have been merged
+             * when this free block was inserted). */
+            if ((block->size - need) >= OS_MEM_MIN_BLOCK_SIZE)
+            {
+                os_mem_block_t *remainder = (os_mem_block_t *)(void *)((uint8_t *)block + need);
+
+                remainder->size = block->size - need;
+                remainder->next = next_free;
+                prev->next      = remainder;
+                block->size     = need;
+            }
+            else
+            {
+                prev->next = next_free;
+            }
+
+            os_mem_free_bytes -= block->size;
+            if (os_mem_free_bytes < os_mem_min_free_bytes)
+            {
+                os_mem_min_free_bytes = os_mem_free_bytes;
+            }
+
+            block->size |= OS_MEM_ALLOCATED_MSK;
+            block->next = NULL;
+
+            memory = (void *)((uint8_t *)block + OS_MEM_HEADER_SIZE);
+        }
+
+        os_critical_exit();
     }
-
-    os_critical_exit();
 
     return memory;
 }
@@ -177,13 +173,6 @@ void* os_mem_alloc(size_t size)
  */
 void os_mem_free(void *memory)
 {
-    os_mem_block_t *block;
-
-    if ((memory == NULL) || (os_mem_end == NULL))
-    {
-        return;
-    }
-
     /* The payload must leave room for its own header BELOW it, not merely lie
      * somewhere in the heap: a pointer into the first header's worth of bytes
      * would pass a plain range check and then be validated through a header
@@ -191,34 +180,30 @@ void os_mem_free(void *memory)
      * fabricated block into the free list whenever the bytes preceding the
      * heap happen to look allocated. Every real payload starts at least
      * OS_MEM_HEADER_SIZE into the heap, so nothing legitimate is rejected. */
-    if (((uint8_t *)memory < &os_mem_heap[OS_MEM_HEADER_SIZE]) ||
-        ((uint8_t *)memory >= &os_mem_heap[OS_CONFIG_HEAP_SIZE]))
+    if ((memory != NULL) && (os_mem_end != NULL) &&
+        ((uint8_t *)memory >= &os_mem_heap[OS_MEM_HEADER_SIZE]) &&
+        ((uint8_t *)memory < &os_mem_heap[OS_CONFIG_HEAP_SIZE]))
     {
-        return;
-    }
+        os_mem_block_t *block = (os_mem_block_t *)(void *)((uint8_t *)memory - OS_MEM_HEADER_SIZE);
 
-    block = (os_mem_block_t *)(void *)((uint8_t *)memory - OS_MEM_HEADER_SIZE);
+        os_critical_enter();
 
-    os_critical_enter();
+        /* An os_mem block carries the allocated flag and a cleared link.
+         * Validated and cleared inside the critical section: a racing free of
+         * the same pointer (a higher-priority ISR, or another core) must never
+         * observe the flag still set after this check passes - otherwise both
+         * callers complete the free and the block gets linked into the free
+         * list twice (self-loop, or a live allocation freed out from under its
+         * owner). */
+        if (((block->size & OS_MEM_ALLOCATED_MSK) != 0U) && (block->next == NULL))
+        {
+            block->size &= ~OS_MEM_ALLOCATED_MSK;
+            os_mem_free_bytes += block->size;
+            os_mem_block_insert(block);
+        }
 
-    /* An os_mem block carries the allocated flag and a cleared link.
-     * Validated and cleared inside the critical section: a racing free of
-     * the same pointer (a higher-priority ISR, or another core) must never
-     * observe the flag still set after this check passes - otherwise both
-     * callers complete the free and the block gets linked into the free
-     * list twice (self-loop, or a live allocation freed out from under its
-     * owner). */
-    if (((block->size & OS_MEM_ALLOCATED_MSK) == 0U) || (block->next != NULL))
-    {
         os_critical_exit();
-        return;
     }
-
-    block->size &= ~OS_MEM_ALLOCATED_MSK;
-    os_mem_free_bytes += block->size;
-    os_mem_block_insert(block);
-
-    os_critical_exit();
 }
 
 /******************************************************************************************************/

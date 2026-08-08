@@ -53,72 +53,83 @@ static os_status os_queue_bind_buffer(os_queue_t *queue, void *buffer, size_t it
  */
 os_status os_queue_send(os_queue_t *queue, const void *item, uint32_t timeout_ms)
 {
-    uint32_t budget_ticks;
-    uint32_t start_tick;
-    uint32_t remaining_ticks;
+    os_status status = OS_STATUS_INVALID_ARG;
 
     OS_ASSERT(queue != NULL);
     OS_ASSERT(item != NULL);
 
-    if ((queue == NULL) || (item == NULL))
+    if ((queue != NULL) && (item != NULL))
     {
-        return OS_STATUS_INVALID_ARG;
+        uint32_t budget_ticks    = os_internal_timeout_to_ticks(timeout_ms);
+        uint32_t start_tick      = os_tick_get();
+        uint32_t remaining_ticks = budget_ticks;
+        bool     waiting         = true;
+
+        /* Retry loop with one exit (MISRA Rule 15.5): each arm records the outcome
+         * in status and clears the loop flag rather than returning for itself. */
+        while (waiting)
+        {
+            os_critical_enter();
+
+            if (queue->count < queue->capacity)
+            {
+                uint8_t *slot = &queue->buffer[queue->tail * queue->item_size];
+
+                (void)memcpy(slot, item, queue->item_size);
+                queue->tail = (queue->tail + 1U) % queue->capacity;
+                queue->count++;
+
+                /* An item arrived: release the highest-priority receiver. */
+                (void)os_task_waiters_wake_one(&queue->receive_waiters);
+
+                os_task_wait_end();
+                os_critical_exit();
+
+                status  = OS_STATUS_OK;
+                waiting = false;
+            }
+            else if ((timeout_ms == OS_WAIT_NOTHING) || (!os_internal_can_block()))
+            {
+                os_task_wait_end();
+                os_critical_exit();
+
+                status  = OS_STATUS_FULL;
+                waiting = false;
+            }
+            else if (remaining_ticks == 0U)
+            {
+                os_task_wait_end();
+                os_critical_exit();
+
+                status  = OS_STATUS_TIMEOUT;
+                waiting = false;
+            }
+            else
+            {
+                /* Join the senders' waiter list inside the same critical section
+                 * that saw the queue full (no lost-wakeup window). */
+                os_task_wait_begin(&queue->send_waiters, remaining_ticks);
+                os_critical_exit();
+
+                /* Resumed: a receive freed a slot (retry) or the wait timed out.
+                 * The budget is recomputed against the wall clock so READY time
+                 * counts toward the timeout. */
+                if (os_task_wait_signaled())
+                {
+                    remaining_ticks = os_internal_wait_remaining(budget_ticks, start_tick);
+                }
+                else
+                {
+                    os_task_wait_end();
+
+                    status  = OS_STATUS_TIMEOUT;
+                    waiting = false;
+                }
+            }
+        }
     }
 
-    budget_ticks    = os_internal_timeout_to_ticks(timeout_ms);
-    start_tick      = os_tick_get();
-    remaining_ticks = budget_ticks;
-
-    for (;;)
-    {
-        os_critical_enter();
-
-        if (queue->count < queue->capacity)
-        {
-            uint8_t *slot = &queue->buffer[queue->tail * queue->item_size];
-
-            (void)memcpy(slot, item, queue->item_size);
-            queue->tail = (queue->tail + 1U) % queue->capacity;
-            queue->count++;
-
-            /* An item arrived: release the highest-priority receiver. */
-            (void)os_task_waiters_wake_one(&queue->receive_waiters);
-
-            os_task_wait_end();
-            os_critical_exit();
-            return OS_STATUS_OK;
-        }
-
-        if ((timeout_ms == OS_WAIT_NOTHING) || !os_internal_can_block())
-        {
-            os_task_wait_end();
-            os_critical_exit();
-            return OS_STATUS_FULL;
-        }
-
-        if (remaining_ticks == 0U)
-        {
-            os_task_wait_end();
-            os_critical_exit();
-            return OS_STATUS_TIMEOUT;
-        }
-
-        /* Join the senders' waiter list inside the same critical section
-         * that saw the queue full (no lost-wakeup window). */
-        os_task_wait_begin(&queue->send_waiters, remaining_ticks);
-        os_critical_exit();
-
-        /* Resumed: a receive freed a slot (retry) or the wait timed out.
-         * The budget is recomputed against the wall clock so READY time
-         * counts toward the timeout. */
-        if (!os_task_wait_signaled())
-        {
-            os_task_wait_end();
-            return OS_STATUS_TIMEOUT;
-        }
-
-        remaining_ticks = os_internal_wait_remaining(budget_ticks, start_tick);
-    }
+    return status;
 }
 
 /******************************************************************************************************/
@@ -133,72 +144,82 @@ os_status os_queue_send(os_queue_t *queue, const void *item, uint32_t timeout_ms
  */
 os_status os_queue_receive(os_queue_t *queue, void *item_out, uint32_t timeout_ms)
 {
-    uint32_t budget_ticks;
-    uint32_t start_tick;
-    uint32_t remaining_ticks;
+    os_status status = OS_STATUS_INVALID_ARG;
 
     OS_ASSERT(queue != NULL);
     OS_ASSERT(item_out != NULL);
 
-    if ((queue == NULL) || (item_out == NULL))
+    if ((queue != NULL) && (item_out != NULL))
     {
-        return OS_STATUS_INVALID_ARG;
+        uint32_t budget_ticks    = os_internal_timeout_to_ticks(timeout_ms);
+        uint32_t start_tick      = os_tick_get();
+        uint32_t remaining_ticks = budget_ticks;
+        bool     waiting         = true;
+
+        /* Retry loop with one exit (MISRA Rule 15.5), mirroring os_queue_send. */
+        while (waiting)
+        {
+            os_critical_enter();
+
+            if (queue->count > 0U)
+            {
+                const uint8_t *slot = &queue->buffer[queue->head * queue->item_size];
+
+                (void)memcpy(item_out, slot, queue->item_size);
+                queue->head = (queue->head + 1U) % queue->capacity;
+                queue->count--;
+
+                /* A slot freed up: release the highest-priority sender. */
+                (void)os_task_waiters_wake_one(&queue->send_waiters);
+
+                os_task_wait_end();
+                os_critical_exit();
+
+                status  = OS_STATUS_OK;
+                waiting = false;
+            }
+            else if ((timeout_ms == OS_WAIT_NOTHING) || (!os_internal_can_block()))
+            {
+                os_task_wait_end();
+                os_critical_exit();
+
+                status  = OS_STATUS_EMPTY;
+                waiting = false;
+            }
+            else if (remaining_ticks == 0U)
+            {
+                os_task_wait_end();
+                os_critical_exit();
+
+                status  = OS_STATUS_TIMEOUT;
+                waiting = false;
+            }
+            else
+            {
+                /* Join the receivers' waiter list inside the same critical section
+                 * that saw the queue empty (no lost-wakeup window). */
+                os_task_wait_begin(&queue->receive_waiters, remaining_ticks);
+                os_critical_exit();
+
+                /* Resumed: a send delivered an item (retry) or the wait timed out.
+                 * The budget is recomputed against the wall clock so READY time
+                 * counts toward the timeout. */
+                if (os_task_wait_signaled())
+                {
+                    remaining_ticks = os_internal_wait_remaining(budget_ticks, start_tick);
+                }
+                else
+                {
+                    os_task_wait_end();
+
+                    status  = OS_STATUS_TIMEOUT;
+                    waiting = false;
+                }
+            }
+        }
     }
 
-    budget_ticks    = os_internal_timeout_to_ticks(timeout_ms);
-    start_tick      = os_tick_get();
-    remaining_ticks = budget_ticks;
-
-    for (;;)
-    {
-        os_critical_enter();
-
-        if (queue->count > 0U)
-        {
-            const uint8_t *slot = &queue->buffer[queue->head * queue->item_size];
-
-            (void)memcpy(item_out, slot, queue->item_size);
-            queue->head = (queue->head + 1U) % queue->capacity;
-            queue->count--;
-
-            /* A slot freed up: release the highest-priority sender. */
-            (void)os_task_waiters_wake_one(&queue->send_waiters);
-
-            os_task_wait_end();
-            os_critical_exit();
-            return OS_STATUS_OK;
-        }
-
-        if ((timeout_ms == OS_WAIT_NOTHING) || !os_internal_can_block())
-        {
-            os_task_wait_end();
-            os_critical_exit();
-            return OS_STATUS_EMPTY;
-        }
-
-        if (remaining_ticks == 0U)
-        {
-            os_task_wait_end();
-            os_critical_exit();
-            return OS_STATUS_TIMEOUT;
-        }
-
-        /* Join the receivers' waiter list inside the same critical section
-         * that saw the queue empty (no lost-wakeup window). */
-        os_task_wait_begin(&queue->receive_waiters, remaining_ticks);
-        os_critical_exit();
-
-        /* Resumed: a send delivered an item (retry) or the wait timed out.
-         * The budget is recomputed against the wall clock so READY time
-         * counts toward the timeout. */
-        if (!os_task_wait_signaled())
-        {
-            os_task_wait_end();
-            return OS_STATUS_TIMEOUT;
-        }
-
-        remaining_ticks = os_internal_wait_remaining(budget_ticks, start_tick);
-    }
+    return status;
 }
 
 /******************************************************************************************************/
@@ -210,18 +231,16 @@ os_status os_queue_receive(os_queue_t *queue, void *item_out, uint32_t timeout_m
  */
 size_t os_queue_count_get(const os_queue_t *queue)
 {
-    size_t count;
+    size_t count = 0U;
 
     OS_ASSERT(queue != NULL);
 
-    if (queue == NULL)
+    if (queue != NULL)
     {
-        return 0U;
+        os_critical_enter();
+        count = queue->count;
+        os_critical_exit();
     }
-
-    os_critical_enter();
-    count = queue->count;
-    os_critical_exit();
 
     return count;
 }
@@ -241,21 +260,19 @@ size_t os_queue_count_get(const os_queue_t *queue)
  */
 size_t os_queue_free_get(const os_queue_t *queue)
 {
-    size_t free_slots;
+    size_t free_slots = 0U;
 
     OS_ASSERT(queue != NULL);
 
-    if (queue == NULL)
+    if (queue != NULL)
     {
-        return 0U;
+        /* count never exceeds capacity (every send checks first), so the
+         * subtraction cannot wrap - including on an unbound queue, where both
+         * are still 0. */
+        os_critical_enter();
+        free_slots = queue->capacity - queue->count;
+        os_critical_exit();
     }
-
-    /* count never exceeds capacity (every send checks first), so the
-     * subtraction cannot wrap - including on an unbound queue, where both
-     * are still 0. */
-    os_critical_enter();
-    free_slots = queue->capacity - queue->count;
-    os_critical_exit();
 
     return free_slots;
 }
@@ -279,68 +296,62 @@ size_t os_queue_free_get(const os_queue_t *queue)
  */
 os_status os_queue_init_dynamic(os_queue_t *queue, size_t item_size, size_t capacity)
 {
-    void      *buffer;
-    size_t    buffer_size;
-    os_status status;
+    os_status status = OS_STATUS_INVALID_ARG;
 
     OS_ASSERT(queue != NULL);
 
-    if ((queue == NULL) || (item_size == 0U) || (capacity == 0U))
+    /* The geometry check rejects a byte count that does not fit in size_t before anything is
+     * allocated: the product would otherwise wrap to a small, successful allocation that every
+     * send and receive then indexes far beyond. It is folded into the same condition as the
+     * argument checks, which is safe because item_size is already known nonzero by then - C
+     * evaluates && left to right and stops at the first false. */
+    if ((queue != NULL) && (item_size != 0U) && (capacity != 0U) &&
+        (capacity <= (SIZE_MAX / item_size)))
     {
-        return OS_STATUS_INVALID_ARG;
+        void *buffer = os_mem_alloc(item_size * capacity);
+
+        if (buffer == NULL)
+        {
+            status = OS_STATUS_NO_MEMORY;
+        }
+        else
+        {
+            /* One critical section covers both the initialization and the ownership flag.
+             *
+             * Setting buffer_owned in a second, separate critical section would leave the queue fully
+             * usable but still claiming it does not own its buffer. An os_queue_cleanup landing in that gap
+             * would reset the queue and, seeing buffer_owned false, walk away without freeing the
+             * allocation just made - a permanent leak of item_size * capacity bytes with nothing to
+             * report it. The window is only a few instructions wide, which is exactly the kind that
+             * survives testing and fails in the field.
+             *
+             * os_queue_bind_buffer performs the waiter check and every field assignment, so this path
+             * leaves the object holding exactly what OS_QUEUE_INITIALIZER writes for the compile-time
+             * ones. It only fails here if the queue still has blocked waiters, in which case the
+             * allocation has to go back rather than leak. */
+            os_critical_enter();
+
+            status = os_queue_bind_buffer(queue, buffer, item_size, capacity);
+
+            if (status == OS_STATUS_OK)
+            {
+                queue->buffer_owned = true;
+            }
+
+            os_critical_exit();
+
+            /* status carries the bind's own answer, not a guess at it:
+             * os_queue_bind_buffer also reports OS_STATUS_INVALID_ARG, and
+             * hardcoding BUSY here would be correct only for as long as every
+             * INVALID_ARG precondition happens to be checked above. */
+            if (status != OS_STATUS_OK)
+            {
+                os_mem_free(buffer);
+            }
+        }
     }
 
-    /* Reject a geometry whose byte count does not fit in size_t before allocating: the product
-     * would otherwise wrap to a small, successful allocation that every send and receive then
-     * indexes far beyond. */
-    if (capacity > (SIZE_MAX / item_size))
-    {
-        return OS_STATUS_INVALID_ARG;
-    }
-
-    buffer_size = item_size * capacity;
-
-    buffer = os_mem_alloc(buffer_size);
-    if (buffer == NULL)
-    {
-        return OS_STATUS_NO_MEMORY;
-    }
-
-    /* One critical section covers both the initialization and the ownership flag.
-     *
-     * Setting buffer_owned in a second, separate critical section would leave the queue fully
-     * usable but still claiming it does not own its buffer. An os_queue_cleanup landing in that gap
-     * would reset the queue and, seeing buffer_owned false, walk away without freeing the
-     * allocation just made - a permanent leak of item_size * capacity bytes with nothing to
-     * report it. The window is only a few instructions wide, which is exactly the kind that
-     * survives testing and fails in the field.
-     *
-     * os_queue_bind_buffer performs the waiter check and every field assignment, so this path
-     * leaves the object holding exactly what OS_QUEUE_INITIALIZER writes for the compile-time
-     * ones. It only fails here if the queue still has blocked waiters, in which case the
-     * allocation has to go back rather than leak. */
-    os_critical_enter();
-
-    status = os_queue_bind_buffer(queue, buffer, item_size, capacity);
-
-    if (status == OS_STATUS_OK)
-    {
-        queue->buffer_owned = true;
-    }
-
-    os_critical_exit();
-
-    /* The bind's own status, not a guess at it: os_queue_bind_buffer also
-     * reports OS_STATUS_INVALID_ARG, and hardcoding BUSY here is correct only
-     * for as long as every INVALID_ARG precondition happens to be checked
-     * above. */
-    if (status != OS_STATUS_OK)
-    {
-        os_mem_free(buffer);
-        return status;
-    }
-
-    return OS_STATUS_OK;
+    return status;
 }
 #endif /* OS_CONFIG_ALLOC_ENABLE */
 
@@ -368,48 +379,53 @@ os_status os_queue_cleanup(os_queue_t *queue)
     void *buffer_to_free = NULL;
 #endif
 
-    if (queue == NULL)
-    {
-        return OS_STATUS_INVALID_ARG;
-    }
+    os_status status = OS_STATUS_INVALID_ARG;
 
-    os_critical_enter();
-
-    if ((queue->send_waiters.head != NULL) || (queue->receive_waiters.head != NULL))
+    if (queue != NULL)
     {
+        os_critical_enter();
+
+        if ((queue->send_waiters.head != NULL) || (queue->receive_waiters.head != NULL))
+        {
+            status = OS_STATUS_BUSY;
+        }
+        else
+        {
+        /* Emptied either way. The waiter lists are already empty - the check above just proved it -
+         * so re-initializing them only guarantees a tail left behind by a list bug cannot survive. */
+        queue->head  = 0U;
+        queue->tail  = 0U;
+        queue->count = 0U;
+        os_list_init(&queue->send_waiters);
+        os_list_init(&queue->receive_waiters);
+
+#if (OS_CONFIG_ALLOC_ENABLE == 1U)
+        if (queue->buffer_owned)
+        {
+            /* Dropped before the critical section ends so the queue cannot be used against a buffer
+             * that is about to be released; the freeing itself happens outside, since os_mem_free
+             * walks the heap free list and there is no reason to hold interrupts off for it. */
+            buffer_to_free      = queue->buffer;
+            queue->buffer       = NULL;
+            queue->item_size    = 0U;
+            queue->capacity     = 0U;
+            queue->buffer_owned = false;
+        }
+#endif
+
+            status = OS_STATUS_OK;
+        }
+
         os_critical_exit();
-        return OS_STATUS_BUSY;
-    }
-
-    /* Emptied either way. The waiter lists are already empty - the check above just proved it -
-     * so re-initializing them only guarantees a tail left behind by a list bug cannot survive. */
-    queue->head  = 0U;
-    queue->tail  = 0U;
-    queue->count = 0U;
-    os_list_init(&queue->send_waiters);
-    os_list_init(&queue->receive_waiters);
 
 #if (OS_CONFIG_ALLOC_ENABLE == 1U)
-    if (queue->buffer_owned)
-    {
-        /* Dropped before the critical section ends so the queue cannot be used against a buffer
-         * that is about to be released; the freeing itself happens outside, since os_mem_free
-         * walks the heap free list and there is no reason to hold interrupts off for it. */
-        buffer_to_free      = queue->buffer;
-        queue->buffer       = NULL;
-        queue->item_size    = 0U;
-        queue->capacity     = 0U;
-        queue->buffer_owned = false;
+        /* NULL is ignored, so the non-owning case (and the BUSY path, which never
+         * set it) needs no branch. */
+        os_mem_free(buffer_to_free);
+#endif
     }
-#endif
 
-    os_critical_exit();
-
-#if (OS_CONFIG_ALLOC_ENABLE == 1U)
-    os_mem_free(buffer_to_free); /* NULL is ignored, so the non-owning case needs no branch */
-#endif
-
-    return OS_STATUS_OK;
+    return status;
 }
 
 #if (OS_CONFIG_ALLOC_ENABLE == 1U)
@@ -437,35 +453,39 @@ os_status os_queue_cleanup(os_queue_t *queue)
  */
 static os_status os_queue_bind_buffer(os_queue_t *queue, void *buffer, size_t item_size, size_t capacity)
 {
-    if ((queue == NULL) || (buffer == NULL) || (item_size == 0U) || (capacity == 0U))
-    {
-        return OS_STATUS_INVALID_ARG;
-    }
+    os_status status = OS_STATUS_INVALID_ARG;
 
-    os_critical_enter();
-
-    /* Re-initializing with queued waiters would strand them on dangling
-     * intrusive nodes and corrupt the lists (first-time init must run on
-     * zero-initialized storage - static objects are). */
-    if ((queue->send_waiters.head != NULL) || (queue->receive_waiters.head != NULL))
+    if ((queue != NULL) && (buffer != NULL) && (item_size != 0U) && (capacity != 0U))
     {
+        os_critical_enter();
+
+        /* Re-initializing with queued waiters would strand them on dangling
+         * intrusive nodes and corrupt the lists (first-time init must run on
+         * zero-initialized storage - static objects are). */
+        if ((queue->send_waiters.head != NULL) || (queue->receive_waiters.head != NULL))
+        {
+            status = OS_STATUS_BUSY;
+        }
+        else
+        {
+            queue->buffer       = (uint8_t *)buffer;
+            queue->item_size    = item_size;
+            queue->capacity     = capacity;
+            queue->head         = 0U;
+            queue->tail         = 0U;
+            queue->count        = 0U;
+            queue->buffer_owned = false; /* the caller claims ownership after this, inside its own
+                                          * critical section - see os_queue_init_dynamic */
+            os_list_init(&queue->send_waiters);
+            os_list_init(&queue->receive_waiters);
+
+            status = OS_STATUS_OK;
+        }
+
         os_critical_exit();
-        return OS_STATUS_BUSY;
     }
 
-    queue->buffer       = (uint8_t *)buffer;
-    queue->item_size    = item_size;
-    queue->capacity     = capacity;
-    queue->head         = 0U;
-    queue->tail         = 0U;
-    queue->count        = 0U;
-    queue->buffer_owned = false; /* the caller claims ownership after this, inside its own critical
-                                  * section - see os_queue_init_dynamic */
-    os_list_init(&queue->send_waiters);
-    os_list_init(&queue->receive_waiters);
-
-    os_critical_exit();
-    return OS_STATUS_OK;
+    return status;
 }
 
 #endif /* OS_CONFIG_ALLOC_ENABLE */

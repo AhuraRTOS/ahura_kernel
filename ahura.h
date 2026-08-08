@@ -138,34 +138,36 @@ typedef struct
 /** Timeout value: do not wait, fail immediately when unavailable. */
 #define OS_WAIT_NOTHING         0U
 
-/** User task priority range: 0 is the idle task's, and OS_TASK_PRIO_MAX is kept out of reach of
- *  os_task_create so the kernel's service tasks have a level nothing else can claim - it is where
- *  OS_CONFIG_TIMER_PRIORITY and OS_CONFIG_WORK_PRIORITY put them by default, though either may be
- *  lowered into the user range.
+/** Every task priority level the scheduler has, one name per level, value N for level N.
  *
- *  Plain literals, not derived from OS_TASK_PRIO_MAX: that is an enum constant, and the
- *  preprocessor reads an enum name as 0, so `(OS_TASK_PRIO_MAX - 1U)` would be -1 inside any #if
- *  and every range test built on it would quietly give the wrong answer. The static assertion
- *  below is what keeps these two in step with the enum instead. */
-#define OS_TASK_PRIO_USER_MIN   1U
-#define OS_TASK_PRIO_USER_MAX   30U
-
-/** Named task priority levels, one per level, value N for level N. OS_TASK_PRIO_1 (lowest)
- *  through OS_TASK_PRIO_30 are the user range, matching
- *  OS_TASK_PRIO_USER_MIN..OS_TASK_PRIO_USER_MAX exactly; OS_TASK_PRIO_MAX is the level above it,
- *  which os_task_create refuses but OS_CONFIG_TIMER_PRIORITY and OS_CONFIG_WORK_PRIORITY accept,
- *  so the enum names every level the scheduler has.
+ *  The range an application may ask for is exactly OS_TASK_PRIO_1_LOWEST..OS_TASK_PRIO_30_HIGHEST,
+ *  and those two names ARE the limits - there is no separate pair of range macros to keep in step
+ *  with them. The two levels outside that range are both kernel-owned and both named here, so the
+ *  enum describes the whole scheduler rather than only the part applications touch:
+ *
+ *    OS_TASK_PRIO_IDLE  (0)   The idle task, one per scheduling core, created by os_init(). It is
+ *                             the empty-ready-bitmap fallback and must be the only thing at this
+ *                             level, or the scheduler could pick a real task when it means to idle.
+ *    OS_TASK_PRIO_MAX   (31)  Above every user task, so the kernel's service tasks have a level
+ *                             nothing else can claim. Where OS_CONFIG_TIMER_PRIORITY and
+ *                             OS_CONFIG_WORK_PRIORITY put them by default, though either may be
+ *                             lowered into the user range.
+ *
+ *  os_task_create() and os_task_priority_set() reject both, returning OS_STATUS_INVALID_ARG.
  *
  *  Safe to enumerate directly like this because the number of levels is a fixed kernel constant
  *  (not application-configurable), so the range never changes. Using a name is a style choice:
  *  a plain number works the same, since os_task_config_t.priority is a plain uint32_t.
  *
  *  One thing a name cannot do is survive the preprocessor. An enum constant is not a macro, so
- *  #if reads it as 0 - which is why the range limits above are literals, why a configured
- *  priority written as a name must be checked with _Static_assert rather than #if (see
- *  os_timer.c), and why application code should not test one in #if either. */
+ *  #if reads it as 0 - which is why a configured priority written as a name must be checked with
+ *  _Static_assert rather than #if (see os_timer.c), and why application code should not test one
+ *  in #if either. */
 typedef enum
 {
+    /* Kernel-owned, below every user task. */
+    OS_TASK_PRIO_IDLE       = 0U,
+
     OS_TASK_PRIO_1_LOWEST   = 1U,
     OS_TASK_PRIO_1          = 1U,
     OS_TASK_PRIO_2          = 2U,
@@ -199,19 +201,23 @@ typedef enum
     OS_TASK_PRIO_30         = 30U,
     OS_TASK_PRIO_30_HIGHEST = 30U,  /**< Highest a user task may request. */
 
-    /* Above the user range: os_task_create rejects it, and it is what
+    /* Kernel-owned, above every user task: os_task_create rejects it, and it is what
      * OS_CONFIG_TIMER_PRIORITY / OS_CONFIG_WORK_PRIORITY default to. */
     OS_TASK_PRIO_MAX        = 31U
 
 } os_task_priority_t;
 
-/* The literals above must stay the enum's user range. Checked here rather than derived, so that
- * changing one and not the other fails to build instead of quietly shifting what a user task may
- * ask for. */
-_Static_assert((OS_TASK_PRIO_USER_MIN == (uint32_t)OS_TASK_PRIO_1) &&
-               (OS_TASK_PRIO_USER_MAX == (uint32_t)OS_TASK_PRIO_30) &&
-               (OS_TASK_PRIO_USER_MAX == ((uint32_t)OS_TASK_PRIO_MAX - 1U)),
-               "OS_TASK_PRIO_USER_MIN/MAX must match os_task_priority_t");
+/* The user range must sit exactly between the two kernel-owned levels, with no gap on either side.
+ * A gap would mean a level no task could ever occupy - wasted ready-list and bitmap space - and an
+ * overlap would put a user task where the idle fallback or a service task belongs. Checked rather
+ * than derived so that renumbering one end without the other fails to build. */
+_Static_assert(((uint32_t)OS_TASK_PRIO_1_LOWEST == ((uint32_t)OS_TASK_PRIO_IDLE + 1U)) &&
+               ((uint32_t)OS_TASK_PRIO_30_HIGHEST == ((uint32_t)OS_TASK_PRIO_MAX - 1U)),
+               "the user priority range must be contiguous with OS_TASK_PRIO_IDLE and OS_TASK_PRIO_MAX");
+
+/* The ready bitmap is one 32-bit word, one bit per level, so the top level has to fit in it. */
+_Static_assert((uint32_t)OS_TASK_PRIO_MAX < 32U,
+               "OS_TASK_PRIO_MAX must fit the 32-bit ready bitmap");
 
 /** Core affinity: the task may run on any core (multi-core builds; the
  *  affinity is a bitmask otherwise, bit n = may run on core n). */
@@ -383,7 +389,7 @@ void os_main(void);
 
 /******************************************************************************************************/
 /**
- * @brief Create a task; priority must be OS_TASK_PRIO_USER_MIN..OS_TASK_PRIO_USER_MAX.
+ * @brief Create a task; priority must be OS_TASK_PRIO_1_LOWEST..OS_TASK_PRIO_30_HIGHEST.
  */
 os_status os_task_create(os_task_t *task, const os_task_config_t *config);
 
@@ -417,7 +423,7 @@ void os_task_yield(void);
 /**
  * @brief Change a task's priority (NULL means the calling task); takes effect immediately, including
  *        for a task already queued on a mutex, semaphore, queue or event. Accepts only
- *        OS_TASK_PRIO_USER_MIN..OS_TASK_PRIO_USER_MAX; OS_STATUS_BUSY for the idle task and the
+ *        OS_TASK_PRIO_1_LOWEST..OS_TASK_PRIO_30_HIGHEST; OS_STATUS_BUSY for the idle task and the
  *        kernel's service tasks. A priority-inheritance boost in force is kept - the new value
  *        becomes the base the task returns to.
  */

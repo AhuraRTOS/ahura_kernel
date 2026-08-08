@@ -22,9 +22,9 @@
 
 /* See os_timer.c: checked with _Static_assert because an os_task_priority_t name is an enum
  * constant, which the preprocessor would read as 0. */
-_Static_assert((OS_CONFIG_WORK_PRIORITY >= OS_TASK_PRIO_USER_MIN) &&
+_Static_assert((OS_CONFIG_WORK_PRIORITY >= OS_TASK_PRIO_1_LOWEST) &&
                (OS_CONFIG_WORK_PRIORITY <= OS_TASK_PRIO_MAX),
-               "OS_CONFIG_WORK_PRIORITY must be OS_TASK_PRIO_USER_MIN..OS_TASK_PRIO_MAX");
+               "OS_CONFIG_WORK_PRIORITY must be OS_TASK_PRIO_1_LOWEST..OS_TASK_PRIO_MAX");
 
 #if (OS_CONFIG_WORK_PAYLOAD_SIZE < 1U)
 #error "OS_CONFIG_WORK_PAYLOAD_SIZE must be at least 1; the work registry sizes its payload copy from it."
@@ -116,49 +116,51 @@ static uint32_t   os_work_registry_slot_free(void);
  */
 os_status os_work_submit(os_work_handler_t handler, const void *data, size_t len, uint32_t delay_ms)
 {
-    uint32_t slot;
-    uint32_t delay_ticks;
+    os_status status = OS_STATUS_INVALID_ARG;
 
-    if ((handler == NULL) || (delay_ms == OS_WAIT_FOREVER) ||
-        (len > OS_CONFIG_WORK_PAYLOAD_SIZE) ||
-        ((len > 0U) && (data == NULL)))
+    if ((handler != NULL) && (delay_ms != OS_WAIT_FOREVER) &&
+        (len <= OS_CONFIG_WORK_PAYLOAD_SIZE) &&
+        ((len == 0U) || (data != NULL)))
     {
-        return OS_STATUS_INVALID_ARG;
-    }
+        uint32_t delay_ticks = OS_TICKS_FROM_MS(delay_ms);
+        uint32_t slot;
 
-    delay_ticks = OS_TICKS_FROM_MS(delay_ms);
+        os_critical_enter();
 
-    os_critical_enter();
+        slot = os_work_registry_slot_free();
 
-    slot = os_work_registry_slot_free();
+        if (slot >= OS_CONFIG_MAX_WORKS)
+        {
+            status = OS_STATUS_FULL;
+        }
+        else
+        {
+            os_work_registry[slot].handler     = handler;
+            os_work_registry[slot].delay_ticks = delay_ticks;
+            os_work_registry[slot].len         = len;
+            os_work_registry[slot].ready       = (delay_ticks == 0U);
 
-    if (slot >= OS_CONFIG_MAX_WORKS)
-    {
+            if (len > 0U)
+            {
+                (void)memcpy(os_work_registry[slot].payload.bytes, data, len);
+            }
+
+            if (delay_ticks == 0U)
+            {
+                /* Direct-handle wake: skips the id lookup os_task_wake would do;
+                 * safe here because os_critical_enter above already holds the
+                 * kernel mask (and, on multi-core builds, the same spinlock
+                 * os_task_wake_tcb requires the caller to hold). */
+                os_task_wake_tcb(os_work_task_tcb);
+            }
+
+            status = OS_STATUS_OK;
+        }
+
         os_critical_exit();
-        return OS_STATUS_FULL;
     }
 
-    os_work_registry[slot].handler     = handler;
-    os_work_registry[slot].delay_ticks = delay_ticks;
-    os_work_registry[slot].len         = len;
-    os_work_registry[slot].ready       = (delay_ticks == 0U);
-
-    if (len > 0U)
-    {
-        (void)memcpy(os_work_registry[slot].payload.bytes, data, len);
-    }
-
-    if (delay_ticks == 0U)
-    {
-        /* Direct-handle wake: skips the id lookup os_task_wake would do;
-         * safe here because os_critical_enter above already holds the
-         * kernel mask (and, on multi-core builds, the same spinlock
-         * os_task_wake_tcb requires the caller to hold). */
-        os_task_wake_tcb(os_work_task_tcb);
-    }
-
-    os_critical_exit();
-    return OS_STATUS_OK;
+    return status;
 }
 
 /******************************************************************************************************/
@@ -189,22 +191,22 @@ os_status os_work_system_init(void)
     }
 
     status = os_task_create_system(&tsk_work, &config);
-    if (status != OS_STATUS_OK)
+
+    /* Each step only runs once the previous one succeeded, and the first failure
+     * is what gets reported. */
+    if (status == OS_STATUS_OK)
     {
-        return status;
+        status = os_task_start(&tsk_work);
     }
 
-    status = os_task_start(&tsk_work);
-    if (status != OS_STATUS_OK)
+    if (status == OS_STATUS_OK)
     {
-        return status;
+        /* Resolved once: the work task is never deleted, so every later wake
+         * (submit and the tick-time expiry path) can skip the id lookup. */
+        os_work_task_tcb = os_task_tcb_resolve(tsk_work.id);
     }
 
-    /* Resolved once: the work task is never deleted, so every later wake
-     * (submit and the tick-time expiry path) can skip the id lookup. */
-    os_work_task_tcb = os_task_tcb_resolve(tsk_work.id);
-
-    return OS_STATUS_OK;
+    return status;
 }
 
 /******************************************************************************************************/
@@ -220,59 +222,57 @@ void os_work_tick_process(uint32_t elapsed_ticks)
     uint32_t slot;
     bool     wake_needed = false;
 
-    if (elapsed_ticks == 0U)
+    if (elapsed_ticks > 0U)
     {
-        return;
-    }
+        /* The kernel mask is raised so a preempting ISR submitting or cancelling
+         * cannot interleave with the pending-check/ready-write pair below
+         * (a cancel landing in between would be silently undone). Also covers
+         * the tickless announce path, which calls this from task context. On
+         * multi-core builds the cross-core spinlock additionally excludes the
+         * other cores' os_work_submit callers, who hold it via
+         * os_critical_enter - the local mask alone only stops this core's own
+         * interrupts. Both are held across the os_task_wake_tcb below, which is
+         * exactly what that call requires of its caller (unlike os_task_wake,
+         * which takes the same non-recursive lock itself and so could not be
+         * called from in here). */
+        mask_state = os_arch_kernel_mask_save();
+        os_critical_multicore_lock();
 
-    /* The kernel mask is raised so a preempting ISR submitting or cancelling
-     * cannot interleave with the pending-check/ready-write pair below
-     * (a cancel landing in between would be silently undone). Also covers
-     * the tickless announce path, which calls this from task context. On
-     * multi-core builds the cross-core spinlock additionally excludes the
-     * other cores' os_work_submit callers, who hold it via
-     * os_critical_enter - the local mask alone only stops this core's own
-     * interrupts. Both are held across the os_task_wake_tcb below, which is
-     * exactly what that call requires of its caller (unlike os_task_wake,
-     * which takes the same non-recursive lock itself and so could not be
-     * called from in here). */
-    mask_state = os_arch_kernel_mask_save();
-    os_critical_multicore_lock();
-
-    for (slot = 0U; slot < OS_CONFIG_MAX_WORKS; slot++)
-    {
-        os_work_entry_t *entry = &os_work_registry[slot];
-
-        /* Taken but not yet ready is exactly what "pending" used to mean. */
-        if ((entry->handler == NULL) || entry->ready)
+        for (slot = 0U; slot < OS_CONFIG_MAX_WORKS; slot++)
         {
-            continue;
+            os_work_entry_t *entry = &os_work_registry[slot];
+
+            /* Taken but not yet ready is exactly what "pending" used to mean. */
+            if ((entry->handler == NULL) || entry->ready)
+            {
+                continue;
+            }
+
+            if (entry->delay_ticks > elapsed_ticks)
+            {
+                entry->delay_ticks -= elapsed_ticks;
+            }
+            else
+            {
+                entry->delay_ticks = 0U;
+                entry->ready       = true;
+                wake_needed        = true;
+            }
         }
 
-        if (entry->delay_ticks > elapsed_ticks)
+        if (wake_needed)
         {
-            entry->delay_ticks -= elapsed_ticks;
+            /* Direct-handle wake: skips both the id lookup and the nested
+             * critical section os_task_wake would pay on every expiring tick;
+             * safe here because the kernel mask and (multi-core) spinlock this
+             * function already holds are exactly what os_task_wake_tcb
+             * requires the caller to provide. */
+            os_task_wake_tcb(os_work_task_tcb);
         }
-        else
-        {
-            entry->delay_ticks = 0U;
-            entry->ready       = true;
-            wake_needed        = true;
-        }
-    }
 
-    if (wake_needed)
-    {
-        /* Direct-handle wake: skips both the id lookup and the nested
-         * critical section os_task_wake would pay on every expiring tick;
-         * safe here because the kernel mask and (multi-core) spinlock this
-         * function already holds are exactly what os_task_wake_tcb
-         * requires the caller to provide. */
-        os_task_wake_tcb(os_work_task_tcb);
+        os_critical_multicore_unlock();
+        os_arch_kernel_mask_restore(mask_state);
     }
-
-    os_critical_multicore_unlock();
-    os_arch_kernel_mask_restore(mask_state);
 }
 
 /******************************************************************************************************/
@@ -424,16 +424,17 @@ static bool os_work_ready_fetch(os_work_handler_t *handler_out, void *payload_ou
 static bool os_work_ready_exists(void)
 {
     uint32_t slot;
+    bool     exists = false;
 
-    for (slot = 0U; slot < OS_CONFIG_MAX_WORKS; slot++)
+    for (slot = 0U; (slot < OS_CONFIG_MAX_WORKS) && (!exists); slot++)
     {
         if ((os_work_registry[slot].handler != NULL) && os_work_registry[slot].ready)
         {
-            return true;
+            exists = true;
         }
     }
 
-    return false;
+    return exists;
 }
 
 /******************************************************************************************************/
@@ -449,16 +450,17 @@ static bool os_work_ready_exists(void)
 static uint32_t os_work_registry_slot_free(void)
 {
     uint32_t slot;
+    uint32_t found = OS_CONFIG_MAX_WORKS;
 
-    for (slot = 0U; slot < OS_CONFIG_MAX_WORKS; slot++)
+    for (slot = 0U; (slot < OS_CONFIG_MAX_WORKS) && (found == OS_CONFIG_MAX_WORKS); slot++)
     {
         if (os_work_registry[slot].handler == NULL)
         {
-            return slot;
+            found = slot;
         }
     }
 
-    return OS_CONFIG_MAX_WORKS;
+    return found;
 }
 
 #endif /* OS_CONFIG_WORK_ENABLE */

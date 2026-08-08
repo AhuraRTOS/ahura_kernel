@@ -8,10 +8,14 @@
  * while one without pays interrupt latency instead.
  *
  * Each function validates and makes exactly one call into the port rather than layering on another
- * os_atomic_*: the port is a separate translation unit, so without LTO every layer would be a real
- * branch and stack frame. The cost is the NULL check written out repeatedly below.
+ * os_atomic_*: the port's operations are inline (os_arch_port_common.h), so one call here becomes
+ * the five instructions the sequence actually is, while layering would re-run the argument checks.
+ * The cost is the NULL check written out repeatedly below.
  *
  * All of them return the value the word held BEFORE the operation.
+ *
+ * MISRA C:2012: every function here has a single exit (Rule 15.5), so each one declares its result
+ * initialised to the value a rejected argument yields and assigns over it on the success path.
  *
  * @copyright (c) 2026 Ahura Project Contributors
  *            SPDX-License-Identifier: MIT
@@ -57,12 +61,14 @@ _Static_assert(sizeof(os_atomic_t) == 4U,
  */
 int32_t os_atomic_get(const os_atomic_t *target)
 {
-    if (target == NULL)
+    int32_t value = 0;
+
+    if (target != NULL)
     {
-        return 0;
+        value = os_arch_atomic_load((const __IO int32_t *)target);
     }
 
-    return os_arch_atomic_load((const __IO int32_t *)target);
+    return value;
 }
 
 /******************************************************************************************************/
@@ -75,14 +81,16 @@ int32_t os_atomic_get(const os_atomic_t *target)
  */
 int32_t os_atomic_set(os_atomic_t *target, int32_t value)
 {
+    int32_t previous = 0;
+
     OS_ASSERT(target != NULL);
 
-    if (target == NULL)
+    if (target != NULL)
     {
-        return 0;
+        previous = os_arch_atomic_exchange((__IO int32_t *)target, value);
     }
 
-    return os_arch_atomic_exchange((__IO int32_t *)target, value);
+    return previous;
 }
 
 /******************************************************************************************************/
@@ -94,14 +102,16 @@ int32_t os_atomic_set(os_atomic_t *target, int32_t value)
  */
 int32_t os_atomic_clear(os_atomic_t *target)
 {
+    int32_t previous = 0;
+
     OS_ASSERT(target != NULL);
 
-    if (target == NULL)
+    if (target != NULL)
     {
-        return 0;
+        previous = os_arch_atomic_exchange((__IO int32_t *)target, 0);
     }
 
-    return os_arch_atomic_exchange((__IO int32_t *)target, 0);
+    return previous;
 }
 
 /******************************************************************************************************/
@@ -114,14 +124,16 @@ int32_t os_atomic_clear(os_atomic_t *target)
  */
 int32_t os_atomic_add(os_atomic_t *target, int32_t value)
 {
+    int32_t previous = 0;
+
     OS_ASSERT(target != NULL);
 
-    if (target == NULL)
+    if (target != NULL)
     {
-        return 0;
+        previous = os_arch_atomic_add((__IO int32_t *)target, value);
     }
 
-    return os_arch_atomic_add((__IO int32_t *)target, value);
+    return previous;
 }
 
 /******************************************************************************************************/
@@ -134,14 +146,16 @@ int32_t os_atomic_add(os_atomic_t *target, int32_t value)
  */
 int32_t os_atomic_sub(os_atomic_t *target, int32_t value)
 {
+    int32_t previous = 0;
+
     OS_ASSERT(target != NULL);
 
-    if (target == NULL)
+    if (target != NULL)
     {
-        return 0;
+        previous = os_arch_atomic_sub((__IO int32_t *)target, value);
     }
 
-    return os_arch_atomic_sub((__IO int32_t *)target, value);
+    return previous;
 }
 
 /******************************************************************************************************/
@@ -153,14 +167,16 @@ int32_t os_atomic_sub(os_atomic_t *target, int32_t value)
  */
 int32_t os_atomic_inc(os_atomic_t *target)
 {
+    int32_t previous = 0;
+
     OS_ASSERT(target != NULL);
 
-    if (target == NULL)
+    if (target != NULL)
     {
-        return 0;
+        previous = os_arch_atomic_add((__IO int32_t *)target, 1);
     }
 
-    return os_arch_atomic_add((__IO int32_t *)target, 1);
+    return previous;
 }
 
 /******************************************************************************************************/
@@ -172,14 +188,16 @@ int32_t os_atomic_inc(os_atomic_t *target)
  */
 int32_t os_atomic_dec(os_atomic_t *target)
 {
+    int32_t previous = 0;
+
     OS_ASSERT(target != NULL);
 
-    if (target == NULL)
+    if (target != NULL)
     {
-        return 0;
+        previous = os_arch_atomic_sub((__IO int32_t *)target, 1);
     }
 
-    return os_arch_atomic_sub((__IO int32_t *)target, 1);
+    return previous;
 }
 
 /******************************************************************************************************/
@@ -192,14 +210,16 @@ int32_t os_atomic_dec(os_atomic_t *target)
  */
 int32_t os_atomic_or(os_atomic_t *target, int32_t value)
 {
+    int32_t previous = 0;
+
     OS_ASSERT(target != NULL);
 
-    if (target == NULL)
+    if (target != NULL)
     {
-        return 0;
+        previous = os_arch_atomic_or((__IO int32_t *)target, value);
     }
 
-    return os_arch_atomic_or((__IO int32_t *)target, value);
+    return previous;
 }
 
 /******************************************************************************************************/
@@ -212,14 +232,16 @@ int32_t os_atomic_or(os_atomic_t *target, int32_t value)
  */
 int32_t os_atomic_and(os_atomic_t *target, int32_t value)
 {
+    int32_t previous = 0;
+
     OS_ASSERT(target != NULL);
 
-    if (target == NULL)
+    if (target != NULL)
     {
-        return 0;
+        previous = os_arch_atomic_and((__IO int32_t *)target, value);
     }
 
-    return os_arch_atomic_and((__IO int32_t *)target, value);
+    return previous;
 }
 
 /******************************************************************************************************/
@@ -232,14 +254,16 @@ int32_t os_atomic_and(os_atomic_t *target, int32_t value)
  */
 int32_t os_atomic_xor(os_atomic_t *target, int32_t value)
 {
+    int32_t previous = 0;
+
     OS_ASSERT(target != NULL);
 
-    if (target == NULL)
+    if (target != NULL)
     {
-        return 0;
+        previous = os_arch_atomic_xor((__IO int32_t *)target, value);
     }
 
-    return os_arch_atomic_xor((__IO int32_t *)target, value);
+    return previous;
 }
 
 /******************************************************************************************************/
@@ -252,14 +276,16 @@ int32_t os_atomic_xor(os_atomic_t *target, int32_t value)
  */
 int32_t os_atomic_nand(os_atomic_t *target, int32_t value)
 {
+    int32_t previous = 0;
+
     OS_ASSERT(target != NULL);
 
-    if (target == NULL)
+    if (target != NULL)
     {
-        return 0;
+        previous = os_arch_atomic_nand((__IO int32_t *)target, value);
     }
 
-    return os_arch_atomic_nand((__IO int32_t *)target, value);
+    return previous;
 }
 
 /******************************************************************************************************/
@@ -279,14 +305,16 @@ int32_t os_atomic_nand(os_atomic_t *target, int32_t value)
  */
 bool os_atomic_cas(os_atomic_t *target, int32_t expected, int32_t desired)
 {
+    bool swapped = false;
+
     OS_ASSERT(target != NULL);
 
-    if (target == NULL)
+    if (target != NULL)
     {
-        return false;
+        swapped = os_arch_atomic_cas((__IO int32_t *)target, expected, desired);
     }
 
-    return os_arch_atomic_cas((__IO int32_t *)target, expected, desired);
+    return swapped;
 }
 
 /******************************************************************************************************/
@@ -299,14 +327,18 @@ bool os_atomic_cas(os_atomic_t *target, int32_t expected, int32_t desired)
  */
 bool os_atomic_test_bit(const os_atomic_t *target, uint32_t bit)
 {
+    bool is_set = false;
+
     OS_ASSERT(bit < OS_ATOMIC_BITS);
 
-    if ((target == NULL) || (bit >= OS_ATOMIC_BITS))
+    if ((target != NULL) && (bit < OS_ATOMIC_BITS))
     {
-        return false;
+        int32_t mask = (int32_t)(1UL << bit);
+
+        is_set = ((os_arch_atomic_load((const __IO int32_t *)target) & mask) != 0);
     }
 
-    return ((os_arch_atomic_load((const __IO int32_t *)target) & (int32_t)(1UL << bit)) != 0);
+    return is_set;
 }
 
 /******************************************************************************************************/
@@ -319,21 +351,20 @@ bool os_atomic_test_bit(const os_atomic_t *target, uint32_t bit)
  */
 bool os_atomic_test_and_set_bit(os_atomic_t *target, uint32_t bit)
 {
-    int32_t mask;
-    int32_t previous;
+    bool was_set = false;
 
     OS_ASSERT(target != NULL);
     OS_ASSERT(bit < OS_ATOMIC_BITS);
 
-    if ((target == NULL) || (bit >= OS_ATOMIC_BITS))
+    if ((target != NULL) && (bit < OS_ATOMIC_BITS))
     {
-        return false;
+        int32_t mask     = (int32_t)(1UL << bit);
+        int32_t previous = os_arch_atomic_or((__IO int32_t *)target, mask);
+
+        was_set = ((previous & mask) != 0);
     }
 
-    mask     = (int32_t)(1UL << bit);
-    previous = os_arch_atomic_or((__IO int32_t *)target, mask);
-
-    return ((previous & mask) != 0);
+    return was_set;
 }
 
 /******************************************************************************************************/
@@ -346,21 +377,20 @@ bool os_atomic_test_and_set_bit(os_atomic_t *target, uint32_t bit)
  */
 bool os_atomic_test_and_clear_bit(os_atomic_t *target, uint32_t bit)
 {
-    int32_t mask;
-    int32_t previous;
+    bool was_set = false;
 
     OS_ASSERT(target != NULL);
     OS_ASSERT(bit < OS_ATOMIC_BITS);
 
-    if ((target == NULL) || (bit >= OS_ATOMIC_BITS))
+    if ((target != NULL) && (bit < OS_ATOMIC_BITS))
     {
-        return false;
+        int32_t mask     = (int32_t)(1UL << bit);
+        int32_t previous = os_arch_atomic_and((__IO int32_t *)target, (int32_t)(~mask));
+
+        was_set = ((previous & mask) != 0);
     }
 
-    mask     = (int32_t)(1UL << bit);
-    previous = os_arch_atomic_and((__IO int32_t *)target, (int32_t)(~mask));
-
-    return ((previous & mask) != 0);
+    return was_set;
 }
 
 /******************************************************************************************************/
@@ -376,12 +406,10 @@ void os_atomic_set_bit(os_atomic_t *target, uint32_t bit)
     OS_ASSERT(target != NULL);
     OS_ASSERT(bit < OS_ATOMIC_BITS);
 
-    if ((target == NULL) || (bit >= OS_ATOMIC_BITS))
+    if ((target != NULL) && (bit < OS_ATOMIC_BITS))
     {
-        return;
+        (void)os_arch_atomic_or((__IO int32_t *)target, (int32_t)(1UL << bit));
     }
-
-    (void)os_arch_atomic_or((__IO int32_t *)target, (int32_t)(1UL << bit));
 }
 
 /******************************************************************************************************/
@@ -397,12 +425,10 @@ void os_atomic_clear_bit(os_atomic_t *target, uint32_t bit)
     OS_ASSERT(target != NULL);
     OS_ASSERT(bit < OS_ATOMIC_BITS);
 
-    if ((target == NULL) || (bit >= OS_ATOMIC_BITS))
+    if ((target != NULL) && (bit < OS_ATOMIC_BITS))
     {
-        return;
+        (void)os_arch_atomic_and((__IO int32_t *)target, (int32_t)(~(1UL << bit)));
     }
-
-    (void)os_arch_atomic_and((__IO int32_t *)target, (int32_t)(~(1UL << bit)));
 }
 
 /******************************************************************************************************/
@@ -416,25 +442,21 @@ void os_atomic_clear_bit(os_atomic_t *target, uint32_t bit)
  */
 void os_atomic_set_bit_to(os_atomic_t *target, uint32_t bit, bool value)
 {
-    int32_t mask;
-
     OS_ASSERT(target != NULL);
     OS_ASSERT(bit < OS_ATOMIC_BITS);
 
-    if ((target == NULL) || (bit >= OS_ATOMIC_BITS))
+    if ((target != NULL) && (bit < OS_ATOMIC_BITS))
     {
-        return;
-    }
+        int32_t mask = (int32_t)(1UL << bit);
 
-    mask = (int32_t)(1UL << bit);
-
-    if (value)
-    {
-        (void)os_arch_atomic_or((__IO int32_t *)target, mask);
-    }
-    else
-    {
-        (void)os_arch_atomic_and((__IO int32_t *)target, (int32_t)(~mask));
+        if (value)
+        {
+            (void)os_arch_atomic_or((__IO int32_t *)target, mask);
+        }
+        else
+        {
+            (void)os_arch_atomic_and((__IO int32_t *)target, (int32_t)(~mask));
+        }
     }
 }
 

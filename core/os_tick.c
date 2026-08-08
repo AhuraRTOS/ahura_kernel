@@ -69,42 +69,42 @@ uint32_t os_tick_get(void)
  */
 void os_tick_handler(void)
 {
+    /* Core 0 owns the kernel time base (delays, timers, work): a tick on any other core only
+     * drives that core's preemption and round-robin, or elapsed time would be counted once per
+     * core. Always true on a single-core build, where the whole question compiles away.
+     *
+     * Held in a flag rather than branching with an early return, so this function has one exit
+     * (MISRA Rule 15.5) and the preempt check at the bottom - which both paths need, identically -
+     * is written once. */
+    bool owns_time_base = true;
+
 #if (OS_CONFIG_CORE_COUNT > 1U)
-    /* Core 0 owns the kernel time base (delays, timers, work): a tick on
-     * any other core only drives that core's preemption and round-robin,
-     * or elapsed time would be counted once per core. */
-    if (os_arch_core_id_get() != 0U)
-    {
-        /* This core's own round-robin quantum still has to be counted down,
-         * even though the kernel time base belongs to core 0. */
-        os_task_slice_tick(1U);
-
-        if (os_kernel_is_running() && os_task_reschedule_possible())
-        {
-            OS_ARCH_CONTEXT_SWITCH_REQUEST();
-        }
-
-        return;
-    }
+    owns_time_base = (os_arch_core_id_get() == 0U);
 #endif
 
-    os_tick_count++;
+    if (owns_time_base)
+    {
+        os_tick_count++;
 
 #if (OS_CONFIG_CPU_USAGE_ENABLE == 1U)
-    os_tick_usage_total_ticks++;
-    if (os_task_current_is_idle())
-    {
-        os_tick_usage_idle_ticks++;
-    }
+        os_tick_usage_total_ticks++;
+        if (os_task_current_is_idle())
+        {
+            os_tick_usage_idle_ticks++;
+        }
 #endif
 
 #if (OS_CONFIG_WORK_ENABLE == 1U)
-    os_work_tick_process(1U);
+        os_work_tick_process(1U);
 #endif
 #if (OS_CONFIG_TIMER_ENABLE == 1U)
-    os_timer_tick_process(1U);
+        os_timer_tick_process(1U);
 #endif
-    os_task_tick_update(1U);
+        os_task_tick_update(1U);
+    }
+
+    /* This core's own round-robin quantum is counted down whichever core it is:
+     * only the kernel time base belongs exclusively to core 0. */
     os_task_slice_tick(1U);
 
     /* Pend PendSV only when it would actually do something: a wake this tick
@@ -173,6 +173,7 @@ uint32_t os_cpu_usage_get(void)
 {
     uint32_t total_ticks;
     uint32_t idle_ticks;
+    uint32_t usage_percent = 0U;
 
     os_critical_enter();
 
@@ -184,17 +185,19 @@ uint32_t os_cpu_usage_get(void)
 
     os_critical_exit();
 
-    if (total_ticks == 0U)
+    /* 0 before the first tick of a window, which is also what the division could
+     * not produce. */
+    if (total_ticks != 0U)
     {
-        return 0U;
+        if (idle_ticks > total_ticks)
+        {
+            idle_ticks = total_ticks;
+        }
+
+        usage_percent = ((total_ticks - idle_ticks) * 100U) / total_ticks;
     }
 
-    if (idle_ticks > total_ticks)
-    {
-        idle_ticks = total_ticks;
-    }
-
-    return ((total_ticks - idle_ticks) * 100U) / total_ticks;
+    return usage_percent;
 }
 #endif /* OS_CONFIG_CPU_USAGE_ENABLE */
 
@@ -277,60 +280,64 @@ void os_tickless_idle_process(void)
     uint32_t planned_idle_ticks;
     uint32_t elapsed_ticks = 0U;
 
-#if (OS_CONFIG_CORE_COUNT > 1U)
     /* Core 0 owns the kernel time base, the same rule os_tick_handler enforces. Announcing a
      * suppressed window from another core would add its idle time to counters core 0's tick
      * interrupt is already advancing, so every sleep would be counted twice and the clock would
-     * run fast. Other cores still idle, they just do it in a plain WFI without announcing. */
-    if (os_arch_core_id_get() != 0U)
-    {
-        return;
-    }
+     * run fast. Other cores still idle, they just do it in a plain WFI without announcing.
+     *
+     * A flag rather than an early return, for the single exit (MISRA Rule 15.5); always true on a
+     * single-core build, where the test compiles away entirely. */
+    bool owns_time_base = true;
+
+#if (OS_CONFIG_CORE_COUNT > 1U)
+    owns_time_base = (os_arch_core_id_get() == 0U);
 #endif
 
-    /* Interrupts off BEFORE deciding how long to sleep, and kept off until the sleep has been
-     * accounted for.
-     *
-     * Every input to that decision - the next timer expiry, the next ready work item, the earliest
-     * sleeping task - is something an ISR can change. Reading them with interrupts live leaves a
-     * window in which an ISR registers a nearer deadline than the one just computed, and the sleep
-     * then runs straight past it. Waking a task in that window is harmless, because that pends
-     * PendSV and a pending exception cuts the WFI short, but starting a timer or submitting
-     * delayed work pends nothing at all: there would be no wake-up event, and the timer would fire
-     * late by the whole remaining window.
-     *
-     * Masking first closes it. A WFI still wakes on a pending interrupt while masked, so anything
-     * arriving from here on shortens the sleep rather than being missed. */
-    mask_state = os_arch_kernel_mask_save();
-
-    planned_idle_ticks = os_tickless_expected_idle_ticks_get();
-
-    if (planned_idle_ticks < OS_CONFIG_TICKLESS_MIN_IDLE)
+    if (owns_time_base)
     {
+        /* Interrupts off BEFORE deciding how long to sleep, and kept off until the sleep has been
+         * accounted for.
+         *
+         * Every input to that decision - the next timer expiry, the next ready work item, the earliest
+         * sleeping task - is something an ISR can change. Reading them with interrupts live leaves a
+         * window in which an ISR registers a nearer deadline than the one just computed, and the sleep
+         * then runs straight past it. Waking a task in that window is harmless, because that pends
+         * PendSV and a pending exception cuts the WFI short, but starting a timer or submitting
+         * delayed work pends nothing at all: there would be no wake-up event, and the timer would fire
+         * late by the whole remaining window.
+         *
+         * Masking first closes it. A WFI still wakes on a pending interrupt while masked, so anything
+         * arriving from here on shortens the sleep rather than being missed. */
+        mask_state = os_arch_kernel_mask_save();
+
+        planned_idle_ticks = os_tickless_expected_idle_ticks_get();
+
+        /* Too short to be worth suppressing: the mask is handed straight back and this
+         * idle pass behaves like a plain WFI. */
+        if (planned_idle_ticks >= OS_CONFIG_TICKLESS_MIN_IDLE)
+        {
+            os_tickless_pre_sleep_cb();
+
+            OS_ARCH_SLEEP(planned_idle_ticks);
+
+            /* Wake path, in this order for a reason: measure while the counter still holds the sleep,
+             * let the application restore its hardware, announce so the clock catches up, and only
+             * then release the mask. Announcing after the release, or before the restore, both break -
+             * os_tick_count is short by the whole sleep until step 3, and the switch os_tick_announce
+             * can pend would otherwise be taken while the idle task still has SLEEPDEEP set. */
+            elapsed_ticks = os_arch_elapsed_ticks_get();
+
+            os_tickless_post_sleep_cb();
+            os_tick_announce(elapsed_ticks);
+            os_arch_sleep_finish();
+        }
+
+        /* Releases the mask taken before the sleep was planned. Nesting is deliberate: the port's own
+         * mask (taken in os_arch_sleep_prepare, released by os_arch_sleep_finish above) sits inside
+         * this one, and both are save/restore rather than unconditional enables, so the interrupt
+         * state the idle task arrived with is what it leaves with. */
         os_arch_kernel_mask_restore(mask_state);
-        return;
     }
-
-    os_tickless_pre_sleep_cb();
-
-    OS_ARCH_SLEEP(planned_idle_ticks);
-
-    /* Wake path, in this order for a reason: measure while the counter still holds the sleep,
-     * let the application restore its hardware, announce so the clock catches up, and only then
-     * release the mask. Announcing after the release, or before the restore, both break -
-     * os_tick_count is short by the whole sleep until step 3, and the switch os_tick_announce can
-     * pend would otherwise be taken while the idle task still has SLEEPDEEP set. */
-    elapsed_ticks = os_arch_elapsed_ticks_get();
-
-    os_tickless_post_sleep_cb();
-    os_tick_announce(elapsed_ticks);
-    os_arch_sleep_finish();
-
-    /* Releases the mask taken before the sleep was planned. Nesting is deliberate: the port's own
-     * mask (taken in os_arch_sleep_prepare, released by os_arch_sleep_finish above) sits inside
-     * this one, and both are save/restore rather than unconditional enables, so the interrupt
-     * state the idle task arrived with is what it leaves with. */
-    os_arch_kernel_mask_restore(mask_state);
 }
 
 /* os_tickless_pre_sleep_cb() and os_tickless_post_sleep_cb() are deliberately NOT defined here.

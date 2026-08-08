@@ -153,11 +153,11 @@
  *
  * os_init() discards the creation status for this task (void, matching the work/timer
  * system-init calls) - an out-of-range priority (must be
- * OS_TASK_PRIO_USER_MIN..USER_MAX) or a too-small stack (must be at least
+ * OS_TASK_PRIO_1_LOWEST..OS_TASK_PRIO_30_HIGHEST) or a too-small stack (must be at least
  * OS_CONFIG_MIN_STACK_SIZE above) fails SILENTLY: the firmware still builds, boots and
  * schedules, but os_main() simply never runs. */
 #define OS_CONFIG_MAIN_TASK_STACK_SIZE      1024U
-#define OS_CONFIG_MAIN_TASK_PRIORITY        1U
+#define OS_CONFIG_MAIN_TASK_PRIORITY        OS_TASK_PRIO_1
 
 /*
  * ***********************************************************************************************************
@@ -240,7 +240,7 @@
  * on what else is runnable. Lower it when callbacks matter less than some user task - they run at
  * this priority for their whole duration, so a slow callback at 31 delays everything.
  *
- * Any level from OS_TASK_PRIO_USER_MIN to OS_TASK_PRIO_MAX is allowed, including levels user
+ * Any level from OS_TASK_PRIO_1_LOWEST to OS_TASK_PRIO_MAX is allowed, including levels user
  * tasks also use; the timer task is a kernel service task either way, so os_task_pause and
  * os_task_delete keep refusing it whatever this is set to. */
 #define OS_CONFIG_TIMER_PRIORITY            OS_TASK_PRIO_MAX
@@ -382,7 +382,7 @@
 #define OS_CONFIG_LOG_BUFFER_SIZE           1024U
 #define OS_CONFIG_LOG_LINE_MAX              128U
 #define OS_CONFIG_LOG_TASK_STACK_SIZE       512U
-#define OS_CONFIG_LOG_TASK_PRIORITY         1U
+#define OS_CONFIG_LOG_TASK_PRIORITY         OS_TASK_PRIO_1
 
 /*
  * ***********************************************************************************************************
@@ -400,7 +400,7 @@
  * nested helper tasks. Same silent-failure caveat as OS_CONFIG_MAIN_TASK_*. */
 #define OS_CONFIG_TEST_ENABLE               0U
 #define OS_CONFIG_TEST_STACK_SIZE           2048U
-#define OS_CONFIG_TEST_PRIORITY             2U
+#define OS_CONFIG_TEST_PRIORITY             OS_TASK_PRIO_2
 
 /*
  * ***********************************************************************************************************

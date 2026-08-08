@@ -20,10 +20,11 @@
 
 /* Checked here rather than with #if: a priority may be given as an os_task_priority_t name, and an
  * enum constant is not a macro - the preprocessor would read it as 0 and reject a valid setting.
- * 0 belongs to the idle task, which the timer task must outrank to be dispatched at all. */
-_Static_assert((OS_CONFIG_TIMER_PRIORITY >= OS_TASK_PRIO_USER_MIN) &&
+ * OS_TASK_PRIO_IDLE belongs to the idle task, which the timer task must outrank to be dispatched
+ * at all. */
+_Static_assert((OS_CONFIG_TIMER_PRIORITY >= OS_TASK_PRIO_1_LOWEST) &&
                (OS_CONFIG_TIMER_PRIORITY <= OS_TASK_PRIO_MAX),
-               "OS_CONFIG_TIMER_PRIORITY must be OS_TASK_PRIO_USER_MIN..OS_TASK_PRIO_MAX");
+               "OS_CONFIG_TIMER_PRIORITY must be OS_TASK_PRIO_1_LOWEST..OS_TASK_PRIO_MAX");
 
 /*
  * ***********************************************************************************************************
@@ -80,38 +81,42 @@ static uint32_t    os_timer_registry_slot_acquire(const os_timer_t *timer);
  */
 os_status os_timer_init(os_timer_t *timer, uint32_t period_ticks, os_timer_mode_t mode, os_timer_callback_t callback, void *context)
 {
-    uint32_t slot;
+    os_status status = OS_STATUS_INVALID_ARG;
 
-    if ((timer == NULL) || (period_ticks == 0U) || (callback == NULL) ||
-        ((mode != OS_TIMER_MODE_ONE_SHOT) && (mode != OS_TIMER_MODE_PERIODIC)))
+    if ((timer != NULL) && (period_ticks != 0U) && (callback != NULL) &&
+        ((mode == OS_TIMER_MODE_ONE_SHOT) || (mode == OS_TIMER_MODE_PERIODIC)))
     {
-        return OS_STATUS_INVALID_ARG;
+        uint32_t slot;
+
+        /* The critical section is what makes this safe on a live timer: clearing active alone
+         * would still leave os_timer_tick_process reading this object from the tick ISR while the
+         * fields below are half-rewritten. */
+        os_critical_enter();
+
+        /* Leaving the timer registered would keep the slot occupied (nothing else releases it
+         * until a later start or stop) and hand the tick a timer the caller has just
+         * reconfigured. */
+        slot = os_timer_registry_slot_find(timer);
+        if (slot < OS_CONFIG_MAX_TIMERS)
+        {
+            os_timer_registry[slot] = NULL;
+        }
+
+        timer->period_ticks    = period_ticks;
+        timer->remaining_ticks = period_ticks;
+        timer->mode            = mode;
+        timer->active          = false;
+        timer->paused          = false;
+        timer->expired         = false;
+        timer->callback        = callback;
+        timer->context         = context;
+
+        os_critical_exit();
+
+        status = OS_STATUS_OK;
     }
 
-    /* The critical section is what makes this safe on a live timer: clearing active alone would
-     * still leave os_timer_tick_process reading this object from the tick ISR while the fields
-     * below are half-rewritten. */
-    os_critical_enter();
-
-    /* Leaving the timer registered would keep the slot occupied (nothing else releases it until a
-     * later start or stop) and hand the tick a timer the caller has just reconfigured. */
-    slot = os_timer_registry_slot_find(timer);
-    if (slot < OS_CONFIG_MAX_TIMERS)
-    {
-        os_timer_registry[slot] = NULL;
-    }
-
-    timer->period_ticks    = period_ticks;
-    timer->remaining_ticks = period_ticks;
-    timer->mode            = mode;
-    timer->active          = false;
-    timer->paused          = false;
-    timer->expired         = false;
-    timer->callback        = callback;
-    timer->context         = context;
-
-    os_critical_exit();
-    return OS_STATUS_OK;
+    return status;
 }
 
 /******************************************************************************************************/
@@ -161,29 +166,28 @@ os_status os_timer_restart(os_timer_t *timer)
  */
 os_status os_timer_pause(os_timer_t *timer)
 {
-    os_status status;
+    os_status status = OS_STATUS_INVALID_ARG;
 
-    if (timer == NULL)
+    if (timer != NULL)
     {
-        return OS_STATUS_INVALID_ARG;
+        os_critical_enter();
+
+        if (timer->active)
+        {
+            timer->active = false;
+            timer->paused = true;
+            status        = OS_STATUS_OK;
+        }
+        else
+        {
+            /* Already paused is success - the timer is in the state asked for. Anything else
+             * (never started, stopped, or a one-shot that has fired) had no countdown to halt. */
+            status = timer->paused ? OS_STATUS_OK : OS_STATUS_ERROR;
+        }
+
+        os_critical_exit();
     }
 
-    os_critical_enter();
-
-    if (timer->active)
-    {
-        timer->active = false;
-        timer->paused = true;
-        status        = OS_STATUS_OK;
-    }
-    else
-    {
-        /* Already paused is success - the timer is in the state asked for. Anything else (never
-         * started, stopped, or a one-shot that has fired) had no countdown to halt. */
-        status = timer->paused ? OS_STATUS_OK : OS_STATUS_ERROR;
-    }
-
-    os_critical_exit();
     return status;
 }
 
@@ -196,26 +200,29 @@ os_status os_timer_pause(os_timer_t *timer)
  */
 os_status os_timer_stop(os_timer_t *timer)
 {
-    uint32_t slot;
+    os_status status = OS_STATUS_INVALID_ARG;
 
-    if (timer == NULL)
+    if (timer != NULL)
     {
-        return OS_STATUS_INVALID_ARG;
+        uint32_t slot;
+
+        os_critical_enter();
+
+        timer->active  = false;
+        timer->paused  = false;
+        timer->expired = false;
+        slot           = os_timer_registry_slot_find(timer);
+        if (slot < OS_CONFIG_MAX_TIMERS)
+        {
+            os_timer_registry[slot] = NULL;
+        }
+
+        os_critical_exit();
+
+        status = OS_STATUS_OK;
     }
 
-    os_critical_enter();
-
-    timer->active  = false;
-    timer->paused  = false;
-    timer->expired = false;
-    slot           = os_timer_registry_slot_find(timer);
-    if (slot < OS_CONFIG_MAX_TIMERS)
-    {
-        os_timer_registry[slot] = NULL;
-    }
-
-    os_critical_exit();
-    return OS_STATUS_OK;
+    return status;
 }
 
 /******************************************************************************************************/
@@ -235,32 +242,35 @@ os_status os_timer_stop(os_timer_t *timer)
  */
 os_status os_timer_delete(os_timer_t *timer)
 {
-    uint32_t slot;
+    os_status status = OS_STATUS_INVALID_ARG;
 
-    if (timer == NULL)
+    if (timer != NULL)
     {
-        return OS_STATUS_INVALID_ARG;
+        uint32_t slot;
+
+        os_critical_enter();
+
+        timer->active          = false;
+        timer->paused          = false;
+        timer->expired         = false;
+
+        slot = os_timer_registry_slot_find(timer);
+        if (slot < OS_CONFIG_MAX_TIMERS)
+        {
+            os_timer_registry[slot] = NULL;
+        }
+
+        timer->period_ticks    = 0U;
+        timer->remaining_ticks = 0U;
+        timer->callback        = NULL;
+        timer->context         = NULL;
+
+        os_critical_exit();
+
+        status = OS_STATUS_OK;
     }
 
-    os_critical_enter();
-
-    timer->active          = false;
-    timer->paused          = false;
-    timer->expired         = false;
-
-    slot = os_timer_registry_slot_find(timer);
-    if (slot < OS_CONFIG_MAX_TIMERS)
-    {
-        os_timer_registry[slot] = NULL;
-    }
-
-    timer->period_ticks    = 0U;
-    timer->remaining_ticks = 0U;
-    timer->callback        = NULL;
-    timer->context         = NULL;
-
-    os_critical_exit();
-    return OS_STATUS_OK;
+    return status;
 }
 
 /******************************************************************************************************/
@@ -288,22 +298,22 @@ os_status os_timer_system_init(void)
     }
 
     status = os_task_create_system(&tsk_timer, &config);
-    if (status != OS_STATUS_OK)
+
+    /* Each step only runs once the previous one succeeded, and the first failure
+     * is what gets reported. */
+    if (status == OS_STATUS_OK)
     {
-        return status;
+        status = os_task_start(&tsk_timer);
     }
 
-    status = os_task_start(&tsk_timer);
-    if (status != OS_STATUS_OK)
+    if (status == OS_STATUS_OK)
     {
-        return status;
+        /* Resolved once: the timer task is never deleted, so the tick-time
+         * expiry wake can skip the id lookup from here on. */
+        os_timer_task_tcb = os_task_tcb_resolve(tsk_timer.id);
     }
 
-    /* Resolved once: the timer task is never deleted, so the tick-time
-     * expiry wake can skip the id lookup from here on. */
-    os_timer_task_tcb = os_task_tcb_resolve(tsk_timer.id);
-
-    return OS_STATUS_OK;
+    return status;
 }
 
 /******************************************************************************************************/
@@ -323,66 +333,65 @@ void os_timer_tick_process(uint32_t elapsed_ticks)
     uint32_t slot;
     bool     wake_needed = false;
 
-    if (elapsed_ticks == 0U)
+    if (elapsed_ticks > 0U)
     {
-        return;
+
+        /* The kernel mask is raised so a preempting ISR starting or stopping
+         * timers cannot interleave with the active-check/expired-write pair
+         * below (a stop landing in between would be silently undone). Also
+         * covers the tickless announce path, which calls this from task context.
+         * On multi-core builds the cross-core spinlock additionally excludes the
+         * other cores' os_timer_start/os_timer_stop callers, who hold it via
+         * os_critical_enter - the local mask alone only stops this core's own
+         * interrupts. Both are held across the os_task_wake_tcb below, which is
+         * exactly what that call requires of its caller (unlike os_task_wake,
+         * which takes the same non-recursive lock itself and so could not be
+         * called from in here). */
+        mask_state = os_arch_kernel_mask_save();
+        os_critical_multicore_lock();
+
+        for (slot = 0U; slot < OS_CONFIG_MAX_TIMERS; slot++)
+        {
+            os_timer_t *timer = os_timer_registry[slot];
+
+            if ((timer == NULL) || (!timer->active))
+            {
+                continue;
+            }
+
+            if (timer->remaining_ticks > elapsed_ticks)
+            {
+                timer->remaining_ticks -= elapsed_ticks;
+                continue;
+            }
+
+            if (timer->mode == OS_TIMER_MODE_PERIODIC)
+            {
+                timer->remaining_ticks = timer->period_ticks;
+            }
+            else
+            {
+                /* One-shot: keep the registry slot until the callback has run. */
+                timer->active = false;
+            }
+
+            timer->expired = true;
+            wake_needed    = true;
+        }
+
+        if (wake_needed)
+        {
+            /* Direct-handle wake: skips both the id lookup and the nested
+             * critical section os_task_wake would pay on every expiring tick;
+             * safe here because the kernel mask and (multi-core) spinlock this
+             * function already holds are exactly what os_task_wake_tcb
+             * requires the caller to provide. */
+            os_task_wake_tcb(os_timer_task_tcb);
+        }
+
+        os_critical_multicore_unlock();
+        os_arch_kernel_mask_restore(mask_state);
     }
-
-    /* The kernel mask is raised so a preempting ISR starting or stopping
-     * timers cannot interleave with the active-check/expired-write pair
-     * below (a stop landing in between would be silently undone). Also
-     * covers the tickless announce path, which calls this from task context.
-     * On multi-core builds the cross-core spinlock additionally excludes the
-     * other cores' os_timer_start/os_timer_stop callers, who hold it via
-     * os_critical_enter - the local mask alone only stops this core's own
-     * interrupts. Both are held across the os_task_wake_tcb below, which is
-     * exactly what that call requires of its caller (unlike os_task_wake,
-     * which takes the same non-recursive lock itself and so could not be
-     * called from in here). */
-    mask_state = os_arch_kernel_mask_save();
-    os_critical_multicore_lock();
-
-    for (slot = 0U; slot < OS_CONFIG_MAX_TIMERS; slot++)
-    {
-        os_timer_t *timer = os_timer_registry[slot];
-
-        if ((timer == NULL) || (!timer->active))
-        {
-            continue;
-        }
-
-        if (timer->remaining_ticks > elapsed_ticks)
-        {
-            timer->remaining_ticks -= elapsed_ticks;
-            continue;
-        }
-
-        if (timer->mode == OS_TIMER_MODE_PERIODIC)
-        {
-            timer->remaining_ticks = timer->period_ticks;
-        }
-        else
-        {
-            /* One-shot: keep the registry slot until the callback has run. */
-            timer->active = false;
-        }
-
-        timer->expired = true;
-        wake_needed    = true;
-    }
-
-    if (wake_needed)
-    {
-        /* Direct-handle wake: skips both the id lookup and the nested
-         * critical section os_task_wake would pay on every expiring tick;
-         * safe here because the kernel mask and (multi-core) spinlock this
-         * function already holds are exactly what os_task_wake_tcb
-         * requires the caller to provide. */
-        os_task_wake_tcb(os_timer_task_tcb);
-    }
-
-    os_critical_multicore_unlock();
-    os_arch_kernel_mask_restore(mask_state);
 }
 
 /******************************************************************************************************/
@@ -513,49 +522,53 @@ static bool os_timer_expired_fetch(os_timer_callback_t *callback_out, void **con
  */
 static os_status os_timer_arm(os_timer_t *timer, bool reload)
 {
-    uint32_t slot;
+    os_status status = OS_STATUS_INVALID_ARG;
 
-    if ((timer == NULL) || (timer->callback == NULL) || (timer->period_ticks == 0U))
+    if ((timer != NULL) && (timer->callback != NULL) && (timer->period_ticks != 0U))
     {
-        return OS_STATUS_INVALID_ARG;
-    }
+        uint32_t slot;
 
-    os_critical_enter();
+        os_critical_enter();
 
-    /* Single pass: re-arming an already-registered timer takes its own
-     * slot rather than a free one, and both the match and the free-slot
-     * fallback are found in one walk instead of two. */
-    slot = os_timer_registry_slot_acquire(timer);
+        /* Single pass: re-arming an already-registered timer takes its own
+         * slot rather than a free one, and both the match and the free-slot
+         * fallback are found in one walk instead of two. */
+        slot = os_timer_registry_slot_acquire(timer);
 
-    if (slot >= OS_CONFIG_MAX_TIMERS)
-    {
+        if (slot >= OS_CONFIG_MAX_TIMERS)
+        {
+            status = OS_STATUS_FULL;
+        }
+        else
+        {
+            os_timer_registry[slot] = timer;
+
+            /* Resuming keeps remaining_ticks; everything else counts a whole period. A paused timer is the
+             * only one whose remaining_ticks means anything, which is why the flag rather than the caller
+             * decides what a plain start does.
+             *
+             * An expiry the tick already noted but the timer task has not drained yet belongs to the period
+             * being discarded here, so it goes with it. Without this, restarting a timer whose expiry is
+             * still in flight leaves active=1 with expired=1 and a full period on the clock, and the next
+             * os_timer_expired_fetch runs the callback at once - a whole period early, at the very moment
+             * the caller asked for the deadline to be pushed back. Only this branch clears it: the resume
+             * path must not, because os_timer_pause documents that a noted expiry is still owed. */
+            if (reload || (!timer->paused))
+            {
+                timer->remaining_ticks = timer->period_ticks;
+                timer->expired         = false;
+            }
+
+            timer->paused = false;
+            timer->active = true;
+
+            status = OS_STATUS_OK;
+        }
+
         os_critical_exit();
-        return OS_STATUS_FULL;
     }
 
-    os_timer_registry[slot] = timer;
-
-    /* Resuming keeps remaining_ticks; everything else counts a whole period. A paused timer is the
-     * only one whose remaining_ticks means anything, which is why the flag rather than the caller
-     * decides what a plain start does.
-     *
-     * An expiry the tick already noted but the timer task has not drained yet belongs to the period
-     * being discarded here, so it goes with it. Without this, restarting a timer whose expiry is
-     * still in flight leaves active=1 with expired=1 and a full period on the clock, and the next
-     * os_timer_expired_fetch runs the callback at once - a whole period early, at the very moment
-     * the caller asked for the deadline to be pushed back. Only this branch clears it: the resume
-     * path must not, because os_timer_pause documents that a noted expiry is still owed. */
-    if (reload || (!timer->paused))
-    {
-        timer->remaining_ticks = timer->period_ticks;
-        timer->expired         = false;
-    }
-
-    timer->paused = false;
-    timer->active = true;
-
-    os_critical_exit();
-    return OS_STATUS_OK;
+    return status;
 }
 
 /******************************************************************************************************/
@@ -567,16 +580,17 @@ static os_status os_timer_arm(os_timer_t *timer, bool reload)
 static bool os_timer_expired_exists(void)
 {
     uint32_t slot;
+    bool     exists = false;
 
-    for (slot = 0U; slot < OS_CONFIG_MAX_TIMERS; slot++)
+    for (slot = 0U; (slot < OS_CONFIG_MAX_TIMERS) && (!exists); slot++)
     {
         if ((os_timer_registry[slot] != NULL) && os_timer_registry[slot]->expired)
         {
-            return true;
+            exists = true;
         }
     }
 
-    return false;
+    return exists;
 }
 
 /******************************************************************************************************/
@@ -589,16 +603,17 @@ static bool os_timer_expired_exists(void)
 static uint32_t os_timer_registry_slot_find(const os_timer_t *timer)
 {
     uint32_t slot;
+    uint32_t found = OS_CONFIG_MAX_TIMERS;
 
-    for (slot = 0U; slot < OS_CONFIG_MAX_TIMERS; slot++)
+    for (slot = 0U; (slot < OS_CONFIG_MAX_TIMERS) && (found == OS_CONFIG_MAX_TIMERS); slot++)
     {
         if (os_timer_registry[slot] == timer)
         {
-            return slot;
+            found = slot;
         }
     }
 
-    return OS_CONFIG_MAX_TIMERS;
+    return found;
 }
 
 /******************************************************************************************************/
@@ -622,7 +637,9 @@ static uint32_t os_timer_registry_slot_acquire(const os_timer_t *timer)
     {
         if (os_timer_registry[slot] == timer)
         {
-            return slot;
+            /* Its own slot wins over any free one, so the walk stops here. */
+            free_slot = slot;
+            break;
         }
 
         if ((os_timer_registry[slot] == NULL) && (free_slot >= OS_CONFIG_MAX_TIMERS))

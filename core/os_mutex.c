@@ -37,27 +37,31 @@
  */
 os_status os_mutex_init(os_mutex_t *mutex)
 {
-    if (mutex == NULL)
-    {
-        return OS_STATUS_INVALID_ARG;
-    }
+    os_status status = OS_STATUS_INVALID_ARG;
 
-    os_critical_enter();
-
-    if (mutex->waiters.head != NULL)
+    if (mutex != NULL)
     {
+        os_critical_enter();
+
+        if (mutex->waiters.head != NULL)
+        {
+            status = OS_STATUS_BUSY;
+        }
+        else
+        {
+            mutex->locked   = false;
+            mutex->owner_id = 0U;
+            os_list_init(&mutex->waiters);
+            mutex->owner_node.next = NULL;
+            mutex->owner_node.prev = NULL;
+
+            status = OS_STATUS_OK;
+        }
+
         os_critical_exit();
-        return OS_STATUS_BUSY;
     }
 
-    mutex->locked   = false;
-    mutex->owner_id = 0U;
-    os_list_init(&mutex->waiters);
-    mutex->owner_node.next = NULL;
-    mutex->owner_node.prev = NULL;
-
-    os_critical_exit();
-    return OS_STATUS_OK;
+    return status;
 }
 
 /******************************************************************************************************/
@@ -75,79 +79,90 @@ os_status os_mutex_init(os_mutex_t *mutex)
  */
 os_status os_mutex_lock(os_mutex_t *mutex, uint32_t timeout_ms)
 {
-    uint32_t self_id;
-    uint32_t budget_ticks;
-    uint32_t start_tick;
-    uint32_t remaining_ticks;
+    os_status status = OS_STATUS_INVALID_ARG;
 
     /* A mutex is an ownership object and an ISR has no identity of its own, so
      * locking from one could only borrow whichever task it interrupted. */
     OS_ASSERT(!os_arch_in_isr());
     OS_ASSERT(mutex != NULL);
 
-    if ((mutex == NULL) || os_arch_in_isr())
+    if ((mutex != NULL) && (!os_arch_in_isr()))
     {
-        return OS_STATUS_INVALID_ARG;
+        uint32_t self_id         = os_task_current_id_get();
+        uint32_t budget_ticks    = os_internal_timeout_to_ticks(timeout_ms);
+        uint32_t start_tick      = os_tick_get();
+        uint32_t remaining_ticks = budget_ticks;
+        bool     waiting         = true;
+
+        /* Retry loop with one exit (MISRA Rule 15.5): each arm records the outcome
+         * in status and clears the loop flag rather than returning for itself. */
+        while (waiting)
+        {
+            os_critical_enter();
+
+            if (!mutex->locked)
+            {
+                mutex->locked   = true;
+                mutex->owner_id = self_id;
+                os_task_mutex_owner_link(&mutex->owner_node);
+                os_task_wait_end();
+                os_critical_exit();
+
+                status  = OS_STATUS_OK;
+                waiting = false;
+            }
+            else
+            {
+                bool held_by_self = ((self_id != 0U) && (mutex->owner_id == self_id));
+
+                /* Recursive lock attempt would deadlock forever: fail fast. */
+                if (held_by_self || (timeout_ms == OS_WAIT_NOTHING) || (!os_internal_can_block()))
+                {
+                    os_task_wait_end();
+                    os_critical_exit();
+
+                    status  = OS_STATUS_BUSY;
+                    waiting = false;
+                }
+                else if (remaining_ticks == 0U)
+                {
+                    os_task_wait_end();
+                    os_critical_exit();
+
+                    status  = OS_STATUS_TIMEOUT;
+                    waiting = false;
+                }
+                else
+                {
+                    /* Boost the owner before blocking: closes the priority-inversion
+                     * window instead of leaving it open until the owner's next unlock. */
+                    os_task_mutex_priority_inherit(mutex->owner_id);
+
+                    /* Join the waiter list inside the same critical section that saw the
+                     * mutex locked (no lost-wakeup window); the switch happens on exit. */
+                    os_task_wait_begin(&mutex->waiters, remaining_ticks);
+                    os_critical_exit();
+
+                    /* Resumed: unlock signaled us (retry the take - another task may
+                     * have been faster) or the wait timed out. The budget is recomputed
+                     * against the wall clock so READY time counts toward the timeout. */
+                    if (os_task_wait_signaled())
+                    {
+                        remaining_ticks = os_internal_wait_remaining(budget_ticks, start_tick);
+                    }
+                    else
+                    {
+                        os_task_wait_end();
+
+                        status  = OS_STATUS_TIMEOUT;
+                        waiting = false;
+                    }
+                }
+            }
+        }
     }
 
-    self_id         = os_task_current_id_get();
-    budget_ticks    = os_internal_timeout_to_ticks(timeout_ms);
-    start_tick      = os_tick_get();
-    remaining_ticks = budget_ticks;
-
-    for (;;)
-    {
-        bool held_by_self;
-
-        os_critical_enter();
-
-        if (!mutex->locked)
-        {
-            mutex->locked   = true;
-            mutex->owner_id = self_id;
-            os_task_mutex_owner_link(&mutex->owner_node);
-            os_task_wait_end();
-            os_critical_exit();
-            return OS_STATUS_OK;
-        }
-
-        held_by_self = ((self_id != 0U) && (mutex->owner_id == self_id));
-
-        /* Recursive lock attempt would deadlock forever: fail fast. */
-        if (held_by_self || (timeout_ms == OS_WAIT_NOTHING) || !os_internal_can_block())
-        {
-            os_task_wait_end();
-            os_critical_exit();
-            return OS_STATUS_BUSY;
-        }
-
-        if (remaining_ticks == 0U)
-        {
-            os_task_wait_end();
-            os_critical_exit();
-            return OS_STATUS_TIMEOUT;
-        }
-
-        /* Boost the owner before blocking: closes the priority-inversion
-         * window instead of leaving it open until the owner's next unlock. */
-        os_task_mutex_priority_inherit(mutex->owner_id);
-
-        /* Join the waiter list inside the same critical section that saw the
-         * mutex locked (no lost-wakeup window); the switch happens on exit. */
-        os_task_wait_begin(&mutex->waiters, remaining_ticks);
-        os_critical_exit();
-
-        /* Resumed: unlock signaled us (retry the take - another task may
-         * have been faster) or the wait timed out. The budget is recomputed
-         * against the wall clock so READY time counts toward the timeout. */
-        if (!os_task_wait_signaled())
-        {
-            os_task_wait_end();
-            return OS_STATUS_TIMEOUT;
-        }
-
-        remaining_ticks = os_internal_wait_remaining(budget_ticks, start_tick);
-    }
+    return status;
 }
 
 /******************************************************************************************************/
@@ -172,58 +187,57 @@ os_status os_mutex_try_lock(os_mutex_t *mutex)
  */
 os_status os_mutex_unlock(os_mutex_t *mutex)
 {
-    uint32_t self_id;
-    uint32_t owner_id;
+    os_status status = OS_STATUS_INVALID_ARG;
 
     OS_ASSERT(!os_arch_in_isr());
     OS_ASSERT(mutex != NULL);
 
-    if ((mutex == NULL) || os_arch_in_isr())
+    if ((mutex != NULL) && (!os_arch_in_isr()))
     {
-        return OS_STATUS_INVALID_ARG;
-    }
+        uint32_t self_id = os_task_current_id_get();
 
-    self_id = os_task_current_id_get();
+        os_critical_enter();
 
-    os_critical_enter();
+        if (!mutex->locked)
+        {
+            status = OS_STATUS_ERROR;
+        }
+        /* Enforce ownership when both sides are identifiable tasks.
+         *
+         * Deliberately NOT an OS_ASSERT: OS_STATUS_NOT_OWNER is a documented return
+         * value, so callers are entitled to attempt the unlock and handle it. It
+         * also depends on runtime scheduling rather than on a static mistake in the
+         * code, which is the line assertions are meant to sit on. */
+        else if ((mutex->owner_id != 0U) && (self_id != 0U) && (mutex->owner_id != self_id))
+        {
+            status = OS_STATUS_NOT_OWNER;
+        }
+        else
+        {
+            /* Captured before the release clears it: the id is the only handle on the
+             * task whose owned-mutex list and priority boost this unlock has to undo,
+             * and that task is not necessarily the caller (see the ownership check
+             * above, which passes when either side is unidentifiable). */
+            uint32_t owner_id = mutex->owner_id;
 
-    if (!mutex->locked)
-    {
+            mutex->locked   = false;
+            mutex->owner_id = 0U;
+
+            /* Drop any boost owed to this mutex before waking the next waiter, so
+             * the wake's own preempt check compares against the correct priority. */
+            os_task_mutex_owner_unlink_and_reprioritize(owner_id, &mutex->owner_node);
+
+            /* Hand the release to the highest-priority waiter (it re-takes in its
+             * own context; no ownership transfer inside the unlock). */
+            (void)os_task_waiters_wake_one(&mutex->waiters);
+
+            status = OS_STATUS_OK;
+        }
+
         os_critical_exit();
-        return OS_STATUS_ERROR;
     }
 
-    /* Enforce ownership when both sides are identifiable tasks.
-     *
-     * Deliberately NOT an OS_ASSERT: OS_STATUS_NOT_OWNER is a documented return
-     * value, so callers are entitled to attempt the unlock and handle it. It
-     * also depends on runtime scheduling rather than on a static mistake in the
-     * code, which is the line assertions are meant to sit on. */
-    if ((mutex->owner_id != 0U) && (self_id != 0U) && (mutex->owner_id != self_id))
-    {
-        os_critical_exit();
-        return OS_STATUS_NOT_OWNER;
-    }
-
-    /* Captured before the release clears it: the id is the only handle on the
-     * task whose owned-mutex list and priority boost this unlock has to undo,
-     * and that task is not necessarily the caller (see the ownership check
-     * above, which passes when either side is unidentifiable). */
-    owner_id = mutex->owner_id;
-
-    mutex->locked   = false;
-    mutex->owner_id = 0U;
-
-    /* Drop any boost owed to this mutex before waking the next waiter, so
-     * the wake's own preempt check compares against the correct priority. */
-    os_task_mutex_owner_unlink_and_reprioritize(owner_id, &mutex->owner_node);
-
-    /* Hand the release to the highest-priority waiter (it re-takes in its
-     * own context; no ownership transfer inside the unlock). */
-    (void)os_task_waiters_wake_one(&mutex->waiters);
-
-    os_critical_exit();
-    return OS_STATUS_OK;
+    return status;
 }
 
 #endif /* OS_CONFIG_MUTEX_ENABLE */

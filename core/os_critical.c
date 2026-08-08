@@ -88,17 +88,15 @@ void os_critical_exit(void)
      * assertions off) keeps the kernel consistent but hides the caller's bug. */
     OS_ASSERT(os_critical_nesting_count[core] != 0U);
 
-    if (os_critical_nesting_count[core] == 0U)
+    if (os_critical_nesting_count[core] != 0U)
     {
-        return;
-    }
+        os_critical_nesting_count[core]--;
 
-    os_critical_nesting_count[core]--;
-
-    if (os_critical_nesting_count[core] == 0U)
-    {
-        os_arch_spinlock_release(&os_critical_kernel_lock);
-        os_arch_kernel_mask_restore(os_critical_saved_mask[core]);
+        if (os_critical_nesting_count[core] == 0U)
+        {
+            os_arch_spinlock_release(&os_critical_kernel_lock);
+            os_arch_kernel_mask_restore(os_critical_saved_mask[core]);
+        }
     }
 }
 

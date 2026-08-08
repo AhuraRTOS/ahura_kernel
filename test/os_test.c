@@ -80,7 +80,7 @@ static os_semaphore_t os_test_sched_lock_sem;  /* left empty: a take would have 
  * PEER of a test task at priority 1, the two round-robined, and "the spinner never advanced"
  * failed by hundreds of microseconds of spinner time with nothing in the test looking wrong.
  *
- * OS_TASK_PRIO_USER_MIN is the floor for user tasks, so a test task sitting on it has no room
+ * OS_TASK_PRIO_1_LOWEST is the floor for user tasks, so a test task sitting on it has no room
  * underneath at all. test_priority_preemption checks that requirement rather than clamping:
  * quietly nudging the priorities would keep the suite green while no longer testing preemption.
  *
@@ -807,7 +807,7 @@ static void test_task_lifecycle(void)
     AHURA_TEST_CHECK(os_task_create(&helper, &cfg) == OS_STATUS_INVALID_ARG,
                       "os_task_create() rejects priority %u (kernel-reserved)", (unsigned)OS_TASK_PRIO_MAX);
 
-    cfg.priority = OS_TASK_PRIO_USER_MIN;
+    cfg.priority = OS_TASK_PRIO_1_LOWEST;
 
     /* The stack travels with the handle now, not the config, so an unusable stack is an unusable
      * handle. These descriptors stand in for an OS_TASK_DEFINE that somehow got it wrong - which
@@ -984,7 +984,7 @@ static void test_priority_preemption(void)
     AHURA_TEST_CHECK(OS_CONFIG_TEST_PRIORITY >= OS_TASK_PRIO_2,
                       "OS_CONFIG_TEST_PRIORITY (%u) leaves a usable priority below the test task",
                       (unsigned)OS_CONFIG_TEST_PRIORITY);
-    AHURA_TEST_CHECK(TEST_PRIO_HIGH <= OS_TASK_PRIO_USER_MAX,
+    AHURA_TEST_CHECK(TEST_PRIO_HIGH <= OS_TASK_PRIO_30_HIGHEST,
                       "OS_CONFIG_TEST_PRIORITY (%u) leaves a usable priority above the test task",
                       (unsigned)OS_CONFIG_TEST_PRIORITY);
 

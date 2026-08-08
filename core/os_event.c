@@ -70,24 +70,28 @@ static bool os_event_waiter_match(uint32_t data0, uint32_t data1, void *context,
  */
 os_status os_event_init(os_event_t *event)
 {
-    if (event == NULL)
-    {
-        return OS_STATUS_INVALID_ARG;
-    }
+    os_status status = OS_STATUS_INVALID_ARG;
 
-    os_critical_enter();
-
-    if (event->waiters.head != NULL)
+    if (event != NULL)
     {
+        os_critical_enter();
+
+        if (event->waiters.head != NULL)
+        {
+            status = OS_STATUS_BUSY;
+        }
+        else
+        {
+            event->flags = 0U;
+            os_list_init(&event->waiters);
+
+            status = OS_STATUS_OK;
+        }
+
         os_critical_exit();
-        return OS_STATUS_BUSY;
     }
 
-    event->flags = 0U;
-    os_list_init(&event->waiters);
-
-    os_critical_exit();
-    return OS_STATUS_OK;
+    return status;
 }
 
 /******************************************************************************************************/
@@ -105,27 +109,29 @@ os_status os_event_init(os_event_t *event)
  */
 os_status os_event_set_bits(os_event_t *event, uint32_t bits)
 {
-    os_event_match_context_t match_context;
+    os_status status = OS_STATUS_INVALID_ARG;
 
-    if (event == NULL)
+    if (event != NULL)
     {
-        return OS_STATUS_INVALID_ARG;
+        os_event_match_context_t match_context;
+
+        os_critical_enter();
+
+        event->flags |= bits;
+
+        match_context.flags_snapshot = event->flags;
+        match_context.clear_accum    = 0U;
+
+        (void)os_task_waiters_wake_match(&event->waiters, os_event_waiter_match, &match_context);
+
+        event->flags &= ~match_context.clear_accum;
+
+        os_critical_exit();
+
+        status = OS_STATUS_OK;
     }
 
-    os_critical_enter();
-
-    event->flags |= bits;
-
-    match_context.flags_snapshot = event->flags;
-    match_context.clear_accum    = 0U;
-
-    (void)os_task_waiters_wake_match(&event->waiters, os_event_waiter_match, &match_context);
-
-    event->flags &= ~match_context.clear_accum;
-
-    os_critical_exit();
-
-    return OS_STATUS_OK;
+    return status;
 }
 
 /******************************************************************************************************/
@@ -138,16 +144,18 @@ os_status os_event_set_bits(os_event_t *event, uint32_t bits)
  */
 os_status os_event_clear_bits(os_event_t *event, uint32_t bits)
 {
-    if (event == NULL)
+    os_status status = OS_STATUS_INVALID_ARG;
+
+    if (event != NULL)
     {
-        return OS_STATUS_INVALID_ARG;
+        os_critical_enter();
+        event->flags &= ~bits;
+        os_critical_exit();
+
+        status = OS_STATUS_OK;
     }
 
-    os_critical_enter();
-    event->flags &= ~bits;
-    os_critical_exit();
-
-    return OS_STATUS_OK;
+    return status;
 }
 
 /******************************************************************************************************/
@@ -170,97 +178,109 @@ os_status os_event_clear_bits(os_event_t *event, uint32_t bits)
  */
 os_status os_event_wait_bits(os_event_t *event, uint32_t bits, bool wait_all, bool clear_on_exit, uint32_t *matched_bits, uint32_t timeout_ms)
 {
-    uint32_t budget_ticks;
-    uint32_t start_tick;
-    uint32_t remaining_ticks;
-    uint32_t wait_flags;
+    os_status status = OS_STATUS_INVALID_ARG;
 
-    if ((event == NULL) || (matched_bits == NULL) || (bits == 0U))
+    if ((event != NULL) && (matched_bits != NULL) && (bits != 0U))
     {
-        return OS_STATUS_INVALID_ARG;
-    }
+        uint32_t budget_ticks    = os_internal_timeout_to_ticks(timeout_ms);
+        uint32_t start_tick      = os_tick_get();
+        uint32_t remaining_ticks = budget_ticks;
+        uint32_t wait_flags      = (wait_all ? OS_EVENT_WAIT_ALL_FLAG : 0U) |
+                                   (clear_on_exit ? OS_EVENT_CLEAR_ON_EXIT_FLAG : 0U);
+        bool     waiting         = true;
 
-    budget_ticks    = os_internal_timeout_to_ticks(timeout_ms);
-    start_tick      = os_tick_get();
-    remaining_ticks = budget_ticks;
-
-    wait_flags = (wait_all ? OS_EVENT_WAIT_ALL_FLAG : 0U) |
-                 (clear_on_exit ? OS_EVENT_CLEAR_ON_EXIT_FLAG : 0U);
-
-    for (;;)
-    {
-        uint32_t current_flags;
-        uint32_t delivered;
-        bool     is_match;
-
-        os_critical_enter();
-
-        current_flags = event->flags & bits;
-        *matched_bits = current_flags;
-
-        if (wait_all)
+        /* Retry loop with one exit (MISRA Rule 15.5): each arm records the outcome
+         * in status and clears the loop flag rather than returning for itself. */
+        while (waiting)
         {
-            is_match = (current_flags == bits);
-        }
-        else
-        {
-            is_match = (current_flags != 0U);
-        }
+            uint32_t current_flags;
+            bool     is_match;
 
-        if (is_match)
-        {
-            if (clear_on_exit)
+            os_critical_enter();
+
+            current_flags = event->flags & bits;
+            *matched_bits = current_flags;
+
+            if (wait_all)
             {
-                event->flags &= ~bits;
+                is_match = (current_flags == bits);
+            }
+            else
+            {
+                is_match = (current_flags != 0U);
             }
 
-            os_task_wait_end();
-            os_critical_exit();
-            return OS_STATUS_OK;
+            if (is_match)
+            {
+                if (clear_on_exit)
+                {
+                    event->flags &= ~bits;
+                }
+
+                os_task_wait_end();
+                os_critical_exit();
+
+                status  = OS_STATUS_OK;
+                waiting = false;
+            }
+            else if ((timeout_ms == OS_WAIT_NOTHING) || (!os_internal_can_block()))
+            {
+                os_task_wait_end();
+                os_critical_exit();
+
+                status  = OS_STATUS_BUSY;
+                waiting = false;
+            }
+            else if (remaining_ticks == 0U)
+            {
+                os_task_wait_end();
+                os_critical_exit();
+
+                status  = OS_STATUS_TIMEOUT;
+                waiting = false;
+            }
+            else
+            {
+                /* Publish the condition for set_bits to evaluate, then join the
+                 * waiter list inside the same critical section that saw the bits
+                 * unmatched (no lost-wakeup window against set_bits). */
+                os_task_wait_data_set(bits, wait_flags);
+                os_task_wait_begin(&event->waiters, remaining_ticks);
+                os_critical_exit();
+
+                if (!os_task_wait_signaled())
+                {
+                    os_task_wait_end();
+
+                    status  = OS_STATUS_TIMEOUT;
+                    waiting = false;
+                }
+                else
+                {
+                    /* A nonzero result is the delivery set_bits captured for us at set
+                     * time (already cleared there when clear_on_exit): report it as-is.
+                     * Zero means a forced/spurious wake: re-evaluate with the budget
+                     * recomputed against the wall clock. */
+                    uint32_t delivered = os_task_wait_result_get();
+
+                    if (delivered != 0U)
+                    {
+                        *matched_bits = delivered;
+                        os_task_wait_end();
+
+                        status  = OS_STATUS_OK;
+                        waiting = false;
+                    }
+                    else
+                    {
+                        remaining_ticks = os_internal_wait_remaining(budget_ticks, start_tick);
+                    }
+                }
+            }
         }
-
-        if ((timeout_ms == OS_WAIT_NOTHING) || !os_internal_can_block())
-        {
-            os_task_wait_end();
-            os_critical_exit();
-            return OS_STATUS_BUSY;
-        }
-
-        if (remaining_ticks == 0U)
-        {
-            os_task_wait_end();
-            os_critical_exit();
-            return OS_STATUS_TIMEOUT;
-        }
-
-        /* Publish the condition for set_bits to evaluate, then join the
-         * waiter list inside the same critical section that saw the bits
-         * unmatched (no lost-wakeup window against set_bits). */
-        os_task_wait_data_set(bits, wait_flags);
-        os_task_wait_begin(&event->waiters, remaining_ticks);
-        os_critical_exit();
-
-        if (!os_task_wait_signaled())
-        {
-            os_task_wait_end();
-            return OS_STATUS_TIMEOUT;
-        }
-
-        /* A nonzero result is the delivery set_bits captured for us at set
-         * time (already cleared there when clear_on_exit): return it as-is.
-         * Zero means a forced/spurious wake: re-evaluate with the budget
-         * recomputed against the wall clock. */
-        delivered = os_task_wait_result_get();
-
-        if (delivered != 0U)
-        {
-            *matched_bits = delivered;
-            os_task_wait_end();
-            return OS_STATUS_OK;
-        }
-
-        remaining_ticks = os_internal_wait_remaining(budget_ticks, start_tick);
     }
+
+    return status;
 }
 
 /*
